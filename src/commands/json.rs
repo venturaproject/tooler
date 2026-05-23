@@ -1,9 +1,9 @@
-use anyhow::{bail, Context as _, Result};
+use crate::context::Context;
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use colored::Colorize;
 use serde_json::Value;
 use std::io::{self, Read};
-use crate::context::Context;
 
 #[derive(Args)]
 pub struct JsonArgs {
@@ -21,8 +21,9 @@ pub struct JsonArgs {
 
 pub fn run(args: JsonArgs, _ctx: &Context) -> Result<()> {
     let raw = match &args.file {
-        Some(path) => std::fs::read_to_string(path)
-            .with_context(|| format!("Cannot read file: {path}"))?,
+        Some(path) => {
+            std::fs::read_to_string(path).with_context(|| format!("Cannot read file: {path}"))?
+        }
         None => {
             let mut buf = String::new();
             io::stdin().read_to_string(&mut buf)?;
@@ -54,7 +55,8 @@ pub fn run(args: JsonArgs, _ctx: &Context) -> Result<()> {
 fn colorize_json(json: &str) -> String {
     json.lines()
         .map(|line| {
-            if line.trim_start().starts_with('"') && line.contains(':')
+            if line.trim_start().starts_with('"')
+                && line.contains(':')
                 && let Some(pos) = line.find(':')
             {
                 let (key, rest) = line.split_at(pos);

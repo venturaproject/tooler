@@ -1,7 +1,7 @@
-use anyhow::{bail, Result};
+use crate::context::Context;
+use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
-use crate::context::Context;
 
 #[derive(Args)]
 pub struct GitArgs {
@@ -51,8 +51,7 @@ pub fn run(args: GitArgs, _ctx: &Context) -> Result<()> {
 fn summary() -> Result<()> {
     let branch = git(&["branch", "--show-current"])?;
     let status = git(&["status", "--short"])?;
-    let last_tag = git(&["describe", "--tags", "--abbrev=0"])
-        .unwrap_or_else(|_| "—".to_string());
+    let last_tag = git(&["describe", "--tags", "--abbrev=0"]).unwrap_or_else(|_| "—".to_string());
     let log = git(&["log", "--oneline", "-5"])?;
 
     let ahead_behind = git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
@@ -137,9 +136,8 @@ fn clean(remote: bool, confirm: bool) -> Result<()> {
 fn changelog(from: Option<String>) -> Result<()> {
     let from_ref = match from {
         Some(f) => f,
-        None => git(&["describe", "--tags", "--abbrev=0"]).unwrap_or_else(|_| {
-            git(&["rev-list", "--max-parents=0", "HEAD"]).unwrap_or_default()
-        }),
+        None => git(&["describe", "--tags", "--abbrev=0"])
+            .unwrap_or_else(|_| git(&["rev-list", "--max-parents=0", "HEAD"]).unwrap_or_default()),
     };
 
     let range = if from_ref.is_empty() {

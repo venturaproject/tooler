@@ -8,6 +8,10 @@ pub struct Context {
 
 impl Context {
     pub fn new(output: OutputFormat, profile: String, config: Config) -> Self {
-        Self { output, profile, config }
+        Self {
+            output,
+            profile,
+            config,
+        }
     }
 }

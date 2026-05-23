@@ -1,8 +1,8 @@
+use crate::{cli::Cli, context::Context};
 use anyhow::Result;
 use clap::{Args, CommandFactory};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use std::io;
-use crate::{cli::Cli, context::Context};
 
 #[derive(Args)]
 pub struct CompletionsArgs {

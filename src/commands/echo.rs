@@ -1,7 +1,7 @@
+use crate::context::Context;
 use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
-use crate::context::Context;
 
 #[derive(Args)]
 pub struct EchoArgs {
@@ -23,17 +23,21 @@ pub struct EchoArgs {
 
 pub fn run(args: EchoArgs, _ctx: &Context) -> Result<()> {
     let text = args.text.join(" ");
-    let text = if args.upper { text.to_uppercase() } else { text };
+    let text = if args.upper {
+        text.to_uppercase()
+    } else {
+        text
+    };
 
     for _ in 0..args.repeat {
         let line = match args.color.as_str() {
-            "red"     => text.red().to_string(),
-            "green"   => text.green().to_string(),
-            "blue"    => text.blue().to_string(),
-            "yellow"  => text.yellow().to_string(),
-            "cyan"    => text.cyan().to_string(),
+            "red" => text.red().to_string(),
+            "green" => text.green().to_string(),
+            "blue" => text.blue().to_string(),
+            "yellow" => text.yellow().to_string(),
+            "cyan" => text.cyan().to_string(),
             "magenta" => text.magenta().to_string(),
-            _         => text.normal().to_string(),
+            _ => text.normal().to_string(),
         };
         println!("{line}");
     }

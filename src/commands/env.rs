@@ -1,8 +1,8 @@
-use anyhow::{bail, Context as _, Result};
+use crate::{context::Context, output::OutputFormat};
+use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use std::collections::HashMap;
-use crate::{context::Context, output::OutputFormat};
 
 #[derive(Args)]
 pub struct EnvArgs {
@@ -32,10 +32,7 @@ pub enum EnvSubcommand {
         file: String,
     },
     /// Show keys present in one file but missing in the other
-    Diff {
-        file_a: String,
-        file_b: String,
-    },
+    Diff { file_a: String, file_b: String },
     /// Verify all keys from a reference file exist in the target
     Check {
         /// Reference file (e.g. .env.example)
@@ -47,8 +44,8 @@ pub enum EnvSubcommand {
 }
 
 fn parse_env_file(path: &str) -> Result<HashMap<String, String>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Cannot read file: {path}"))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("Cannot read file: {path}"))?;
 
     let mut map = HashMap::new();
     for line in content.lines() {
@@ -69,7 +66,11 @@ fn mask(value: &str) -> String {
         return "(empty)".dimmed().to_string();
     }
     let visible = value.len().min(3);
-    format!("{}{}", &value[..visible], "*".repeat(value.len().saturating_sub(visible)))
+    format!(
+        "{}{}",
+        &value[..visible],
+        "*".repeat(value.len().saturating_sub(visible))
+    )
 }
 
 pub fn run(args: EnvArgs, ctx: &Context) -> Result<()> {
@@ -82,7 +83,10 @@ pub fn run(args: EnvArgs, ctx: &Context) -> Result<()> {
                 .collect();
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-            let kv_refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let kv_refs: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
 
             if ctx.output == OutputFormat::Plain {
                 println!("{} {}", "env:".bold(), file.cyan());
@@ -120,11 +124,21 @@ pub fn run(args: EnvArgs, ctx: &Context) -> Result<()> {
             for key in &all_keys {
                 match (vars_a.contains_key(key), vars_b.contains_key(key)) {
                     (true, false) => {
-                        println!("{} {} {}", "−".red().bold(), key, format!("(only in {file_a})").dimmed());
+                        println!(
+                            "{} {} {}",
+                            "−".red().bold(),
+                            key,
+                            format!("(only in {file_a})").dimmed()
+                        );
                         diffs = true;
                     }
                     (false, true) => {
-                        println!("{} {} {}", "+".green().bold(), key, format!("(only in {file_b})").dimmed());
+                        println!(
+                            "{} {} {}",
+                            "+".green().bold(),
+                            key,
+                            format!("(only in {file_b})").dimmed()
+                        );
                         diffs = true;
                     }
                     _ => {}
@@ -145,7 +159,12 @@ pub fn run(args: EnvArgs, ctx: &Context) -> Result<()> {
                 .collect();
 
             if missing.is_empty() {
-                println!("{} all keys from {} present in {}", "✓".green().bold(), reference, target);
+                println!(
+                    "{} all keys from {} present in {}",
+                    "✓".green().bold(),
+                    reference,
+                    target
+                );
             } else {
                 missing.sort();
                 eprintln!("{} missing keys in {}:", "✗".red().bold(), target);

@@ -1,7 +1,7 @@
-use anyhow::{bail, Result};
+use crate::{context::Context, project};
+use anyhow::{Result, bail};
 use clap::Args;
 use colored::Colorize;
-use crate::{context::Context, project};
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -29,10 +29,18 @@ pub fn run(args: RunArgs, _ctx: &Context) -> Result<()> {
 fn list_scripts(project: &project::ProjectConfig) -> Result<()> {
     if project.scripts.is_empty() {
         println!("{}", "No scripts defined.".dimmed());
-        println!("Create a {} file with a {} section:", ".tooler.toml".cyan(), "[scripts]".bold());
+        println!(
+            "Create a {} file with a {} section:",
+            ".tooler.toml".cyan(),
+            "[scripts]".bold()
+        );
         println!();
         println!("  {}", "[scripts]".dimmed());
-        println!("  {} = {}", "build".dimmed(), r#""cargo build --release""#.dimmed());
+        println!(
+            "  {} = {}",
+            "build".dimmed(),
+            r#""cargo build --release""#.dimmed()
+        );
         println!("  {} = {}", "test".dimmed(), r#""cargo test""#.dimmed());
         return Ok(());
     }
@@ -64,7 +72,11 @@ fn exec_script(
         None => {
             let mut available: Vec<&str> = project.scripts.keys().map(String::as_str).collect();
             available.sort();
-            bail!("Script '{}' not found. Available: {}", name, available.join(", "))
+            bail!(
+                "Script '{}' not found. Available: {}",
+                name,
+                available.join(", ")
+            )
         }
     };
 
@@ -87,7 +99,11 @@ fn exec_script(
         .status()?;
 
     if !status.success() {
-        bail!("script '{}' failed (exit {})", name, status.code().unwrap_or(1));
+        bail!(
+            "script '{}' failed (exit {})",
+            name,
+            status.code().unwrap_or(1)
+        );
     }
     Ok(())
 }

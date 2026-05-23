@@ -1,8 +1,8 @@
-use anyhow::{bail, Context as _, Result};
+use crate::context::Context;
+use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use std::time::Duration;
-use crate::context::Context;
 
 #[derive(Args)]
 pub struct HttpArgs {
@@ -48,11 +48,17 @@ fn resolve_url(url: &str, ctx: &Context) -> Result<String> {
     if let Some(profile) = ctx.config.profile.get(&ctx.profile)
         && let Some(base) = &profile.base_url
     {
-        return Ok(format!("{}/{}", base.trim_end_matches('/'), url.trim_start_matches('/')));
+        return Ok(format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            url.trim_start_matches('/')
+        ));
     }
     bail!(
         "'{}' is not an absolute URL and profile '{}' has no base_url.\n  Set it with: tooler config set profile.{}.base_url <url>",
-        url, ctx.profile, ctx.profile
+        url,
+        ctx.profile,
+        ctx.profile
     )
 }
 
@@ -62,13 +68,40 @@ fn active_token(token: Option<String>, ctx: &Context) -> Option<String> {
 
 pub fn run(args: HttpArgs, ctx: &Context) -> Result<()> {
     match args.subcommand {
-        HttpSubcommand::Get { url, token, headers, timeout } => {
+        HttpSubcommand::Get {
+            url,
+            token,
+            headers,
+            timeout,
+        } => {
             let url = resolve_url(&url, ctx)?;
-            do_request("GET", &url, None, active_token(token, ctx), headers, timeout, ctx)
+            do_request(
+                "GET",
+                &url,
+                None,
+                active_token(token, ctx),
+                headers,
+                timeout,
+                ctx,
+            )
         }
-        HttpSubcommand::Post { url, body, token, headers, timeout } => {
+        HttpSubcommand::Post {
+            url,
+            body,
+            token,
+            headers,
+            timeout,
+        } => {
             let url = resolve_url(&url, ctx)?;
-            do_request("POST", &url, body.as_deref(), active_token(token, ctx), headers, timeout, ctx)
+            do_request(
+                "POST",
+                &url,
+                body.as_deref(),
+                active_token(token, ctx),
+                headers,
+                timeout,
+                ctx,
+            )
         }
     }
 }
@@ -88,7 +121,7 @@ fn do_request(
 
     let mut req = match method {
         "POST" => client.post(url),
-        _      => client.get(url),
+        _ => client.get(url),
     };
 
     if let Some(t) = token {
@@ -102,10 +135,14 @@ fn do_request(
     }
 
     if let Some(b) = body {
-        req = req.header("Content-Type", "application/json").body(b.to_string());
+        req = req
+            .header("Content-Type", "application/json")
+            .body(b.to_string());
     }
 
-    let response = req.send().with_context(|| format!("Request failed: {url}"))?;
+    let response = req
+        .send()
+        .with_context(|| format!("Request failed: {url}"))?;
 
     let status = response.status();
     let status_label = status.as_u16().to_string();
@@ -117,7 +154,12 @@ fn do_request(
         status_label.red()
     };
 
-    println!("{} {} — {}", method.bold().cyan(), url.dimmed(), status_colored);
+    println!(
+        "{} {} — {}",
+        method.bold().cyan(),
+        url.dimmed(),
+        status_colored
+    );
     println!("{}", "─".repeat(50).dimmed());
 
     let body_text = response.text()?;

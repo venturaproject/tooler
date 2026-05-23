@@ -1,9 +1,9 @@
-use anyhow::{bail, Result};
+use crate::context::Context;
+use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use std::collections::HashMap;
 use std::path::Path;
-use crate::context::Context;
 
 #[derive(Args)]
 pub struct ScaffoldArgs {
@@ -39,7 +39,9 @@ fn templates() -> Vec<Template> {
             name: "rust-cli",
             description: "Rust CLI application with clap and anyhow",
             files: vec![
-                ("Cargo.toml", r#"[package]
+                (
+                    "Cargo.toml",
+                    r#"[package]
 name = "{{name_snake}}"
 version = "0.1.0"
 edition = "2021"
@@ -51,8 +53,12 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-"#.into()),
-                ("src/main.rs", r#"use anyhow::Result;
+"#
+                    .into(),
+                ),
+                (
+                    "src/main.rs",
+                    r#"use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -77,16 +83,23 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
-"#.into()),
+"#
+                    .into(),
+                ),
                 (".gitignore", "/target\n".into()),
-                ("README.md", "# {{name}}\n\n```sh\ncargo run -- hello world\n```\n".into()),
+                (
+                    "README.md",
+                    "# {{name}}\n\n```sh\ncargo run -- hello world\n```\n".into(),
+                ),
             ],
         },
         Template {
             name: "node-api",
             description: "Node.js REST API with Express",
             files: vec![
-                ("package.json", r#"{
+                (
+                    "package.json",
+                    r#"{
   "name": "{{name_snake}}",
   "version": "0.1.0",
   "description": "{{name}}",
@@ -99,8 +112,12 @@ fn main() -> Result<()> {
     "express": "^4.18.0"
   }
 }
-"#.into()),
-                ("src/index.js", r#"const express = require('express')
+"#
+                    .into(),
+                ),
+                (
+                    "src/index.js",
+                    r#"const express = require('express')
 const app = express()
 const PORT = process.env.PORT || 3000
 
@@ -113,16 +130,23 @@ app.get('/health', (_req, res) => {
 app.listen(PORT, () => {
   console.log(`{{name}} running on http://localhost:${PORT}`)
 })
-"#.into()),
+"#
+                    .into(),
+                ),
                 (".gitignore", "node_modules/\n.env\n".into()),
-                ("README.md", "# {{name}}\n\n```sh\nnpm install\nnpm run dev\n```\n".into()),
+                (
+                    "README.md",
+                    "# {{name}}\n\n```sh\nnpm install\nnpm run dev\n```\n".into(),
+                ),
             ],
         },
         Template {
             name: "python-cli",
             description: "Python CLI script with argparse",
             files: vec![
-                ("main.py", r#"import argparse
+                (
+                    "main.py",
+                    r#"import argparse
 import sys
 
 
@@ -141,10 +165,15 @@ def main():
 
 if __name__ == '__main__':
     main()
-"#.into()),
+"#
+                    .into(),
+                ),
                 ("requirements.txt", "# add dependencies here\n".into()),
                 (".gitignore", "__pycache__/\n*.pyc\n.venv/\n.env\n".into()),
-                ("README.md", "# {{name}}\n\n```sh\npython main.py hello world\n```\n".into()),
+                (
+                    "README.md",
+                    "# {{name}}\n\n```sh\npython main.py hello world\n```\n".into(),
+                ),
             ],
         },
     ]
@@ -165,7 +194,11 @@ fn render(content: &str, vars: &HashMap<&str, String>) -> String {
 pub fn run(args: ScaffoldArgs, _ctx: &Context) -> Result<()> {
     match args.subcommand {
         ScaffoldSubcommand::List => list(),
-        ScaffoldSubcommand::New { template, name, dir } => new(&template, &name, dir),
+        ScaffoldSubcommand::New {
+            template,
+            name,
+            dir,
+        } => new(&template, &name, dir),
     }
 }
 
@@ -176,16 +209,26 @@ fn list() -> Result<()> {
         println!("  {:20} {}", t.name.bold(), t.description.dimmed());
     }
     println!();
-    println!("{}", "Usage: tooler scaffold new <template> <name>".dimmed());
+    println!(
+        "{}",
+        "Usage: tooler scaffold new <template> <name>".dimmed()
+    );
     Ok(())
 }
 
 fn new(template_name: &str, name: &str, output: Option<String>) -> Result<()> {
     let all = templates();
-    let tmpl = all.iter().find(|t| t.name == template_name).ok_or_else(|| {
-        let names: Vec<&str> = all.iter().map(|t| t.name).collect();
-        anyhow::anyhow!("Template '{}' not found. Available: {}", template_name, names.join(", "))
-    })?;
+    let tmpl = all
+        .iter()
+        .find(|t| t.name == template_name)
+        .ok_or_else(|| {
+            let names: Vec<&str> = all.iter().map(|t| t.name).collect();
+            anyhow::anyhow!(
+                "Template '{}' not found. Available: {}",
+                template_name,
+                names.join(", ")
+            )
+        })?;
 
     let dest = output.unwrap_or_else(|| name.to_string());
     let dest_path = Path::new(&dest);

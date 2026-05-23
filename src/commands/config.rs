@@ -1,7 +1,7 @@
-use anyhow::{bail, Result};
+use crate::{config, context::Context};
+use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
-use crate::{config, context::Context};
 
 #[derive(Args)]
 pub struct ConfigArgs {
@@ -36,15 +36,22 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                 println!("{}", "No profiles configured.".dimmed());
             } else {
                 for name in ctx.config.profile.keys() {
-                    let marker = if *name == ctx.profile { " (active)".dimmed().to_string() } else { String::new() };
+                    let marker = if *name == ctx.profile {
+                        " (active)".dimmed().to_string()
+                    } else {
+                        String::new()
+                    };
                     println!("  {}{}", name.cyan(), marker);
                 }
             }
         }
         ConfigSubcommand::Get { key } => match key.as_str() {
             "default.output" => println!("{}", ctx.config.default.output),
-            "default.color"  => println!("{}", ctx.config.default.color),
-            _ => bail!("Unknown key '{}'. Available: default.output, default.color", key),
+            "default.color" => println!("{}", ctx.config.default.color),
+            _ => bail!(
+                "Unknown key '{}'. Available: default.output, default.color",
+                key
+            ),
         },
         ConfigSubcommand::Set { key, value } => {
             let mut cfg = config::load()?;
@@ -56,10 +63,14 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                     cfg.default.output = value.clone();
                 }
                 "default.color" => {
-                    cfg.default.color = value.parse()
+                    cfg.default.color = value
+                        .parse()
                         .map_err(|_| anyhow::anyhow!("Use 'true' or 'false'"))?;
                 }
-                _ => bail!("Unknown key '{}'. Available: default.output, default.color", key),
+                _ => bail!(
+                    "Unknown key '{}'. Available: default.output, default.color",
+                    key
+                ),
             }
             config::save(&cfg)?;
             println!("{} {} = {}", "set".green().bold(), key.cyan(), value);

@@ -1,12 +1,12 @@
-use clap::{Parser, Subcommand};
 use crate::{
     commands::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, echo::EchoArgs,
-        env::EnvArgs, git::GitArgs, http::HttpArgs, info::InfoArgs, json::JsonArgs,
-        play::PlayArgs, run::RunArgs, scaffold::ScaffoldArgs,
+        env::EnvArgs, git::GitArgs, http::HttpArgs, info::InfoArgs, json::JsonArgs, play::PlayArgs,
+        run::RunArgs, scaffold::ScaffoldArgs,
     },
     output::OutputFormat,
 };
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(

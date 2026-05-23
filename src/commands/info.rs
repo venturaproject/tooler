@@ -1,8 +1,8 @@
+use crate::{context::Context, output::OutputFormat};
 use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
 use std::env;
-use crate::{context::Context, output::OutputFormat};
 
 #[derive(Args)]
 pub struct InfoArgs {
@@ -22,12 +22,19 @@ pub fn run(args: InfoArgs, ctx: &Context) -> Result<()> {
     if ctx.output == OutputFormat::Json {
         let mut root = serde_json::Map::new();
         if args.dir || show_all {
-            root.insert("dir".into(), env::current_dir()?.display().to_string().into());
+            root.insert(
+                "dir".into(),
+                env::current_dir()?.display().to_string().into(),
+            );
         }
         if args.env || show_all {
             let env_map: serde_json::Map<_, _> = env_keys
                 .iter()
-                .filter_map(|k| env::var(k).ok().map(|v| (k.to_string(), serde_json::Value::String(v))))
+                .filter_map(|k| {
+                    env::var(k)
+                        .ok()
+                        .map(|v| (k.to_string(), serde_json::Value::String(v)))
+                })
                 .collect();
             root.insert("env".into(), serde_json::Value::Object(env_map));
         }
@@ -48,7 +55,10 @@ pub fn run(args: InfoArgs, ctx: &Context) -> Result<()> {
         }
     }
 
-    let kv_refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let kv_refs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     if ctx.output == OutputFormat::Plain {
         println!("{}", "tooler info".bold().cyan());

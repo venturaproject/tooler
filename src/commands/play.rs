@@ -1,11 +1,11 @@
-use anyhow::{bail, Context as _, Result};
+use crate::context::Context;
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use colored::Colorize;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use crate::context::Context;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -73,8 +73,12 @@ struct EnvCheckSpec {
     target: String,
 }
 
-fn default_timeout() -> u64 { 5 }
-fn default_env_target() -> String { ".env".to_string() }
+fn default_timeout() -> u64 {
+    5
+}
+fn default_env_target() -> String {
+    ".env".to_string()
+}
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
@@ -84,8 +88,9 @@ pub fn run(args: PlayArgs, _ctx: &Context) -> Result<()> {
         return write_sample(path);
     }
 
-    let file = args.file.as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Specify a playbook file, or use --init to generate one."))?;
+    let file = args.file.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("Specify a playbook file, or use --init to generate one.")
+    })?;
 
     let file_path = PathBuf::from(file);
     let playbook_dir = file_path
@@ -98,19 +103,23 @@ pub fn run(args: PlayArgs, _ctx: &Context) -> Result<()> {
     let content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Cannot read playbook: {file}"))?;
 
-    let mut playbook: Playbook = serde_yaml::from_str(&content)
-        .with_context(|| format!("Invalid YAML in {file}"))?;
+    let mut playbook: Playbook =
+        serde_yaml::from_str(&content).with_context(|| format!("Invalid YAML in {file}"))?;
 
     // Merge CLI --var overrides into playbook vars
     for var in &args.vars {
         if let Some((k, v)) = var.split_once('=') {
-            playbook.vars.insert(k.trim().to_string(), v.trim().to_string());
+            playbook
+                .vars
+                .insert(k.trim().to_string(), v.trim().to_string());
         } else {
             bail!("--var must be in key=value format, got: '{var}'");
         }
     }
 
-    let tag_filter: Option<Vec<&str>> = args.tags.as_deref()
+    let tag_filter: Option<Vec<&str>> = args
+        .tags
+        .as_deref()
         .map(|t| t.split(',').map(str::trim).collect());
 
     execute_playbook(&playbook, &playbook_dir, &tag_filter, args.dry)
@@ -126,13 +135,20 @@ fn execute_playbook(
 ) -> Result<()> {
     let sep = "─".repeat(56);
 
-    println!("\n{} {} {}", "PLAY".bold().cyan(), format!("[{}]", playbook.name).bold(), playbook_dir.display().to_string().dimmed());
+    println!(
+        "\n{} {} {}",
+        "PLAY".bold().cyan(),
+        format!("[{}]", playbook.name).bold(),
+        playbook_dir.display().to_string().dimmed()
+    );
     if let Some(desc) = &playbook.description {
         println!("     {}", desc.dimmed());
     }
     println!("{}", sep.dimmed());
 
-    let tasks: Vec<&Task> = playbook.tasks.iter()
+    let tasks: Vec<&Task> = playbook
+        .tasks
+        .iter()
         .filter(|t| match tag_filter {
             None => true,
             Some(tags) => t.tags.iter().any(|tag| tags.contains(&tag.as_str())),
@@ -145,7 +161,13 @@ fn execute_playbook(
     let mut skipped = 0usize;
 
     for (i, task) in tasks.iter().enumerate() {
-        println!("\n{} [{}/{}] {}", "TASK".bold().yellow(), i + 1, total, task.name.bold());
+        println!(
+            "\n{} [{}/{}] {}",
+            "TASK".bold().yellow(),
+            i + 1,
+            total,
+            task.name.bold()
+        );
 
         let result = run_task(task, &playbook.vars, playbook_dir, dry);
 
@@ -160,7 +182,12 @@ fn execute_playbook(
             }
             Err(e) => {
                 if task.ignore_errors {
-                    println!("  {} {} — {}", "!".yellow().bold(), "failed (ignored):".yellow(), e);
+                    println!(
+                        "  {} {} — {}",
+                        "!".yellow().bold(),
+                        "failed (ignored):".yellow(),
+                        e
+                    );
                     skipped += 1;
                 } else {
                     println!("  {} {}", "✗".red().bold(), e.to_string().red());
@@ -184,7 +211,12 @@ fn execute_playbook(
     Ok(())
 }
 
-fn run_task(task: &Task, vars: &HashMap<String, String>, playbook_dir: &Path, dry: bool) -> Result<()> {
+fn run_task(
+    task: &Task,
+    vars: &HashMap<String, String>,
+    playbook_dir: &Path,
+    dry: bool,
+) -> Result<()> {
     if let Some(cmd) = &task.run {
         let cmd = render(cmd, vars);
         println!("  {} {}", "$".bold().green(), cmd.dimmed());
@@ -197,7 +229,11 @@ fn run_task(task: &Task, vars: &HashMap<String, String>, playbook_dir: &Path, dr
                 .status()?;
             let elapsed = start.elapsed();
             if status.success() {
-                println!("  {} {}", "✓ ok".green().bold(), format!("({:.1}s)", elapsed.as_secs_f32()).dimmed());
+                println!(
+                    "  {} {}",
+                    "✓ ok".green().bold(),
+                    format!("({:.1}s)", elapsed.as_secs_f32()).dimmed()
+                );
             } else {
                 bail!("command exited with code {}", status.code().unwrap_or(1));
             }
@@ -226,14 +262,22 @@ fn run_task(task: &Task, vars: &HashMap<String, String>, playbook_dir: &Path, dr
     if let Some(spec) = &task.env_check {
         let reference = playbook_dir.join(render(&spec.reference, vars));
         let target = playbook_dir.join(render(&spec.target, vars));
-        println!("  {} {} → {}", "→".bold(), reference.display().to_string().dimmed(), target.display().to_string().dimmed());
+        println!(
+            "  {} {} → {}",
+            "→".bold(),
+            reference.display().to_string().dimmed(),
+            target.display().to_string().dimmed()
+        );
         if !dry {
             env_check(&reference.to_string_lossy(), &target.to_string_lossy())?;
         }
         return Ok(());
     }
 
-    bail!("task '{}' has no action (run, check_url, check_port, env_check)", task.name);
+    bail!(
+        "task '{}' has no action (run, check_url, check_port, env_check)",
+        task.name
+    );
 }
 
 // ── Actions ───────────────────────────────────────────────────────────────────
@@ -244,7 +288,12 @@ fn check_url(url: &str) -> Result<()> {
         .build()?;
     match client.get(url).send() {
         Ok(r) if r.status().is_success() => {
-            println!("  {} {} ({})", "✓".green().bold(), url, r.status().as_u16().to_string().green());
+            println!(
+                "  {} {} ({})",
+                "✓".green().bold(),
+                url,
+                r.status().as_u16().to_string().green()
+            );
             Ok(())
         }
         Ok(r) => bail!("HTTP {}", r.status().as_u16()),
@@ -268,9 +317,10 @@ fn check_port(host: &str, port: u16, timeout_secs: u64) -> Result<()> {
 
 fn env_check(reference: &str, target: &str) -> Result<()> {
     let parse = |path: &str| -> Result<std::collections::HashSet<String>> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Cannot read {path}"))?;
-        Ok(content.lines()
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("Cannot read {path}"))?;
+        Ok(content
+            .lines()
             .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
             .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim().to_string()))
             .collect())
@@ -285,7 +335,14 @@ fn env_check(reference: &str, target: &str) -> Result<()> {
         Ok(())
     } else {
         missing.sort();
-        bail!("missing in {target}: {}", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        bail!(
+            "missing in {target}: {}",
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 }
 
@@ -304,7 +361,11 @@ fn print_recap(ok: usize, failed: usize, skipped: usize) {
         "\n{}  {}  {}  {}",
         "RECAP".bold(),
         format!("ok={ok}").green().bold(),
-        if failed > 0 { format!("failed={failed}").red().bold() } else { format!("failed={failed}").dimmed() },
+        if failed > 0 {
+            format!("failed={failed}").red().bold()
+        } else {
+            format!("failed={failed}").dimmed()
+        },
         format!("skipped={skipped}").dimmed(),
     );
 }

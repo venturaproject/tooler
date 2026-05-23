@@ -1,9 +1,9 @@
+use crate::context::Context;
 use anyhow::{Context as _, Result};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
-use crate::context::Context;
 
 #[derive(Args)]
 pub struct CheckArgs {
@@ -32,8 +32,12 @@ pub enum CheckSubcommand {
 
 pub fn run(args: CheckArgs, _ctx: &Context) -> Result<()> {
     match args.subcommand {
-        CheckSubcommand::Url { url, timeout }        => check_url(&url, timeout),
-        CheckSubcommand::Port { host, port, timeout } => check_port(&host, port, timeout),
+        CheckSubcommand::Url { url, timeout } => check_url(&url, timeout),
+        CheckSubcommand::Port {
+            host,
+            port,
+            timeout,
+        } => check_port(&host, port, timeout),
     }
 }
 
@@ -44,11 +48,21 @@ fn check_url(url: &str, timeout_secs: u64) -> Result<()> {
 
     match client.get(url).send() {
         Ok(res) if res.status().is_success() => {
-            println!("{} {} ({})", "✓".green().bold(), url, res.status().as_u16().to_string().green());
+            println!(
+                "{} {} ({})",
+                "✓".green().bold(),
+                url,
+                res.status().as_u16().to_string().green()
+            );
             Ok(())
         }
         Ok(res) => {
-            println!("{} {} ({})", "✗".red().bold(), url, res.status().as_u16().to_string().red());
+            println!(
+                "{} {} ({})",
+                "✗".red().bold(),
+                url,
+                res.status().as_u16().to_string().red()
+            );
             anyhow::bail!("HTTP {}", res.status().as_u16())
         }
         Err(e) => {
@@ -72,7 +86,11 @@ fn check_port(host: &str, port: u16, timeout_secs: u64) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            println!("{} {host}:{port} — {}", "✗".red().bold(), e.to_string().dimmed());
+            println!(
+                "{} {host}:{port} — {}",
+                "✗".red().bold(),
+                e.to_string().dimmed()
+            );
             Err(e.into())
         }
     }
