@@ -2,7 +2,8 @@ use clap::{Parser, Subcommand};
 use crate::{
     commands::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, echo::EchoArgs,
-        env::EnvArgs, http::HttpArgs, info::InfoArgs, json::JsonArgs, run::RunArgs,
+        env::EnvArgs, git::GitArgs, http::HttpArgs, info::InfoArgs, json::JsonArgs,
+        run::RunArgs, scaffold::ScaffoldArgs,
     },
     output::OutputFormat,
 };
@@ -53,6 +54,12 @@ pub enum Commands {
 
     /// Run a script defined in .tooler.toml
     Run(RunArgs),
+
+    /// Git utilities: summary, clean branches, changelog
+    Git(GitArgs),
+
+    /// Create new projects from templates
+    Scaffold(ScaffoldArgs),
 
     /// Generate shell completion scripts
     Completions(CompletionsArgs),
