@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "tooler": {
+      "type": "stdio",
+      "command": "tooler",
+      "args": [
+        "mcp"
+      ],
+      "env": {}
+    }
+  }
+}

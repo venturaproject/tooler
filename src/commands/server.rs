@@ -1,6 +1,7 @@
 use crate::{
     config::{self, Server},
     context::Context,
+    output::OutputFormat,
 };
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
@@ -45,9 +46,9 @@ pub enum ServerSubcommand {
     Remove { name: String },
 }
 
-pub fn run(args: ServerArgs, _ctx: &Context) -> Result<()> {
+pub fn run(args: ServerArgs, ctx: &Context) -> Result<()> {
     match args.subcommand {
-        ServerSubcommand::List => list(),
+        ServerSubcommand::List => list(ctx),
         ServerSubcommand::Add {
             name,
             host,
@@ -56,13 +57,33 @@ pub fn run(args: ServerArgs, _ctx: &Context) -> Result<()> {
             key,
             ssl_dir,
         } => add(&name, host, user, port, key, ssl_dir),
-        ServerSubcommand::Show { name } => show(&name),
+        ServerSubcommand::Show { name } => show(&name, ctx),
         ServerSubcommand::Remove { name } => remove(&name),
     }
 }
 
-fn list() -> Result<()> {
+fn list(ctx: &Context) -> Result<()> {
     let cfg = config::load()?;
+    let mut names: Vec<&String> = cfg.server.keys().collect();
+    names.sort();
+
+    if ctx.output == OutputFormat::Json {
+        let servers: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    serde_json::to_value(&cfg.server[*n]).unwrap(),
+                )
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"servers": serde_json::Value::Object(servers)})
+        );
+        return Ok(());
+    }
+
     if cfg.server.is_empty() {
         println!("{}", "No servers configured.".dimmed());
         println!(
@@ -74,8 +95,6 @@ fn list() -> Result<()> {
     }
     println!("{}", "servers:".bold().cyan());
     println!("{}", "─".repeat(50).dimmed());
-    let mut names: Vec<&String> = cfg.server.keys().collect();
-    names.sort();
     for name in names {
         let s = &cfg.server[name];
         let user_host = match &s.user {
@@ -123,12 +142,17 @@ fn add(
     Ok(())
 }
 
-fn show(name: &str) -> Result<()> {
+fn show(name: &str, ctx: &Context) -> Result<()> {
     let cfg = config::load()?;
     let s = cfg
         .server
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+
+    if ctx.output == OutputFormat::Json {
+        println!("{}", serde_json::json!({"name": name, "server": s}));
+        return Ok(());
+    }
 
     println!("{} {}", "server:".bold().cyan(), name.bold());
     println!("{}", "─".repeat(40).dimmed());

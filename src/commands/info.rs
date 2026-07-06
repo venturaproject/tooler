@@ -4,14 +4,16 @@ use clap::Args;
 use colored::Colorize;
 use std::env;
 
-#[derive(Args)]
+#[derive(Args, serde::Deserialize, schemars::JsonSchema)]
 pub struct InfoArgs {
     /// Show environment variables
     #[arg(short, long)]
+    #[serde(default)]
     pub env: bool,
 
     /// Show working directory
     #[arg(short, long)]
+    #[serde(default)]
     pub dir: bool,
 }
 

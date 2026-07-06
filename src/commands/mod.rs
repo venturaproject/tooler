@@ -7,6 +7,7 @@ pub mod git;
 pub mod http;
 pub mod info;
 pub mod json;
+pub mod mcp;
 pub mod play;
 pub mod run;
 pub mod scaffold;

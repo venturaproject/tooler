@@ -1,4 +1,4 @@
-use crate::context::Context;
+use crate::{context::Context, output::OutputFormat};
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
@@ -40,30 +40,51 @@ fn git(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-pub fn run(args: GitArgs, _ctx: &Context) -> Result<()> {
+pub fn run(args: GitArgs, ctx: &Context) -> Result<()> {
     match args.subcommand {
-        GitSubcommand::Summary => summary(),
-        GitSubcommand::Clean { remote, confirm } => clean(remote, confirm),
-        GitSubcommand::Changelog { from } => changelog(from),
+        GitSubcommand::Summary => summary(ctx),
+        GitSubcommand::Clean { remote, confirm } => clean(remote, confirm, ctx),
+        GitSubcommand::Changelog { from } => changelog(from, ctx),
     }
 }
 
-fn summary() -> Result<()> {
+fn summary(ctx: &Context) -> Result<()> {
     let branch = git(&["branch", "--show-current"])?;
     let status = git(&["status", "--short"])?;
-    let last_tag = git(&["describe", "--tags", "--abbrev=0"]).unwrap_or_else(|_| "—".to_string());
+    let last_tag = git(&["describe", "--tags", "--abbrev=0"]).ok();
     let log = git(&["log", "--oneline", "-5"])?;
 
-    let ahead_behind = git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
-        .ok()
-        .and_then(|s| {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            if parts.len() == 2 {
-                Some(format!("↑{} ↓{}", parts[0], parts[1]))
-            } else {
-                None
-            }
-        });
+    let ahead_behind: Option<(u32, u32)> =
+        git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
+            .ok()
+            .and_then(|s| {
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                if parts.len() == 2 {
+                    Some((parts[0].parse().unwrap_or(0), parts[1].parse().unwrap_or(0)))
+                } else {
+                    None
+                }
+            });
+
+    if ctx.output == OutputFormat::Json {
+        let (ahead, behind) = ahead_behind.unwrap_or((0, 0));
+        println!(
+            "{}",
+            serde_json::json!({
+                "branch": branch,
+                "tag": last_tag,
+                "ahead": ahead,
+                "behind": behind,
+                "clean": status.is_empty(),
+                "status": status.lines().collect::<Vec<_>>(),
+                "recent": log.lines().collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+
+    let last_tag = last_tag.unwrap_or_else(|| "—".to_string());
+    let ahead_behind = ahead_behind.map(|(a, b)| format!("↑{a} ↓{b}"));
 
     println!("{}", "git summary".bold().cyan());
     println!("{}", "─".repeat(40).dimmed());
@@ -93,7 +114,7 @@ fn summary() -> Result<()> {
     Ok(())
 }
 
-fn clean(remote: bool, confirm: bool) -> Result<()> {
+fn clean(remote: bool, confirm: bool, ctx: &Context) -> Result<()> {
     let current = git(&["branch", "--show-current"])?;
     let protected = ["main", "master", "develop", "dev", current.as_str()];
 
@@ -103,6 +124,35 @@ fn clean(remote: bool, confirm: bool) -> Result<()> {
         .map(|l| l.trim().trim_start_matches("* "))
         .filter(|b| !b.is_empty() && !protected.contains(b))
         .collect();
+
+    if ctx.output == OutputFormat::Json {
+        if to_delete.is_empty() {
+            println!("{}", serde_json::json!({"branches": [], "deleted": false}));
+            return Ok(());
+        }
+        if !confirm {
+            println!(
+                "{}",
+                serde_json::json!({"branches": to_delete, "deleted": false})
+            );
+            return Ok(());
+        }
+        let mut results = vec![];
+        for branch in &to_delete {
+            git(&["branch", "-d", branch])?;
+            let remote_deleted = if remote {
+                Some(git(&["push", "origin", "--delete", branch]).is_ok())
+            } else {
+                None
+            };
+            results.push(serde_json::json!({"branch": branch, "remote_deleted": remote_deleted}));
+        }
+        println!(
+            "{}",
+            serde_json::json!({"branches": to_delete, "deleted": true, "results": results})
+        );
+        return Ok(());
+    }
 
     if to_delete.is_empty() {
         println!("{}", "No merged branches to delete.".green());
@@ -133,7 +183,7 @@ fn clean(remote: bool, confirm: bool) -> Result<()> {
     Ok(())
 }
 
-fn changelog(from: Option<String>) -> Result<()> {
+fn changelog(from: Option<String>, ctx: &Context) -> Result<()> {
     let from_ref = match from {
         Some(f) => f,
         None => git(&["describe", "--tags", "--abbrev=0"])
@@ -149,6 +199,13 @@ fn changelog(from: Option<String>) -> Result<()> {
     let log = git(&["log", &range, "--oneline", "--no-merges"])?;
 
     if log.is_empty() {
+        if ctx.output == OutputFormat::Json {
+            println!(
+                "{}",
+                serde_json::json!({"features": [], "fixes": [], "other": []})
+            );
+            return Ok(());
+        }
         println!("{}", "No commits since last tag.".dimmed());
         return Ok(());
     }
@@ -166,6 +223,14 @@ fn changelog(from: Option<String>) -> Result<()> {
         } else {
             other.push(msg);
         }
+    }
+
+    if ctx.output == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({"features": feat, "fixes": fix, "other": other})
+        );
+        return Ok(());
     }
 
     println!("## Changelog\n");

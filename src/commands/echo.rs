@@ -3,22 +3,34 @@ use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
 
-#[derive(Args)]
+#[derive(Args, serde::Deserialize, schemars::JsonSchema)]
 pub struct EchoArgs {
     /// Text to echo
+    #[serde(default)]
     pub text: Vec<String>,
 
     /// Print in uppercase
     #[arg(short, long)]
+    #[serde(default)]
     pub upper: bool,
 
     /// Color: red, green, blue, yellow, cyan, magenta
     #[arg(short, long, default_value = "white")]
+    #[serde(default = "default_echo_color")]
     pub color: String,
 
     /// Repeat N times
     #[arg(short, long, default_value_t = 1)]
+    #[serde(default = "default_echo_repeat")]
     pub repeat: u32,
+}
+
+fn default_echo_color() -> String {
+    "white".to_string()
+}
+
+fn default_echo_repeat() -> u32 {
+    1
 }
 
 pub fn run(args: EchoArgs, _ctx: &Context) -> Result<()> {

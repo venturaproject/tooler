@@ -20,6 +20,7 @@
   - [tooler scaffold](#tooler-scaffold)
   - [tooler config](#tooler-config)
   - [tooler completions](#tooler-completions)
+  - [tooler mcp](#tooler-mcp)
 - [Extending tooler](#extending-tooler)
 - [Releasing a new version](#releasing-a-new-version)
 - [Dependencies](#dependencies)
@@ -370,6 +371,56 @@ tooler completions fish  > ~/.config/fish/completions/tooler.fish
 
 ---
 
+### tooler mcp
+
+Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
+
+```sh
+tooler mcp
+```
+
+**Claude Code** (project or user scope):
+
+```sh
+claude mcp add tooler -- tooler mcp
+```
+
+**Claude Desktop** — add to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "tooler": {
+      "command": "tooler",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Most tools accept an optional `cwd` parameter so a single long-running server can target different project directories across a session.
+
+Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can distinguish safe reads (`tooler_info`, `tooler_env_show`, `tooler_check_url`, ...) from destructive operations (`tooler_ssh_exec`, `tooler_ssh_ssl`, `tooler_git_clean`, ...).
+
+`tooler_ssh_ssl` never accepts `pfx_password`/`sudo_pass` as tool arguments (they'd otherwise sit in plaintext in the conversation/tool-call history). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` in the MCP server's own environment instead, e.g.:
+
+```json
+{
+  "mcpServers": {
+    "tooler": {
+      "command": "tooler",
+      "args": ["mcp"],
+      "env": {
+        "TOOLER_PFX_PASS": "...",
+        "TOOLER_SUDO_PASS": "..."
+      }
+    }
+  }
+}
+```
+
+---
+
 ## Extending tooler
 
 Adding a new command takes five steps:
@@ -446,3 +497,4 @@ Builds for: `linux/x86_64`, `linux/aarch64`, `macos/x86_64`, `macos/aarch64`, `w
 | `dirs` | Home directory resolution |
 | `chrono` | Date/year for scaffold templates |
 | `clap_complete` | Shell completion generation |
+| `rmcp` + `schemars` + `tokio` | MCP server (`tooler mcp`) |

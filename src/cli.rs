@@ -1,8 +1,8 @@
 use crate::{
     commands::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, echo::EchoArgs,
-        env::EnvArgs, git::GitArgs, http::HttpArgs, info::InfoArgs, json::JsonArgs, play::PlayArgs,
-        run::RunArgs, scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs,
+        env::EnvArgs, git::GitArgs, http::HttpArgs, info::InfoArgs, json::JsonArgs, mcp::McpArgs,
+        play::PlayArgs, run::RunArgs, scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs,
     },
     output::OutputFormat,
 };
@@ -72,4 +72,7 @@ pub enum Commands {
 
     /// SSH operations: check, exec, copy, ssl deploy
     Ssh(SshArgs),
+
+    /// Run tooler as an MCP server (stdio) for use with Claude and other MCP clients
+    Mcp(McpArgs),
 }

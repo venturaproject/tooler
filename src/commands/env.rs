@@ -99,6 +99,10 @@ pub fn run(args: EnvArgs, ctx: &Context) -> Result<()> {
             let vars = parse_env_file(&file)?;
             let mut keys: Vec<String> = vars.into_keys().collect();
             keys.sort();
+            if ctx.output == OutputFormat::Json {
+                println!("{}", serde_json::json!({"keys": keys}));
+                return Ok(());
+            }
             for key in &keys {
                 println!("{key}");
             }
@@ -107,8 +111,23 @@ pub fn run(args: EnvArgs, ctx: &Context) -> Result<()> {
         EnvSubcommand::Get { key, file } => {
             let vars = parse_env_file(&file)?;
             match vars.get(&key) {
-                Some(val) => println!("{val}"),
-                None => bail!("Key '{}' not found in {}", key, file),
+                Some(val) => {
+                    if ctx.output == OutputFormat::Json {
+                        println!("{}", serde_json::json!({"key": key, "value": val}));
+                    } else {
+                        println!("{val}");
+                    }
+                }
+                None => {
+                    if ctx.output == OutputFormat::Json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"key": key, "error": format!("Key '{key}' not found in {file}")})
+                        );
+                        std::process::exit(1);
+                    }
+                    bail!("Key '{}' not found in {}", key, file)
+                }
             }
         }
 
@@ -119,6 +138,23 @@ pub fn run(args: EnvArgs, ctx: &Context) -> Result<()> {
             let mut all_keys: Vec<String> = vars_a.keys().chain(vars_b.keys()).cloned().collect();
             all_keys.sort();
             all_keys.dedup();
+
+            if ctx.output == OutputFormat::Json {
+                let mut only_in_a = vec![];
+                let mut only_in_b = vec![];
+                for key in &all_keys {
+                    match (vars_a.contains_key(key), vars_b.contains_key(key)) {
+                        (true, false) => only_in_a.push(key.clone()),
+                        (false, true) => only_in_b.push(key.clone()),
+                        _ => {}
+                    }
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"only_in_a": only_in_a, "only_in_b": only_in_b})
+                );
+                return Ok(());
+            }
 
             let mut diffs = false;
             for key in &all_keys {
@@ -157,6 +193,16 @@ pub fn run(args: EnvArgs, ctx: &Context) -> Result<()> {
                 .into_keys()
                 .filter(|k| !target_vars.contains_key(k))
                 .collect();
+            missing.sort();
+
+            if ctx.output == OutputFormat::Json {
+                let ok = missing.is_empty();
+                println!("{}", serde_json::json!({"missing": missing, "ok": ok}));
+                if !ok {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
 
             if missing.is_empty() {
                 println!(
@@ -166,7 +212,6 @@ pub fn run(args: EnvArgs, ctx: &Context) -> Result<()> {
                     target
                 );
             } else {
-                missing.sort();
                 eprintln!("{} missing keys in {}:", "✗".red().bold(), target);
                 for key in &missing {
                     eprintln!("  {}", key.yellow());
