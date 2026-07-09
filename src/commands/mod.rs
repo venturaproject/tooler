@@ -1,6 +1,7 @@
 pub mod check;
 pub mod completions;
 pub mod config;
+pub mod doctor;
 pub mod echo;
 pub mod env;
 pub mod git;

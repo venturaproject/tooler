@@ -23,6 +23,7 @@ reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], def
 chrono = "0.4"
 serde_yaml = "0.9"
 keyring = "4"
-rmcp = { version = "2", features = ["server", "transport-io"] }
+rmcp = { version = "2", features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-std", "net"] }
+axum = "0.8"

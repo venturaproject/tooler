@@ -41,5 +41,6 @@ fn main() -> Result<()> {
         Commands::Server(args) => commands::server::run(args, &ctx),
         Commands::Ssh(args) => commands::ssh::run(args, &ctx),
         Commands::Mcp(args) => commands::mcp::run(args, &ctx),
+        Commands::Doctor(args) => commands::doctor::run(args, &ctx),
     }
 }

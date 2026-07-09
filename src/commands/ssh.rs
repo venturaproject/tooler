@@ -67,7 +67,7 @@ pub enum SshSubcommand {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn expand_tilde(path: &str) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     if let Some(stripped) = path.strip_prefix("~/")
         && let Some(home) = dirs::home_dir()
     {

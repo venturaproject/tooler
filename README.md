@@ -20,6 +20,7 @@
   - [tooler scaffold](#tooler-scaffold)
   - [tooler config](#tooler-config)
   - [tooler completions](#tooler-completions)
+  - [tooler doctor](#tooler-doctor)
   - [tooler mcp](#tooler-mcp)
 - [Extending tooler](#extending-tooler)
 - [Releasing a new version](#releasing-a-new-version)
@@ -376,6 +377,17 @@ tooler completions fish  > ~/.config/fish/completions/tooler.fish
 
 ---
 
+### tooler doctor
+
+Run environment/health checks: git installed/configured, OS keychain accessible, SSH key files for configured server profiles, self-exe resolution, and a config summary. Exits non-zero if any check fails.
+
+```sh
+tooler doctor
+tooler doctor --output json
+```
+
+---
+
 ### tooler mcp
 
 Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
@@ -426,6 +438,27 @@ Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openW
 ```
 
 Likewise, `tooler_config_get`/`tooler_config_set` refuse `profile.<name>.token` over MCP -- set or read it directly in a terminal (`tooler config set profile.staging.token ...`), where it's stored encrypted in the OS keychain instead of passing through the conversation. `tooler_config_unset` is exempt since it only removes a value.
+
+Run `tooler doctor` (also exposed as the `tooler_doctor` tool) to self-check the environment an MCP server is running in: git installed/configured, OS keychain accessible, SSH key files for configured server profiles, and that the binary can resolve itself (a precondition for every tool call, since each one re-execs `tooler`).
+
+**Resources** (read-only, referenceable with `@` in MCP clients): `tooler://config/profiles`, `tooler://config/servers`, `tooler://config/show` -- the same data as their equivalent tools, for use as ambient context.
+
+**Prompts**: `deploy_check(profile)` walks through `tooler_env_diff` / `tooler_check_url` / `tooler_git_summary` for a profile; `env_parity(file_a, file_b)` diffs two `.env` files and summarizes drift.
+
+**Audit log**: pass `--audit-log <path>` (or set `TOOLER_MCP_AUDIT_LOG`) to append one JSON line per tool call (timestamp, argv, cwd, success, duration) -- useful when Claude is driving SSH/git/server operations semi-autonomously.
+
+```sh
+tooler mcp --audit-log ~/.tooler/mcp-audit.jsonl
+```
+
+**HTTP transport**: `tooler mcp` is stdio-only by default (unchanged for Claude Code/Desktop). Pass `--http` to serve over [Streamable HTTP](https://modelcontextprotocol.io) instead, e.g. to reach it from claude.ai or a remote agent. `rmcp` has no built-in inbound authentication, so `tooler` requires a bearer token and **refuses to start** without one:
+
+```sh
+tooler mcp --http --token "$(openssl rand -hex 32)"   # binds 127.0.0.1:8642 by default
+tooler mcp --http --bind 0.0.0.0:8642 --token ...      # expose beyond localhost -- do this deliberately
+```
+
+`--token` can also come from `TOOLER_MCP_TOKEN`. Clients must send `Authorization: Bearer <token>`; requests without it (or with the wrong token) get `401`.
 
 ---
 
@@ -506,4 +539,5 @@ Builds for: `linux/x86_64`, `linux/aarch64`, `macos/x86_64`, `macos/aarch64`, `w
 | `chrono` | Date/year for scaffold templates |
 | `clap_complete` | Shell completion generation |
 | `rmcp` + `schemars` + `tokio` | MCP server (`tooler mcp`) |
+| `axum` | HTTP transport for `tooler mcp --http` |
 | `keyring` | Encrypted credential storage (OS Keychain / Credential Manager / Secret Service) |

@@ -5,9 +5,18 @@ use crate::{
 use anyhow::Result;
 use clap::Args;
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    handler::server::{
+        router::{prompt::PromptRouter, tool::ToolRouter},
+        wrapper::Parameters,
+    },
+    model::{
+        CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
+        PromptMessage, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
+        Role, ServerCapabilities, ServerInfo,
+    },
+    prompt, prompt_handler, prompt_router,
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -15,15 +24,93 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 #[derive(Args)]
-pub struct McpArgs {}
+pub struct McpArgs {
+    /// Serve over HTTP (Streamable HTTP transport) instead of stdio
+    #[arg(long)]
+    pub http: bool,
+    /// Bind address when --http is set
+    #[arg(long, default_value = "127.0.0.1:8642")]
+    pub bind: String,
+    /// Bearer token required for --http requests [env: TOOLER_MCP_TOKEN]
+    #[arg(long, env = "TOOLER_MCP_TOKEN")]
+    pub token: Option<String>,
+    /// Append a JSON line per MCP tool call to this file [env: TOOLER_MCP_AUDIT_LOG]
+    #[arg(long, env = "TOOLER_MCP_AUDIT_LOG")]
+    pub audit_log: Option<std::path::PathBuf>,
+}
 
-pub fn run(_args: McpArgs, _ctx: &Context) -> Result<()> {
+pub fn run(args: McpArgs, _ctx: &Context) -> Result<()> {
+    if args.http && args.token.is_none() {
+        anyhow::bail!(
+            "tooler mcp --http requires a bearer token: pass --token or set TOOLER_MCP_TOKEN. \
+             Refusing to start an unauthenticated HTTP MCP server."
+        );
+    }
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let service = ToolerMcp::new().serve(stdio()).await?;
-        service.waiting().await?;
-        anyhow::Ok(())
+        if args.http {
+            run_http(args).await
+        } else {
+            let service = ToolerMcp::with_audit_log(args.audit_log)
+                .serve(stdio())
+                .await?;
+            service.waiting().await?;
+            anyhow::Ok(())
+        }
     })
+}
+
+async fn run_http(args: McpArgs) -> Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+    use std::sync::Arc;
+
+    let token = Arc::new(args.token.expect("checked in run()"));
+    let audit_log = args.audit_log;
+
+    let service = StreamableHttpService::new(
+        move || Ok(ToolerMcp::with_audit_log(audit_log.clone())),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(token, require_bearer_token),
+    );
+
+    let addr: std::net::SocketAddr = args
+        .bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --bind address '{}': {e}", args.bind))?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    eprintln!("tooler mcp: listening on http://{addr}/mcp (bearer auth required)");
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+async fn require_bearer_token(
+    axum::extract::State(expected): axum::extract::State<std::sync::Arc<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    let provided = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match provided {
+        Some(p) if constant_time_eq(p.as_bytes(), expected.as_bytes()) => Ok(next.run(req).await),
+        _ => Err(axum::http::StatusCode::UNAUTHORIZED),
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ── argv helpers ────────────────────────────────────────────────────────────
@@ -59,52 +146,95 @@ fn push_repeated(argv: &mut Vec<String>, flag: &str, values: &[String]) {
     }
 }
 
-/// Self-invokes the current `tooler` binary as a subprocess with the given
-/// argv, and returns its output as an MCP tool result. Always appends
-/// `--output json` (a no-op for commands that don't branch on it) and sets
-/// `NO_COLOR=1` so plain-text responses come back without ANSI escapes.
-async fn exec_self(
-    mut argv: Vec<String>,
-    cwd: &Option<String>,
-) -> Result<CallToolResult, McpError> {
-    let exe = std::env::current_exe().map_err(|e| {
-        McpError::internal_error(format!("cannot resolve tooler binary: {e}"), None)
-    })?;
+impl ToolerMcp {
+    /// Self-invokes the current `tooler` binary as a subprocess with the given
+    /// argv, and returns its output as an MCP tool result. Always appends
+    /// `--output json` (a no-op for commands that don't branch on it) and sets
+    /// `NO_COLOR=1` so plain-text responses come back without ANSI escapes.
+    async fn exec_self(
+        &self,
+        mut argv: Vec<String>,
+        cwd: &Option<String>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = std::time::Instant::now();
+        let logged_argv = argv.clone();
 
-    argv.push("--output".to_string());
-    argv.push("json".to_string());
+        let exe = std::env::current_exe().map_err(|e| {
+            McpError::internal_error(format!("cannot resolve tooler binary: {e}"), None)
+        })?;
 
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.args(&argv).env("NO_COLOR", "1");
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+        argv.push("--output".to_string());
+        argv.push("json".to_string());
+
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.args(&argv).env("NO_COLOR", "1");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| McpError::internal_error(format!("failed to launch tooler: {e}"), None))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        let result = if output.status.success() {
+            CallToolResult::success(vec![ContentBlock::text(stdout)])
+        } else {
+            let mut message = String::new();
+            if !stdout.trim().is_empty() {
+                message.push_str(&stdout);
+            }
+            if !stderr.trim().is_empty() {
+                if !message.is_empty() {
+                    message.push_str("\n--- stderr ---\n");
+                }
+                message.push_str(&stderr);
+            }
+            if message.is_empty() {
+                message = format!("tooler exited with status {}", output.status);
+            }
+            CallToolResult::error(vec![ContentBlock::text(message)])
+        };
+
+        self.write_audit(
+            &logged_argv,
+            cwd,
+            output.status.success(),
+            started.elapsed().as_millis(),
+        );
+        Ok(result)
     }
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| McpError::internal_error(format!("failed to launch tooler: {e}"), None))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    if output.status.success() {
-        Ok(CallToolResult::success(vec![ContentBlock::text(stdout)]))
-    } else {
-        let mut message = String::new();
-        if !stdout.trim().is_empty() {
-            message.push_str(&stdout);
+    /// Appends one JSON line per MCP tool call to `self.audit_log`, if set. A plain
+    /// blocking write is intentional: this is one append per tool call (low
+    /// frequency), not a hot path, so `tokio::fs`/locking would be over-engineering
+    /// for a single-user CLI's audit trail.
+    fn write_audit(&self, argv: &[String], cwd: &Option<String>, success: bool, duration_ms: u128) {
+        let Some(path) = &self.audit_log else {
+            return;
+        };
+        let line = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "argv": argv,
+            "cwd": cwd,
+            "success": success,
+            "duration_ms": duration_ms,
+        });
+        use std::io::Write;
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| writeln!(f, "{line}"));
+        if let Err(e) = result {
+            eprintln!(
+                "tooler mcp: failed to write audit log {}: {e}",
+                path.display()
+            );
         }
-        if !stderr.trim().is_empty() {
-            if !message.is_empty() {
-                message.push_str("\n--- stderr ---\n");
-            }
-            message.push_str(&stderr);
-        }
-        if message.is_empty() {
-            message = format!("tooler exited with status {}", output.status);
-        }
-        Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
     }
 }
 
@@ -370,12 +500,23 @@ struct SshSslArgs {
 #[derive(Clone)]
 pub struct ToolerMcp {
     tool_router: ToolRouter<ToolerMcp>,
+    prompt_router: PromptRouter<ToolerMcp>,
+    audit_log: Option<std::path::PathBuf>,
 }
 
 impl ToolerMcp {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
+            audit_log: None,
+        }
+    }
+
+    pub fn with_audit_log(audit_log: Option<std::path::PathBuf>) -> Self {
+        Self {
+            audit_log,
+            ..Self::new()
         }
     }
 }
@@ -383,6 +524,61 @@ impl ToolerMcp {
 impl Default for ToolerMcp {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DeployCheckArgs {
+    /// Config profile name (matches profile.<name> / server.<name> in tooler config)
+    profile: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct EnvParityArgs {
+    /// First .env file path
+    file_a: String,
+    /// Second .env file path
+    file_b: String,
+}
+
+#[prompt_router]
+impl ToolerMcp {
+    #[prompt(
+        name = "deploy_check",
+        description = "Guide a pre-deploy check: env parity, URL health, and git status for a profile"
+    )]
+    async fn deploy_check(
+        &self,
+        Parameters(args): Parameters<DeployCheckArgs>,
+    ) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "Run a deploy readiness check for the '{p}' profile:\n\
+                 1. Call tooler_env_diff to compare the local .env against .env.example.\n\
+                 2. Call tooler_check_url against the profile's base_url to confirm it's reachable.\n\
+                 3. Call tooler_git_summary to confirm the working tree is clean.\n\
+                 Summarize pass/fail for each step at the end.",
+                p = args.profile
+            ),
+        )]
+    }
+
+    #[prompt(
+        name = "env_parity",
+        description = "Guide a diff between two .env files and summarize drift"
+    )]
+    async fn env_parity(&self, Parameters(args): Parameters<EnvParityArgs>) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "Call tooler_env_diff with file_a=\"{a}\" and file_b=\"{b}\", then summarize which \
+                 keys are missing on each side and flag anything that looks like a required \
+                 variable.",
+                a = args.file_a,
+                b = args.file_b
+            ),
+        )]
     }
 }
 
@@ -399,7 +595,16 @@ impl ToolerMcp {
         let mut argv = vec!["info".to_string()];
         push_flag(&mut argv, "--env", args.env);
         push_flag(&mut argv, "--dir", args.dir);
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Run environment/health checks: git, OS keychain, SSH key files, \
+                        self-exe resolution, config summary",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn tooler_doctor(&self) -> Result<CallToolResult, McpError> {
+        self.exec_self(vec!["doctor".to_string()], &None).await
     }
 
     #[tool(
@@ -417,7 +622,7 @@ impl ToolerMcp {
         argv.push(args.color.clone());
         argv.push("--repeat".to_string());
         argv.push(args.repeat.to_string());
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -431,7 +636,7 @@ impl ToolerMcp {
         let mut argv = vec!["json".to_string(), args.file.clone()];
         push_opt(&mut argv, "--key", &args.key);
         push_flag(&mut argv, "--compact", args.compact);
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -447,7 +652,7 @@ impl ToolerMcp {
             argv.push(f.clone());
         }
         push_flag(&mut argv, "--reveal", args.reveal);
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -462,7 +667,7 @@ impl ToolerMcp {
         if let Some(f) = &args.file {
             argv.push(f.clone());
         }
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -477,7 +682,7 @@ impl ToolerMcp {
         if let Some(f) = &args.file {
             argv.push(f.clone());
         }
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -494,7 +699,7 @@ impl ToolerMcp {
             args.file_a.clone(),
             args.file_b.clone(),
         ];
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -513,7 +718,7 @@ impl ToolerMcp {
         if let Some(t) = &args.target {
             argv.push(t.clone());
         }
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -531,7 +736,7 @@ impl ToolerMcp {
         push_repeated(&mut argv, "--header", &args.headers);
         push_opt_num(&mut argv, "--timeout", args.timeout);
         push_opt(&mut argv, "--profile", &args.profile);
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -555,7 +760,7 @@ impl ToolerMcp {
         push_repeated(&mut argv, "--header", &args.headers);
         push_opt_num(&mut argv, "--timeout", args.timeout);
         push_opt(&mut argv, "--profile", &args.profile);
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -568,7 +773,7 @@ impl ToolerMcp {
     ) -> Result<CallToolResult, McpError> {
         let mut argv = vec!["check".to_string(), "url".to_string(), args.url.clone()];
         push_opt_num(&mut argv, "--timeout", args.timeout);
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -586,7 +791,7 @@ impl ToolerMcp {
             args.port.to_string(),
         ];
         push_opt_num(&mut argv, "--timeout", args.timeout);
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -594,7 +799,8 @@ impl ToolerMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn tooler_config_show(&self) -> Result<CallToolResult, McpError> {
-        exec_self(vec!["config".to_string(), "show".to_string()], &None).await
+        self.exec_self(vec!["config".to_string(), "show".to_string()], &None)
+            .await
     }
 
     #[tool(
@@ -612,7 +818,7 @@ impl ToolerMcp {
             )]));
         }
         let argv = vec!["config".to_string(), "get".to_string(), args.key.clone()];
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -643,7 +849,7 @@ impl ToolerMcp {
             args.key.clone(),
             args.value.clone(),
         ];
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -651,7 +857,8 @@ impl ToolerMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn tooler_config_profiles(&self) -> Result<CallToolResult, McpError> {
-        exec_self(vec!["config".to_string(), "profiles".to_string()], &None).await
+        self.exec_self(vec!["config".to_string(), "profiles".to_string()], &None)
+            .await
     }
 
     #[tool(
@@ -659,7 +866,8 @@ impl ToolerMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn tooler_config_path(&self) -> Result<CallToolResult, McpError> {
-        exec_self(vec!["config".to_string(), "path".to_string()], &None).await
+        self.exec_self(vec!["config".to_string(), "path".to_string()], &None)
+            .await
     }
 
     #[tool(
@@ -677,7 +885,7 @@ impl ToolerMcp {
         Parameters(args): Parameters<ConfigUnsetArgs>,
     ) -> Result<CallToolResult, McpError> {
         let argv = vec!["config".to_string(), "unset".to_string(), args.key.clone()];
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -702,7 +910,7 @@ impl ToolerMcp {
             argv.push("--".to_string());
             argv.extend(args.extra.clone());
         }
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -726,7 +934,7 @@ impl ToolerMcp {
         push_repeated(&mut argv, "--var", &args.vars);
         push_opt(&mut argv, "--tags", &args.tags);
         push_flag(&mut argv, "--init", args.init);
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -737,7 +945,8 @@ impl ToolerMcp {
         &self,
         Parameters(args): Parameters<GitCwdArgs>,
     ) -> Result<CallToolResult, McpError> {
-        exec_self(vec!["git".to_string(), "summary".to_string()], &args.cwd).await
+        self.exec_self(vec!["git".to_string(), "summary".to_string()], &args.cwd)
+            .await
     }
 
     #[tool(
@@ -756,7 +965,7 @@ impl ToolerMcp {
         let mut argv = vec!["git".to_string(), "clean".to_string()];
         push_flag(&mut argv, "--remote", args.remote);
         push_flag(&mut argv, "--confirm", args.confirm);
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -769,7 +978,7 @@ impl ToolerMcp {
     ) -> Result<CallToolResult, McpError> {
         let mut argv = vec!["git".to_string(), "changelog".to_string()];
         push_opt(&mut argv, "--from", &args.from);
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -777,7 +986,8 @@ impl ToolerMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn tooler_scaffold_list(&self) -> Result<CallToolResult, McpError> {
-        exec_self(vec!["scaffold".to_string(), "list".to_string()], &None).await
+        self.exec_self(vec!["scaffold".to_string(), "list".to_string()], &None)
+            .await
     }
 
     #[tool(
@@ -800,7 +1010,7 @@ impl ToolerMcp {
             args.name.clone(),
         ];
         push_opt(&mut argv, "--dir", &args.dir);
-        exec_self(argv, &args.cwd).await
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(
@@ -808,7 +1018,8 @@ impl ToolerMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn tooler_server_list(&self) -> Result<CallToolResult, McpError> {
-        exec_self(vec!["server".to_string(), "list".to_string()], &None).await
+        self.exec_self(vec!["server".to_string(), "list".to_string()], &None)
+            .await
     }
 
     #[tool(
@@ -835,7 +1046,7 @@ impl ToolerMcp {
         push_opt_num(&mut argv, "--port", args.port);
         push_opt(&mut argv, "--key", &args.key);
         push_opt(&mut argv, "--ssl-dir", &args.ssl_dir);
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -847,7 +1058,7 @@ impl ToolerMcp {
         Parameters(args): Parameters<ServerNameArgs>,
     ) -> Result<CallToolResult, McpError> {
         let argv = vec!["server".to_string(), "show".to_string(), args.name.clone()];
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -868,7 +1079,7 @@ impl ToolerMcp {
             "remove".to_string(),
             args.name.clone(),
         ];
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -880,7 +1091,7 @@ impl ToolerMcp {
         Parameters(args): Parameters<SshCheckArgs>,
     ) -> Result<CallToolResult, McpError> {
         let argv = vec!["ssh".to_string(), "check".to_string(), args.server.clone()];
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -903,7 +1114,7 @@ impl ToolerMcp {
             args.command.clone(),
         ];
         push_flag(&mut argv, "--sudo", args.sudo);
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -925,7 +1136,7 @@ impl ToolerMcp {
             args.local.clone(),
             args.remote.clone(),
         ];
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 
     #[tool(
@@ -955,20 +1166,78 @@ impl ToolerMcp {
         push_opt(&mut argv, "--remote-dir", &args.remote_dir);
         push_opt(&mut argv, "--cert-name", &args.cert_name);
         push_opt(&mut argv, "--key-name", &args.key_name);
-        exec_self(argv, &None).await
+        self.exec_self(argv, &None).await
     }
 }
 
 #[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for ToolerMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("tooler", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Tooler: a devops CLI toolkit. Tools mirror the `tooler` subcommands 1:1 \
-                 (env, http, check, git, ssh, server profiles, run/play automation). \
-                 Most tools accept an optional `cwd` to target a specific project directory.",
-            )
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(Implementation::new("tooler", env!("CARGO_PKG_VERSION")))
+        .with_instructions(
+            "Tooler: a devops CLI toolkit. Tools mirror the `tooler` subcommands 1:1 \
+             (env, http, check, git, ssh, server profiles, run/play automation). \
+             Most tools accept an optional `cwd` to target a specific project directory.",
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new("tooler://config/profiles", "config_profiles")
+                .with_description("Configured tooler profiles (same as tooler_config_profiles)")
+                .with_mime_type("application/json"),
+            Resource::new("tooler://config/servers", "config_servers")
+                .with_description("Configured server profiles (same as tooler_server_list)")
+                .with_mime_type("application/json"),
+            Resource::new("tooler://config/show", "config_show")
+                .with_description("Full tooler configuration (same as tooler_config_show)")
+                .with_mime_type("application/json"),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let argv = match request.uri.as_str() {
+            "tooler://config/profiles" => vec!["config".to_string(), "profiles".to_string()],
+            "tooler://config/servers" => vec!["server".to_string(), "list".to_string()],
+            "tooler://config/show" => vec!["config".to_string(), "show".to_string()],
+            other => {
+                return Err(McpError::resource_not_found(
+                    format!("no such resource: {other}"),
+                    None,
+                ));
+            }
+        };
+        let result = self.exec_self(argv, &None).await?;
+        let text = result
+            .content
+            .into_iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if result.is_error == Some(true) {
+            return Err(McpError::internal_error(text, None));
+        }
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(text, request.uri).with_mime_type("application/json"),
+        ]))
     }
 }
 
