@@ -168,6 +168,10 @@ tooler config set profile.staging.token mytoken123
 tooler http get /users --profile staging
 ```
 
+Tokens are never written to `config.toml` in plaintext — they're stored encrypted in the OS credential store (Keychain on macOS, Credential Manager on Windows, Secret Service on Linux). `tooler config show` / `config profiles` never reveal the value, only whether a token is set (`[token]`). Remove one with `tooler config unset profile.staging.token`.
+
+A profile's stored token is only ever attached automatically when the request's URL has the same scheme+host+port as that profile's `base_url` — a relative path (which is always resolved against `base_url`) or an absolute URL that happens to match it. A request to any other host (e.g. one an MCP tool caller supplies) is sent without it; pass `--token` explicitly if you really want to send a credential somewhere else.
+
 ---
 
 ### tooler check
@@ -338,10 +342,13 @@ tooler config path                          # show config file location
 tooler config get default.output            # read a value
 tooler config set default.output json       # set a value (plain | json | table)
 tooler config set default.color false
-tooler config profiles                      # list configured profiles
+tooler config profiles                      # list configured profiles (with [token] markers)
+tooler config set profile.staging.base_url https://staging.example.com
+tooler config set profile.staging.token mytoken123   # stored in the OS keychain, not this file
+tooler config unset profile.staging.token
 ```
 
-**Config file structure** (`~/.tooler/config.toml`):
+**Config file structure** (`~/.tooler/config.toml`) — profile tokens are deliberately absent, see above:
 
 ```toml
 [default]
@@ -350,11 +357,9 @@ color = true
 
 [profile.staging]
 base_url = "https://staging.example.com"
-token = "mytoken"
 
 [profile.prod]
 base_url = "https://example.com"
-token = "prodtoken"
 ```
 
 ---
@@ -418,6 +423,8 @@ Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openW
   }
 }
 ```
+
+Likewise, `tooler_config_get`/`tooler_config_set` refuse `profile.<name>.token` over MCP -- set or read it directly in a terminal (`tooler config set profile.staging.token ...`), where it's stored encrypted in the OS keychain instead of passing through the conversation. `tooler_config_unset` is exempt since it only removes a value.
 
 ---
 
@@ -498,3 +505,4 @@ Builds for: `linux/x86_64`, `linux/aarch64`, `macos/x86_64`, `macos/aarch64`, `w
 | `chrono` | Date/year for scaffold templates |
 | `clap_complete` | Shell completion generation |
 | `rmcp` + `schemars` + `tokio` | MCP server (`tooler mcp`) |
+| `keyring` | Encrypted credential storage (OS Keychain / Credential Manager / Secret Service) |

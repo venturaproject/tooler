@@ -62,8 +62,30 @@ fn resolve_url(url: &str, ctx: &Context) -> Result<String> {
     )
 }
 
-fn active_token(token: Option<String>, ctx: &Context) -> Option<String> {
-    token.or_else(|| ctx.config.profile.get(&ctx.profile)?.token.clone())
+/// True if `a` and `b` share scheme+host+port. Used to gate auto-attaching a stored
+/// profile token: it must only go to the host the profile was configured for, never to
+/// an arbitrary URL (e.g. one supplied by an MCP tool call).
+fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(ua), Ok(ub)) => ua.origin() == ub.origin(),
+        _ => false,
+    }
+}
+
+fn active_token(token: Option<String>, ctx: &Context, url: &str) -> Result<Option<String>> {
+    if token.is_some() {
+        return Ok(token);
+    }
+    let base_matches = ctx
+        .config
+        .profile
+        .get(&ctx.profile)
+        .and_then(|p| p.base_url.as_deref())
+        .is_some_and(|base| same_origin(base, url));
+    if !base_matches {
+        return Ok(None);
+    }
+    crate::secrets::get_token(&ctx.profile)
 }
 
 pub fn run(args: HttpArgs, ctx: &Context) -> Result<()> {
@@ -75,15 +97,8 @@ pub fn run(args: HttpArgs, ctx: &Context) -> Result<()> {
             timeout,
         } => {
             let url = resolve_url(&url, ctx)?;
-            do_request(
-                "GET",
-                &url,
-                None,
-                active_token(token, ctx),
-                headers,
-                timeout,
-                ctx,
-            )
+            let token = active_token(token, ctx, &url)?;
+            do_request("GET", &url, None, token, headers, timeout, ctx)
         }
         HttpSubcommand::Post {
             url,
@@ -93,15 +108,8 @@ pub fn run(args: HttpArgs, ctx: &Context) -> Result<()> {
             timeout,
         } => {
             let url = resolve_url(&url, ctx)?;
-            do_request(
-                "POST",
-                &url,
-                body.as_deref(),
-                active_token(token, ctx),
-                headers,
-                timeout,
-                ctx,
-            )
+            let token = active_token(token, ctx, &url)?;
+            do_request("POST", &url, body.as_deref(), token, headers, timeout, ctx)
         }
     }
 }

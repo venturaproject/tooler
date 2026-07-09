@@ -22,6 +22,7 @@ dirs = "5"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 chrono = "0.4"
 serde_yaml = "0.9"
+keyring = "4"
 rmcp = { version = "2", features = ["server", "transport-io"] }
 schemars = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-std"] }

@@ -48,6 +48,12 @@ fn push_opt_num<T: ToString>(argv: &mut Vec<String>, flag: &str, value: Option<T
     }
 }
 
+fn is_profile_token_key(key: &str) -> bool {
+    key.strip_prefix("profile.")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(_, field)| field == "token")
+}
+
 fn push_repeated(argv: &mut Vec<String>, flag: &str, values: &[String]) {
     for v in values {
         argv.push(flag.to_string());
@@ -192,6 +198,12 @@ struct CheckPortArgs {
 #[derive(Deserialize, JsonSchema)]
 struct ConfigGetArgs {
     /// Config key, e.g. "default.output"
+    key: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ConfigUnsetArgs {
+    /// Config key, e.g. "profile.staging.token"
     key: String,
 }
 
@@ -586,12 +598,20 @@ impl ToolerMcp {
         &self,
         Parameters(args): Parameters<ConfigGetArgs>,
     ) -> Result<CallToolResult, McpError> {
+        if is_profile_token_key(&args.key) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "Refusing to read a profile token over MCP -- it would end up in plaintext in \
+                 the conversation. Run `tooler config get \"..\"` directly in a terminal instead.",
+            )]));
+        }
         let argv = vec!["config".to_string(), "get".to_string(), args.key.clone()];
         exec_self(argv, &None).await
     }
 
     #[tool(
-        description = "Set a tooler config value by key, e.g. default.output json",
+        description = "Set a tooler config value by key, e.g. default.output json. Refuses \
+                        profile.<name>.token (set that directly in a terminal instead, so the \
+                        secret never enters the conversation).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -603,6 +623,13 @@ impl ToolerMcp {
         &self,
         Parameters(args): Parameters<ConfigSetArgs>,
     ) -> Result<CallToolResult, McpError> {
+        if is_profile_token_key(&args.key) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "Refusing to set a profile token over MCP -- it would sit in plaintext in the \
+                 conversation/tool-call history. Run `tooler config set profile.<name>.token ..` \
+                 directly in a terminal instead; it's stored encrypted in the OS keychain.",
+            )]));
+        }
         let argv = vec![
             "config".to_string(),
             "set".to_string(),
@@ -626,6 +653,24 @@ impl ToolerMcp {
     )]
     async fn tooler_config_path(&self) -> Result<CallToolResult, McpError> {
         exec_self(vec!["config".to_string(), "path".to_string()], &None).await
+    }
+
+    #[tool(
+        description = "Unset a tooler config value by key, e.g. profile.staging.token \
+                        (safe to use over MCP -- it only removes the stored value)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_config_unset(
+        &self,
+        Parameters(args): Parameters<ConfigUnsetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec!["config".to_string(), "unset".to_string(), args.key.clone()];
+        exec_self(argv, &None).await
     }
 
     #[tool(

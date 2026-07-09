@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,7 +31,6 @@ impl Default for DefaultSection {
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Profile {
     pub base_url: Option<String>,
-    pub token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -56,7 +55,44 @@ pub fn load() -> Result<Config> {
         return Ok(Config::default());
     }
     let content = std::fs::read_to_string(&path)?;
-    Ok(toml::from_str(&content)?)
+    let config: Config = toml::from_str(&content)?;
+    migrate_legacy_tokens(&content, &config)?;
+    Ok(config)
+}
+
+/// Older versions stored profile tokens as plaintext `token = "..."` under
+/// `[profile.<name>]`. `Profile` no longer has that field, so it's silently ignored by
+/// serde on load -- and would be permanently dropped on the next `save()`. Move any such
+/// tokens into the OS keychain and rewrite the file without them before that can happen.
+fn migrate_legacy_tokens(raw_content: &str, config: &Config) -> Result<()> {
+    let raw: toml::Value = toml::from_str(raw_content)?;
+    let Some(profiles) = raw.get("profile").and_then(|v| v.as_table()) else {
+        return Ok(());
+    };
+
+    let mut migrated = Vec::new();
+    for (name, value) in profiles {
+        if let Some(token) = value.get("token").and_then(|v| v.as_str()) {
+            crate::secrets::set_token(name, token).with_context(|| {
+                format!(
+                    "Found a legacy plaintext token for profile '{name}' in {} but could not \
+                     migrate it to the OS keychain. Fix keychain access and retry, or remove \
+                     the 'token' line for this profile manually.",
+                    config_path().display()
+                )
+            })?;
+            migrated.push(name.clone());
+        }
+    }
+
+    if !migrated.is_empty() {
+        save(config)?;
+        eprintln!(
+            "tooler: migrated plaintext token(s) for profile(s) {} from config.toml to the OS keychain",
+            migrated.join(", ")
+        );
+    }
+    Ok(())
 }
 
 pub fn save(config: &Config) -> Result<()> {

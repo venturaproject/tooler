@@ -5,6 +5,7 @@ mod context;
 mod error;
 mod output;
 mod project;
+mod secrets;
 
 use anyhow::Result;
 use clap::Parser;
