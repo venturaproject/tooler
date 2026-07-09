@@ -27,7 +27,7 @@ pub enum ConfigSubcommand {
 }
 
 /// Splits a "profile.<name>.<field>" key into (name, field).
-fn parse_profile_key(key: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_profile_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix("profile.")?;
     rest.split_once('.')
 }

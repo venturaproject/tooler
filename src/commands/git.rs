@@ -114,6 +114,37 @@ fn summary(ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of deleting a single merged branch, shared by both the JSON and
+/// plain-text renderers below so they can never diverge on what actually happened.
+struct DeleteOutcome<'a> {
+    branch: &'a str,
+    local_error: Option<String>,
+    /// `None` if `--remote` wasn't requested or the local delete failed first.
+    remote_deleted: Option<bool>,
+}
+
+/// Deletes each branch locally (and from `origin` if `remote`), continuing past
+/// failures so every branch gets a reported outcome instead of aborting partway
+/// through and silently dropping the branches after the first failure.
+fn delete_branches<'a>(to_delete: &[&'a str], remote: bool) -> Vec<DeleteOutcome<'a>> {
+    to_delete
+        .iter()
+        .map(|&branch| {
+            let local = git(&["branch", "-d", branch]);
+            let remote_deleted = if remote && local.is_ok() {
+                Some(git(&["push", "origin", "--delete", branch]).is_ok())
+            } else {
+                None
+            };
+            DeleteOutcome {
+                branch,
+                local_error: local.err().map(|e| e.to_string()),
+                remote_deleted,
+            }
+        })
+        .collect()
+}
+
 fn clean(remote: bool, confirm: bool, ctx: &Context) -> Result<()> {
     let current = git(&["branch", "--show-current"])?;
     let protected = ["main", "master", "develop", "dev", current.as_str()];
@@ -137,16 +168,17 @@ fn clean(remote: bool, confirm: bool, ctx: &Context) -> Result<()> {
             );
             return Ok(());
         }
-        let mut results = vec![];
-        for branch in &to_delete {
-            git(&["branch", "-d", branch])?;
-            let remote_deleted = if remote {
-                Some(git(&["push", "origin", "--delete", branch]).is_ok())
-            } else {
-                None
-            };
-            results.push(serde_json::json!({"branch": branch, "remote_deleted": remote_deleted}));
-        }
+        let results: Vec<_> = delete_branches(&to_delete, remote)
+            .into_iter()
+            .map(|o| {
+                serde_json::json!({
+                    "branch": o.branch,
+                    "deleted": o.local_error.is_none(),
+                    "error": o.local_error,
+                    "remote_deleted": o.remote_deleted,
+                })
+            })
+            .collect();
         println!(
             "{}",
             serde_json::json!({"branches": to_delete, "deleted": true, "results": results})
@@ -169,15 +201,22 @@ fn clean(remote: bool, confirm: bool, ctx: &Context) -> Result<()> {
         return Ok(());
     }
 
-    for branch in &to_delete {
-        git(&["branch", "-d", branch])?;
-        println!("{} deleted {}", "✓".green().bold(), branch);
-
-        if remote {
-            match git(&["push", "origin", "--delete", branch]) {
-                Ok(_) => println!("{} deleted origin/{}", "✓".green().bold(), branch),
-                Err(e) => println!("{} origin/{}: {}", "!".yellow().bold(), branch, e),
+    for outcome in delete_branches(&to_delete, remote) {
+        match outcome.local_error {
+            None => println!("{} deleted {}", "✓".green().bold(), outcome.branch),
+            Some(e) => {
+                println!("{} {}: {}", "!".red().bold(), outcome.branch, e);
+                continue;
             }
+        }
+        match outcome.remote_deleted {
+            Some(true) => println!("{} deleted origin/{}", "✓".green().bold(), outcome.branch),
+            Some(false) => println!(
+                "{} origin/{}: failed to delete",
+                "!".yellow().bold(),
+                outcome.branch
+            ),
+            None => {}
         }
     }
     Ok(())

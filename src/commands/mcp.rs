@@ -49,9 +49,7 @@ fn push_opt_num<T: ToString>(argv: &mut Vec<String>, flag: &str, value: Option<T
 }
 
 fn is_profile_token_key(key: &str) -> bool {
-    key.strip_prefix("profile.")
-        .and_then(|rest| rest.split_once('.'))
-        .is_some_and(|(_, field)| field == "token")
+    crate::commands::config::parse_profile_key(key).is_some_and(|(_, field)| field == "token")
 }
 
 fn push_repeated(argv: &mut Vec<String>, flag: &str, values: &[String]) {
