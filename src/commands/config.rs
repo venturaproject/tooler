@@ -60,15 +60,15 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
             if json {
                 let profiles: Vec<_> = names
                     .iter()
-                    .map(|name| {
-                        let has_token = secrets::get_token(name).ok().flatten().is_some();
-                        serde_json::json!({
+                    .map(|name| -> Result<serde_json::Value> {
+                        let has_token = secrets::get_token(name)?.is_some();
+                        Ok(serde_json::json!({
                             "name": name,
                             "base_url": ctx.config.profile.get(*name).and_then(|p| p.base_url.clone()),
                             "has_token": has_token,
-                        })
+                        }))
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 println!(
                     "{}",
                     serde_json::json!({"profiles": profiles, "active": ctx.profile})
@@ -84,7 +84,7 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                     } else {
                         String::new()
                     };
-                    let token_marker = if secrets::get_token(name).ok().flatten().is_some() {
+                    let token_marker = if secrets::get_token(name)?.is_some() {
                         " [token]".dimmed().to_string()
                     } else {
                         String::new()

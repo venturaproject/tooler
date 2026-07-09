@@ -1,4 +1,4 @@
-use crate::context::Context;
+use crate::{context::Context, output::OutputFormat};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
@@ -16,8 +16,8 @@ pub enum HttpSubcommand {
     Get {
         /// URL or path (path uses profile base_url)
         url: String,
-        /// Bearer token for Authorization header
-        #[arg(short, long)]
+        /// Bearer token for Authorization header [env: TOOLER_HTTP_TOKEN]
+        #[arg(short, long, env = "TOOLER_HTTP_TOKEN")]
         token: Option<String>,
         /// Extra headers in "Key: Value" format
         #[arg(short = 'H', long = "header")]
@@ -32,7 +32,8 @@ pub enum HttpSubcommand {
         /// JSON body string
         #[arg(short, long)]
         body: Option<String>,
-        #[arg(short, long)]
+        /// Bearer token for Authorization header [env: TOOLER_HTTP_TOKEN]
+        #[arg(short, long, env = "TOOLER_HTTP_TOKEN")]
         token: Option<String>,
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
@@ -121,7 +122,7 @@ fn do_request(
     token: Option<String>,
     extra_headers: Vec<String>,
     timeout_secs: u64,
-    _ctx: &Context,
+    ctx: &Context,
 ) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
@@ -153,6 +154,24 @@ fn do_request(
         .with_context(|| format!("Request failed: {url}"))?;
 
     let status = response.status();
+    let body_text = response.text()?;
+    let body_json = serde_json::from_str::<serde_json::Value>(&body_text).ok();
+
+    if ctx.output == OutputFormat::Json {
+        let payload = serde_json::json!({
+            "method": method,
+            "url": url,
+            "status": status.as_u16(),
+            "ok": status.is_success(),
+            "body": body_json.unwrap_or(serde_json::Value::String(body_text)),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        if !status.is_success() {
+            bail!("HTTP {}", status.as_u16());
+        }
+        return Ok(());
+    }
+
     let status_label = status.as_u16().to_string();
     let status_colored = if status.is_success() {
         status_label.green()
@@ -170,8 +189,7 @@ fn do_request(
     );
     println!("{}", "─".repeat(50).dimmed());
 
-    let body_text = response.text()?;
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
+    if let Some(json) = body_json {
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
         println!("{body_text}");

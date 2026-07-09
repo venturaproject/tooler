@@ -154,7 +154,7 @@ Make HTTP requests with optional profile-based auth.
 ```sh
 tooler http get https://api.example.com/users
 tooler http get /users --profile staging          # uses profile base_url
-tooler http get /health --token abc123            # Bearer auth
+tooler http get /health --token abc123            # Bearer auth (or set TOOLER_HTTP_TOKEN)
 tooler http get /users --header "X-Key: value"
 tooler http post /users --body '{"name":"test"}'
 tooler http post /users --body '{"name":"test"}' --timeout 30
@@ -407,7 +407,7 @@ Most tools accept an optional `cwd` parameter so a single long-running server ca
 
 Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can distinguish safe reads (`tooler_info`, `tooler_env_show`, `tooler_check_url`, ...) from destructive operations (`tooler_ssh_exec`, `tooler_ssh_ssl`, `tooler_git_clean`, ...).
 
-`tooler_ssh_ssl` never accepts `pfx_password`/`sudo_pass` as tool arguments (they'd otherwise sit in plaintext in the conversation/tool-call history). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` in the MCP server's own environment instead, e.g.:
+`tooler_ssh_ssl` never accepts `pfx_password`/`sudo_pass` as tool arguments, and `tooler_http_get`/`tooler_http_post` never accept a bearer `token` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` in the MCP server's own environment instead, e.g.:
 
 ```json
 {
@@ -417,7 +417,8 @@ Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openW
       "args": ["mcp"],
       "env": {
         "TOOLER_PFX_PASS": "...",
-        "TOOLER_SUDO_PASS": "..."
+        "TOOLER_SUDO_PASS": "...",
+        "TOOLER_HTTP_TOKEN": "..."
       }
     }
   }

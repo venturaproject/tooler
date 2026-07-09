@@ -93,11 +93,19 @@ async fn exec_self(
     if output.status.success() {
         Ok(CallToolResult::success(vec![ContentBlock::text(stdout)]))
     } else {
-        let message = if stderr.trim().is_empty() {
-            stdout
-        } else {
-            stderr
-        };
+        let mut message = String::new();
+        if !stdout.trim().is_empty() {
+            message.push_str(&stdout);
+        }
+        if !stderr.trim().is_empty() {
+            if !message.is_empty() {
+                message.push_str("\n--- stderr ---\n");
+            }
+            message.push_str(&stderr);
+        }
+        if message.is_empty() {
+            message = format!("tooler exited with status {}", output.status);
+        }
         Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
     }
 }
@@ -153,8 +161,6 @@ struct EnvCheckArgs {
 struct HttpGetArgs {
     /// URL or path (path uses the profile's base_url)
     url: String,
-    /// Bearer token for the Authorization header
-    token: Option<String>,
     /// Extra headers in "Key: Value" format
     #[serde(default)]
     headers: Vec<String>,
@@ -169,7 +175,6 @@ struct HttpPostArgs {
     url: String,
     /// JSON body string
     body: Option<String>,
-    token: Option<String>,
     #[serde(default)]
     headers: Vec<String>,
     timeout: Option<u64>,
@@ -514,7 +519,10 @@ impl ToolerMcp {
     }
 
     #[tool(
-        description = "Perform an HTTP GET request, with optional profile-based auth",
+        description = "Perform an HTTP GET request, with optional profile-based auth. Never \
+                        accepts a bearer token as a tool argument -- set TOOLER_HTTP_TOKEN in \
+                        the MCP server's own environment for ad hoc auth, or use --profile for \
+                        a token stored in the OS keychain (only sent to that profile's host).",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn tooler_http_get(
@@ -522,7 +530,6 @@ impl ToolerMcp {
         Parameters(args): Parameters<HttpGetArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut argv = vec!["http".to_string(), "get".to_string(), args.url.clone()];
-        push_opt(&mut argv, "--token", &args.token);
         push_repeated(&mut argv, "--header", &args.headers);
         push_opt_num(&mut argv, "--timeout", args.timeout);
         push_opt(&mut argv, "--profile", &args.profile);
@@ -530,7 +537,10 @@ impl ToolerMcp {
     }
 
     #[tool(
-        description = "Perform an HTTP POST request with a JSON body",
+        description = "Perform an HTTP POST request with a JSON body. Never accepts a bearer \
+                        token as a tool argument -- set TOOLER_HTTP_TOKEN in the MCP server's \
+                        own environment for ad hoc auth, or use --profile for a token stored in \
+                        the OS keychain (only sent to that profile's host).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -544,7 +554,6 @@ impl ToolerMcp {
     ) -> Result<CallToolResult, McpError> {
         let mut argv = vec!["http".to_string(), "post".to_string(), args.url.clone()];
         push_opt(&mut argv, "--body", &args.body);
-        push_opt(&mut argv, "--token", &args.token);
         push_repeated(&mut argv, "--header", &args.headers);
         push_opt_num(&mut argv, "--timeout", args.timeout);
         push_opt(&mut argv, "--profile", &args.profile);

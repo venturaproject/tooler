@@ -56,9 +56,9 @@ pub fn run(args: ServerArgs, ctx: &Context) -> Result<()> {
             port,
             key,
             ssl_dir,
-        } => add(&name, host, user, port, key, ssl_dir),
+        } => add(&name, host, user, port, key, ssl_dir, ctx),
         ServerSubcommand::Show { name } => show(&name, ctx),
-        ServerSubcommand::Remove { name } => remove(&name),
+        ServerSubcommand::Remove { name } => remove(&name, ctx),
     }
 }
 
@@ -125,19 +125,23 @@ fn add(
     port: Option<u16>,
     key: Option<String>,
     ssl_dir: Option<String>,
+    ctx: &Context,
 ) -> Result<()> {
     let mut cfg = config::load()?;
-    cfg.server.insert(
-        name.to_string(),
-        Server {
-            host,
-            user,
-            port,
-            key,
-            ssl_dir,
-        },
-    );
+    let server = Server {
+        host,
+        user,
+        port,
+        key,
+        ssl_dir,
+    };
+    cfg.server.insert(name.to_string(), server.clone());
     config::save(&cfg)?;
+
+    if ctx.output == OutputFormat::Json {
+        println!("{}", serde_json::json!({"name": name, "server": server}));
+        return Ok(());
+    }
     println!("{} server '{}'", "added".green().bold(), name.cyan());
     Ok(())
 }
@@ -183,12 +187,17 @@ fn show(name: &str, ctx: &Context) -> Result<()> {
     Ok(())
 }
 
-fn remove(name: &str) -> Result<()> {
+fn remove(name: &str, ctx: &Context) -> Result<()> {
     let mut cfg = config::load()?;
     if cfg.server.remove(name).is_none() {
         bail!("Server '{}' not found", name);
     }
     config::save(&cfg)?;
+
+    if ctx.output == OutputFormat::Json {
+        println!("{}", serde_json::json!({"name": name, "removed": true}));
+        return Ok(());
+    }
     println!("{} server '{}'", "removed".red().bold(), name);
     Ok(())
 }
