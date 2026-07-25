@@ -42,6 +42,60 @@ pub struct Server {
     pub ssl_dir: Option<String>,
 }
 
+impl Server {
+    /// `user@host`, or just `host` if no user is configured.
+    pub fn host_target(&self) -> String {
+        match &self.user {
+            Some(u) => format!("{u}@{}", self.host),
+            None => self.host.clone(),
+        }
+    }
+
+    /// Flags for `ssh` invocations: strict host key checking disabled,
+    /// batch mode (never prompt), plus `-i`/`-p` if a key/port is configured.
+    pub fn ssh_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "-o".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+        ];
+        if let Some(key) = &self.key {
+            args.push("-i".into());
+            args.push(
+                crate::commands::ssh::expand_tilde(key)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+        if let Some(port) = self.port {
+            args.push("-p".into());
+            args.push(port.to_string());
+        }
+        args
+    }
+
+    /// Flags for `scp` invocations. Same key/host-checking handling as
+    /// [`Server::ssh_args`], but `scp` uses `-P` for the port (not `-p`) and
+    /// has no batch-mode flag.
+    pub fn scp_args(&self) -> Vec<String> {
+        let mut args = vec!["-o".to_string(), "StrictHostKeyChecking=no".to_string()];
+        if let Some(key) = &self.key {
+            args.push("-i".into());
+            args.push(
+                crate::commands::ssh::expand_tilde(key)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+        if let Some(port) = self.port {
+            args.push("-P".into());
+            args.push(port.to_string());
+        }
+        args
+    }
+}
+
 pub fn config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))

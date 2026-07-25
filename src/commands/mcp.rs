@@ -410,6 +410,12 @@ struct GitCleanArgs {
     /// Actually delete (default is preview-only)
     #[serde(default)]
     confirm: bool,
+    /// Only branches with a trailing DDMMYY date suffix on/after this date (DDMMYY).
+    /// When set (with `before`), targets any local branch in range regardless of
+    /// merge status, instead of the default merged-only cleanup.
+    after: Option<String>,
+    /// Only branches with a trailing DDMMYY date suffix on/before this date (DDMMYY)
+    before: Option<String>,
     cwd: Option<String>,
 }
 
@@ -431,6 +437,137 @@ struct ScaffoldNewArgs {
     /// Destination directory (defaults to ./<name>)
     dir: Option<String>,
     cwd: Option<String>,
+}
+
+// ── report ────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct ReportArgs {
+    /// Named JSON inputs, each `NAME=PATH` (e.g. from another tooler command's
+    /// `--output json`). Omit to build the report from a single unnamed source.
+    #[serde(default)]
+    input: Vec<String>,
+    /// Output file path to write the generated report to
+    out: String,
+    /// Report title
+    title: Option<String>,
+    cwd: Option<String>,
+}
+
+// ── db ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct DbQueryArgs {
+    /// Server profile to run psql/mysql on (see tooler_server_list)
+    server: String,
+    /// SQL query (read-only: SELECT/SHOW/EXPLAIN/WITH/DESCRIBE only)
+    sql: String,
+    /// Remote path to a dotenv-style file (e.g. Laravel .env) to read DB_* credentials
+    /// from. Preferred over passing credentials explicitly.
+    env: Option<String>,
+    /// DB engine when not using `env`: mysql or postgres
+    engine: Option<String>,
+    /// DB host as reachable from the server profile (when not using `env`)
+    host: Option<String>,
+    /// DB port (when not using `env`; defaults to the engine's standard port)
+    port: Option<u16>,
+    /// Database name (when not using `env`)
+    database: Option<String>,
+    /// DB username (when not using `env`)
+    user: Option<String>,
+    /// Cap the number of rows returned
+    max_rows: Option<usize>,
+}
+
+// ── gh ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct GhPrsArgs {
+    /// Repository as owner/name (defaults to the repo in the current directory)
+    repo: Option<String>,
+    /// Only PRs created on/after this date (YYYY-MM-DD)
+    after: Option<String>,
+    /// Only PRs created on/before this date (YYYY-MM-DD)
+    before: Option<String>,
+    /// PR state to include: open, closed, merged, or all
+    state: Option<String>,
+    /// Max PRs to fetch from GitHub before date filtering
+    limit: Option<u32>,
+    cwd: Option<String>,
+}
+
+// ── systemd ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct SystemdUnitArgs {
+    /// Server profile (see tooler_server_list)
+    server: String,
+    /// Unit name, e.g. nginx or myapp.service
+    unit: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SystemdRestartArgs {
+    server: String,
+    unit: String,
+    /// Run via sudo. A sudo password, if needed, must never be passed as a tool
+    /// argument -- set TOOLER_SUDO_PASS in the MCP server's own environment instead
+    /// (or rely on passwordless/NOPASSWD sudo).
+    #[serde(default)]
+    sudo: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SystemdLogsArgs {
+    server: String,
+    unit: String,
+    /// Number of lines
+    lines: Option<u32>,
+    /// Run via sudo (some systems restrict journal access to root)
+    #[serde(default)]
+    sudo: bool,
+}
+
+// ── cron ──────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct CronServerArgs {
+    server: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CronAddArgs {
+    server: String,
+    /// Full crontab line, e.g. "0 3 * * * /path/to/backup.sh"
+    line: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CronRemoveArgs {
+    server: String,
+    /// Fixed substring to match (not a regex) -- matching lines are dropped
+    pattern: String,
+}
+
+// ── logs ──────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct LogsTailArgs {
+    server: String,
+    /// Remote file path
+    path: String,
+    /// Number of lines
+    lines: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct LogsGrepArgs {
+    server: String,
+    path: String,
+    /// Fixed substring to match (not a regex)
+    pattern: String,
+    /// Cap the number of matching lines returned
+    max_lines: Option<usize>,
 }
 
 // ── server profiles ───────────────────────────────────────────────────────
@@ -950,7 +1087,9 @@ impl ToolerMcp {
     }
 
     #[tool(
-        description = "Delete branches already merged into the current branch",
+        description = "Delete branches already merged into the current branch, or (with \
+                        after/before) any local branch with a trailing DDMMYY date suffix \
+                        in the given range regardless of merge status",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -965,6 +1104,8 @@ impl ToolerMcp {
         let mut argv = vec!["git".to_string(), "clean".to_string()];
         push_flag(&mut argv, "--remote", args.remote);
         push_flag(&mut argv, "--confirm", args.confirm);
+        push_opt(&mut argv, "--after", &args.after);
+        push_opt(&mut argv, "--before", &args.before);
         self.exec_self(argv, &args.cwd).await
     }
 
@@ -1011,6 +1152,268 @@ impl ToolerMcp {
         ];
         push_opt(&mut argv, "--dir", &args.dir);
         self.exec_self(argv, &args.cwd).await
+    }
+
+    #[tool(
+        description = "Generate a multi-page PDF report (cover page, per-source sections, \
+                        tables, and embedded bar charts) from one or more JSON files, typically \
+                        the --output json result of another tooler command",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_report_pdf(
+        &self,
+        Parameters(args): Parameters<ReportArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["report".to_string(), "pdf".to_string()];
+        push_repeated(&mut argv, "--in", &args.input);
+        argv.push("--out".to_string());
+        argv.push(args.out.clone());
+        if let Some(title) = &args.title {
+            argv.push("--title".to_string());
+            argv.push(title.clone());
+        }
+        self.exec_self(argv, &args.cwd).await
+    }
+
+    #[tool(
+        description = "Generate a multi-sheet Excel (.xlsx) report (one sheet per source, with \
+                        formatted tables and native charts) from one or more JSON files, \
+                        typically the --output json result of another tooler command",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_report_excel(
+        &self,
+        Parameters(args): Parameters<ReportArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["report".to_string(), "excel".to_string()];
+        push_repeated(&mut argv, "--in", &args.input);
+        argv.push("--out".to_string());
+        argv.push(args.out.clone());
+        if let Some(title) = &args.title {
+            argv.push("--title".to_string());
+            argv.push(title.clone());
+        }
+        self.exec_self(argv, &args.cwd).await
+    }
+
+    #[tool(
+        description = "Run a read-only SQL query (SELECT/SHOW/EXPLAIN/WITH/DESCRIBE) against a \
+                        remote database by running psql/mysql directly on a server profile over \
+                        SSH, returning rows as JSON — feed the result straight into \
+                        tooler_report_pdf/excel. \
+                        Prefer `env` (a remote dotenv-style file, e.g. Laravel .env) to supply \
+                        DB_* credentials rather than passing them explicitly; a DB password can \
+                        never be passed as a tool argument — set TOOLER_DB_PASSWORD in the \
+                        environment the tooler MCP server itself runs in instead.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn tooler_db_query(
+        &self,
+        Parameters(args): Parameters<DbQueryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "db".to_string(),
+            "query".to_string(),
+            args.server.clone(),
+            args.sql.clone(),
+        ];
+        push_opt(&mut argv, "--env", &args.env);
+        push_opt(&mut argv, "--engine", &args.engine);
+        push_opt(&mut argv, "--host", &args.host);
+        push_opt_num(&mut argv, "--port", args.port);
+        push_opt(&mut argv, "--database", &args.database);
+        push_opt(&mut argv, "--user", &args.user);
+        push_opt_num(&mut argv, "--max-rows", args.max_rows);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "List pull requests (title, labels, author, dates) via the `gh` CLI, \
+                        optionally filtered to a created-date range. Requires `gh` installed \
+                        and authenticated in the environment the tooler MCP server runs in. \
+                        Feed the JSON result straight into tooler_report_pdf/excel.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_gh_prs(
+        &self,
+        Parameters(args): Parameters<GhPrsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["gh".to_string(), "prs".to_string()];
+        push_opt(&mut argv, "--repo", &args.repo);
+        push_opt(&mut argv, "--after", &args.after);
+        push_opt(&mut argv, "--before", &args.before);
+        push_opt(&mut argv, "--state", &args.state);
+        push_opt_num(&mut argv, "--limit", args.limit);
+        self.exec_self(argv, &args.cwd).await
+    }
+
+    #[tool(
+        description = "Show a systemd unit's status on a remote server over SSH \
+                        (systemctl status). `active` in the result reflects the exit code \
+                        (0 = active); a non-zero exit (e.g. a stopped or unknown unit) is \
+                        returned as informative output, not a tool error.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_systemd_status(
+        &self,
+        Parameters(args): Parameters<SystemdUnitArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec![
+            "systemd".to_string(),
+            "status".to_string(),
+            args.server.clone(),
+            args.unit.clone(),
+        ];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Restart a systemd unit on a remote server over SSH. A sudo password, if \
+                        needed, must never be passed as a tool argument -- set TOOLER_SUDO_PASS \
+                        in the MCP server's own environment instead (or rely on \
+                        passwordless/NOPASSWD sudo).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_systemd_restart(
+        &self,
+        Parameters(args): Parameters<SystemdRestartArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "systemd".to_string(),
+            "restart".to_string(),
+            args.server.clone(),
+            args.unit.clone(),
+        ];
+        push_flag(&mut argv, "--sudo", args.sudo);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Show recent journal entries for a systemd unit on a remote server \
+                        (journalctl -u)",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_systemd_logs(
+        &self,
+        Parameters(args): Parameters<SystemdLogsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "systemd".to_string(),
+            "logs".to_string(),
+            args.server.clone(),
+            args.unit.clone(),
+        ];
+        push_opt_num(&mut argv, "--lines", args.lines);
+        push_flag(&mut argv, "--sudo", args.sudo);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "List a remote server's crontab entries (crontab -l)",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_cron_list(
+        &self,
+        Parameters(args): Parameters<CronServerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec!["cron".to_string(), "list".to_string(), args.server.clone()];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Append a line to a remote server's crontab",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_cron_add(
+        &self,
+        Parameters(args): Parameters<CronAddArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec![
+            "cron".to_string(),
+            "add".to_string(),
+            args.server.clone(),
+            args.line.clone(),
+        ];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Remove crontab lines containing a fixed substring, on a remote server",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_cron_remove(
+        &self,
+        Parameters(args): Parameters<CronRemoveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec![
+            "cron".to_string(),
+            "remove".to_string(),
+            args.server.clone(),
+            args.pattern.clone(),
+        ];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Show the last N lines of a remote file over SSH (tail -n)",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_logs_tail(
+        &self,
+        Parameters(args): Parameters<LogsTailArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "logs".to_string(),
+            "tail".to_string(),
+            args.server.clone(),
+            args.path.clone(),
+        ];
+        push_opt_num(&mut argv, "--lines", args.lines);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Search a remote file over SSH for a fixed substring (grep -F)",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_logs_grep(
+        &self,
+        Parameters(args): Parameters<LogsGrepArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "logs".to_string(),
+            "grep".to_string(),
+            args.server.clone(),
+            args.path.clone(),
+            args.pattern.clone(),
+        ];
+        push_opt_num(&mut argv, "--max-lines", args.max_lines);
+        self.exec_self(argv, &None).await
     }
 
     #[tool(

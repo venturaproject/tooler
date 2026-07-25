@@ -2,9 +2,10 @@ mod cli;
 mod commands;
 mod config;
 mod context;
-mod error;
+mod db;
 mod output;
 mod project;
+mod report;
 mod secrets;
 
 use anyhow::Result;
@@ -42,5 +43,11 @@ fn main() -> Result<()> {
         Commands::Ssh(args) => commands::ssh::run(args, &ctx),
         Commands::Mcp(args) => commands::mcp::run(args, &ctx),
         Commands::Doctor(args) => commands::doctor::run(args, &ctx),
+        Commands::Report(args) => commands::report::run(args, &ctx),
+        Commands::Db(args) => commands::db::run(args, &ctx),
+        Commands::Gh(args) => commands::gh::run(args, &ctx),
+        Commands::Systemd(args) => commands::systemd::run(args, &ctx),
+        Commands::Cron(args) => commands::cron::run(args, &ctx),
+        Commands::Logs(args) => commands::logs::run(args, &ctx),
     }
 }

@@ -1,9 +1,10 @@
 use crate::{
     commands::{
-        check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, doctor::DoctorArgs,
-        echo::EchoArgs, env::EnvArgs, git::GitArgs, http::HttpArgs, info::InfoArgs, json::JsonArgs,
-        mcp::McpArgs, play::PlayArgs, run::RunArgs, scaffold::ScaffoldArgs, server::ServerArgs,
-        ssh::SshArgs,
+        check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, cron::CronArgs,
+        db::DbArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs, gh::GhArgs, git::GitArgs,
+        http::HttpArgs, info::InfoArgs, json::JsonArgs, logs::LogsArgs, mcp::McpArgs,
+        play::PlayArgs, report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs,
+        server::ServerArgs, ssh::SshArgs, systemd::SystemdArgs,
     },
     output::OutputFormat,
 };
@@ -79,4 +80,22 @@ pub enum Commands {
 
     /// Run environment/health checks (git, OS keychain, SSH keys, self-exe)
     Doctor(DoctorArgs),
+
+    /// Generate PDF/Excel reports from the JSON output of other tooler commands
+    Report(ReportArgs),
+
+    /// Query a remote database over SSH (read-only)
+    Db(DbArgs),
+
+    /// Pull request data via the `gh` CLI (title, labels, dates)
+    Gh(GhArgs),
+
+    /// Manage systemd units on a remote server over SSH (status, restart, logs)
+    Systemd(SystemdArgs),
+
+    /// Manage a remote server's crontab over SSH (list, add, remove)
+    Cron(CronArgs),
+
+    /// Read remote log files over SSH (tail, grep)
+    Logs(LogsArgs),
 }

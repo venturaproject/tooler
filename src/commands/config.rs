@@ -137,7 +137,7 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
             if let Some((name, field)) = parse_profile_key(&key) {
                 match field {
                     "base_url" => {
-                        let mut cfg = config::load()?;
+                        let mut cfg = ctx.config.clone();
                         cfg.profile.entry(name.to_string()).or_default().base_url =
                             Some(value.clone());
                         config::save(&cfg)?;
@@ -151,7 +151,7 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                         secrets::set_token(name, &value)?;
                         // Ensure the profile is registered in the config file (with no
                         // base_url) so it shows up in `config profiles` / `show`.
-                        let mut cfg = config::load()?;
+                        let mut cfg = ctx.config.clone();
                         cfg.profile.entry(name.to_string()).or_default();
                         config::save(&cfg)?;
                         if json {
@@ -176,7 +176,7 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                 }
                 return Ok(());
             }
-            let mut cfg = config::load()?;
+            let mut cfg = ctx.config.clone();
             match key.as_str() {
                 "default.output" => {
                     if !["plain", "json", "table"].contains(&value.as_str()) {
@@ -205,7 +205,7 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
             if let Some((name, field)) = parse_profile_key(&key) {
                 match field {
                     "base_url" => {
-                        let mut cfg = config::load()?;
+                        let mut cfg = ctx.config.clone();
                         if let Some(p) = cfg.profile.get_mut(name) {
                             p.base_url = None;
                         }

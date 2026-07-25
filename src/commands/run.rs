@@ -1,4 +1,4 @@
-use crate::{context::Context, project};
+use crate::{context::Context, output::OutputFormat, project};
 use anyhow::{Result, bail};
 use clap::Args;
 use colored::Colorize;
@@ -17,16 +17,31 @@ pub struct RunArgs {
     pub extra: Vec<String>,
 }
 
-pub fn run(args: RunArgs, _ctx: &Context) -> Result<()> {
+pub fn run(args: RunArgs, ctx: &Context) -> Result<()> {
     let (project, root) = project::load()?;
 
     match args.script {
-        None => list_scripts(&project),
-        Some(name) => exec_script(&name, &project, &root, args.dry, &args.extra),
+        None => list_scripts(&project, ctx),
+        Some(name) => exec_script(&name, &project, &root, args.dry, &args.extra, ctx),
     }
 }
 
-fn list_scripts(project: &project::ProjectConfig) -> Result<()> {
+fn list_scripts(project: &project::ProjectConfig, ctx: &Context) -> Result<()> {
+    let mut names: Vec<&String> = project.scripts.keys().collect();
+    names.sort();
+
+    if ctx.output == OutputFormat::Json {
+        let scripts: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .map(|n| (n.to_string(), project.scripts[*n].clone().into()))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"scripts": serde_json::Value::Object(scripts)})
+        );
+        return Ok(());
+    }
+
     if project.scripts.is_empty() {
         println!("{}", "No scripts defined.".dimmed());
         println!(
@@ -52,8 +67,6 @@ fn list_scripts(project: &project::ProjectConfig) -> Result<()> {
     println!("{} {}", "scripts:".bold().cyan(), config_path.dimmed());
     println!("{}", "─".repeat(40).dimmed());
 
-    let mut names: Vec<&String> = project.scripts.keys().collect();
-    names.sort();
     for name in names {
         println!("  {:20} {}", name.bold(), project.scripts[name].dimmed());
     }
@@ -66,17 +79,25 @@ fn exec_script(
     root: &std::path::Path,
     dry: bool,
     extra: &[String],
+    ctx: &Context,
 ) -> Result<()> {
+    let json = ctx.output == OutputFormat::Json;
+
     let cmd = match project.scripts.get(name) {
         Some(c) => c.clone(),
         None => {
             let mut available: Vec<&str> = project.scripts.keys().map(String::as_str).collect();
             available.sort();
-            bail!(
+            let message = format!(
                 "Script '{}' not found. Available: {}",
                 name,
                 available.join(", ")
-            )
+            );
+            if json {
+                println!("{}", serde_json::json!({"script": name, "error": message}));
+                std::process::exit(1);
+            }
+            bail!(message)
         }
     };
 
@@ -86,9 +107,17 @@ fn exec_script(
         format!("{} {}", cmd, extra.join(" "))
     };
 
-    println!("{} {}", "$".bold().green(), full_cmd.dimmed());
+    if !json {
+        println!("{} {}", "$".bold().green(), full_cmd.dimmed());
+    }
 
     if dry {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"script": name, "command": full_cmd, "dry": true})
+            );
+        }
         return Ok(());
     }
 
@@ -97,6 +126,22 @@ fn exec_script(
         .arg(&full_cmd)
         .current_dir(root)
         .status()?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "script": name,
+                "command": full_cmd,
+                "success": status.success(),
+                "exit_code": status.code(),
+            })
+        );
+        if !status.success() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     if !status.success() {
         bail!(

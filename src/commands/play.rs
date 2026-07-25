@@ -1,8 +1,8 @@
-use crate::context::Context;
+use crate::{context::Context, output::OutputFormat};
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use colored::Colorize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -82,10 +82,10 @@ fn default_env_target() -> String {
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
-pub fn run(args: PlayArgs, _ctx: &Context) -> Result<()> {
+pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     if args.init {
         let path = args.file.as_deref().unwrap_or("playbook.yml");
-        return write_sample(path);
+        return write_sample(path, ctx);
     }
 
     let file = args.file.as_deref().ok_or_else(|| {
@@ -122,29 +122,40 @@ pub fn run(args: PlayArgs, _ctx: &Context) -> Result<()> {
         .as_deref()
         .map(|t| t.split(',').map(str::trim).collect());
 
-    execute_playbook(&playbook, &playbook_dir, &tag_filter, args.dry)
+    execute_playbook(&playbook, &playbook_dir, &tag_filter, args.dry, ctx)
 }
 
 // ── Runner ────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct TaskOutcome {
+    name: String,
+    status: &'static str,
+    error: Option<String>,
+}
 
 fn execute_playbook(
     playbook: &Playbook,
     playbook_dir: &Path,
     tag_filter: &Option<Vec<&str>>,
     dry: bool,
+    ctx: &Context,
 ) -> Result<()> {
+    let json = ctx.output == OutputFormat::Json;
     let sep = "─".repeat(56);
 
-    println!(
-        "\n{} {} {}",
-        "PLAY".bold().cyan(),
-        format!("[{}]", playbook.name).bold(),
-        playbook_dir.display().to_string().dimmed()
-    );
-    if let Some(desc) = &playbook.description {
-        println!("     {}", desc.dimmed());
+    if !json {
+        println!(
+            "\n{} {} {}",
+            "PLAY".bold().cyan(),
+            format!("[{}]", playbook.name).bold(),
+            playbook_dir.display().to_string().dimmed()
+        );
+        if let Some(desc) = &playbook.description {
+            println!("     {}", desc.dimmed());
+        }
+        println!("{}", sep.dimmed());
     }
-    println!("{}", sep.dimmed());
 
     let tasks: Vec<&Task> = playbook
         .tasks
@@ -159,39 +170,83 @@ fn execute_playbook(
     let mut ok = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
+    let mut outcomes: Vec<TaskOutcome> = Vec::new();
 
     for (i, task) in tasks.iter().enumerate() {
-        println!(
-            "\n{} [{}/{}] {}",
-            "TASK".bold().yellow(),
-            i + 1,
-            total,
-            task.name.bold()
-        );
+        if !json {
+            println!(
+                "\n{} [{}/{}] {}",
+                "TASK".bold().yellow(),
+                i + 1,
+                total,
+                task.name.bold()
+            );
+        }
 
-        let result = run_task(task, &playbook.vars, playbook_dir, dry);
+        let result = run_task(task, &playbook.vars, playbook_dir, dry, json);
 
         match result {
             Ok(_) => {
-                ok += 1;
                 if dry {
-                    println!("  {}", "(dry run — skipped)".dimmed());
+                    if !json {
+                        println!("  {}", "(dry run — skipped)".dimmed());
+                    }
                     skipped += 1;
-                    ok -= 1;
+                    outcomes.push(TaskOutcome {
+                        name: task.name.clone(),
+                        status: "skipped",
+                        error: None,
+                    });
+                } else {
+                    ok += 1;
+                    outcomes.push(TaskOutcome {
+                        name: task.name.clone(),
+                        status: "ok",
+                        error: None,
+                    });
                 }
             }
             Err(e) => {
                 if task.ignore_errors {
-                    println!(
-                        "  {} {} — {}",
-                        "!".yellow().bold(),
-                        "failed (ignored):".yellow(),
-                        e
-                    );
+                    if !json {
+                        println!(
+                            "  {} {} — {}",
+                            "!".yellow().bold(),
+                            "failed (ignored):".yellow(),
+                            e
+                        );
+                    }
                     skipped += 1;
+                    outcomes.push(TaskOutcome {
+                        name: task.name.clone(),
+                        status: "ignored",
+                        error: Some(e.to_string()),
+                    });
                 } else {
-                    println!("  {} {}", "✗".red().bold(), e.to_string().red());
                     failed += 1;
+                    outcomes.push(TaskOutcome {
+                        name: task.name.clone(),
+                        status: "failed",
+                        error: Some(e.to_string()),
+                    });
+
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "playbook": playbook.name,
+                                "dry": dry,
+                                "tasks": outcomes,
+                                "ok": ok,
+                                "failed": failed,
+                                "skipped": skipped,
+                                "success": false,
+                            })
+                        );
+                        std::process::exit(1);
+                    }
+
+                    println!("  {} {}", "✗".red().bold(), e.to_string().red());
                     println!("\n{}", sep.dimmed());
                     println!(
                         "\n{} failed at task \"{}\". {}",
@@ -206,6 +261,22 @@ fn execute_playbook(
         }
     }
 
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "playbook": playbook.name,
+                "dry": dry,
+                "tasks": outcomes,
+                "ok": ok,
+                "failed": failed,
+                "skipped": skipped,
+                "success": true,
+            })
+        );
+        return Ok(());
+    }
+
     println!("\n{}", sep.dimmed());
     print_recap(ok, failed, skipped);
     Ok(())
@@ -216,10 +287,13 @@ fn run_task(
     vars: &HashMap<String, String>,
     playbook_dir: &Path,
     dry: bool,
+    quiet: bool,
 ) -> Result<()> {
     if let Some(cmd) = &task.run {
         let cmd = render(cmd, vars);
-        println!("  {} {}", "$".bold().green(), cmd.dimmed());
+        if !quiet {
+            println!("  {} {}", "$".bold().green(), cmd.dimmed());
+        }
         if !dry {
             let start = Instant::now();
             let status = std::process::Command::new("sh")
@@ -229,11 +303,13 @@ fn run_task(
                 .status()?;
             let elapsed = start.elapsed();
             if status.success() {
-                println!(
-                    "  {} {}",
-                    "✓ ok".green().bold(),
-                    format!("({:.1}s)", elapsed.as_secs_f32()).dimmed()
-                );
+                if !quiet {
+                    println!(
+                        "  {} {}",
+                        "✓ ok".green().bold(),
+                        format!("({:.1}s)", elapsed.as_secs_f32()).dimmed()
+                    );
+                }
             } else {
                 bail!("command exited with code {}", status.code().unwrap_or(1));
             }
@@ -243,18 +319,22 @@ fn run_task(
 
     if let Some(url) = &task.check_url {
         let url = render(url, vars);
-        println!("  {} {}", "→".bold(), url.dimmed());
+        if !quiet {
+            println!("  {} {}", "→".bold(), url.dimmed());
+        }
         if !dry {
-            check_url(&url)?;
+            check_url(&url, quiet)?;
         }
         return Ok(());
     }
 
     if let Some(spec) = &task.check_port {
         let host = render(&spec.host, vars);
-        println!("  {} {}:{}", "→".bold(), host.dimmed(), spec.port);
+        if !quiet {
+            println!("  {} {}:{}", "→".bold(), host.dimmed(), spec.port);
+        }
         if !dry {
-            check_port(&host, spec.port, spec.timeout)?;
+            check_port(&host, spec.port, spec.timeout, quiet)?;
         }
         return Ok(());
     }
@@ -262,14 +342,20 @@ fn run_task(
     if let Some(spec) = &task.env_check {
         let reference = playbook_dir.join(render(&spec.reference, vars));
         let target = playbook_dir.join(render(&spec.target, vars));
-        println!(
-            "  {} {} → {}",
-            "→".bold(),
-            reference.display().to_string().dimmed(),
-            target.display().to_string().dimmed()
-        );
+        if !quiet {
+            println!(
+                "  {} {} → {}",
+                "→".bold(),
+                reference.display().to_string().dimmed(),
+                target.display().to_string().dimmed()
+            );
+        }
         if !dry {
-            env_check(&reference.to_string_lossy(), &target.to_string_lossy())?;
+            env_check(
+                &reference.to_string_lossy(),
+                &target.to_string_lossy(),
+                quiet,
+            )?;
         }
         return Ok(());
     }
@@ -282,18 +368,20 @@ fn run_task(
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
-fn check_url(url: &str) -> Result<()> {
+fn check_url(url: &str, quiet: bool) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
     match client.get(url).send() {
         Ok(r) if r.status().is_success() => {
-            println!(
-                "  {} {} ({})",
-                "✓".green().bold(),
-                url,
-                r.status().as_u16().to_string().green()
-            );
+            if !quiet {
+                println!(
+                    "  {} {} ({})",
+                    "✓".green().bold(),
+                    url,
+                    r.status().as_u16().to_string().green()
+                );
+            }
             Ok(())
         }
         Ok(r) => bail!("HTTP {}", r.status().as_u16()),
@@ -301,7 +389,7 @@ fn check_url(url: &str) -> Result<()> {
     }
 }
 
-fn check_port(host: &str, port: u16, timeout_secs: u64) -> Result<()> {
+fn check_port(host: &str, port: u16, timeout_secs: u64, quiet: bool) -> Result<()> {
     use std::net::ToSocketAddrs;
     let addr = format!("{host}:{port}");
     let socket = addr
@@ -311,11 +399,15 @@ fn check_port(host: &str, port: u16, timeout_secs: u64) -> Result<()> {
         .with_context(|| format!("No address for '{addr}'"))?;
 
     std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(timeout_secs))
-        .map(|_| println!("  {} {host}:{port} is open", "✓".green().bold()))
+        .map(|_| {
+            if !quiet {
+                println!("  {} {host}:{port} is open", "✓".green().bold());
+            }
+        })
         .map_err(|e| anyhow::anyhow!("{host}:{port} — {e}"))
 }
 
-fn env_check(reference: &str, target: &str) -> Result<()> {
+fn env_check(reference: &str, target: &str, quiet: bool) -> Result<()> {
     let parse = |path: &str| -> Result<std::collections::HashSet<String>> {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("Cannot read {path}"))?;
@@ -331,7 +423,9 @@ fn env_check(reference: &str, target: &str) -> Result<()> {
     let mut missing: Vec<&String> = ref_keys.iter().filter(|k| !tgt_keys.contains(*k)).collect();
 
     if missing.is_empty() {
-        println!("  {} all keys present in {target}", "✓".green().bold());
+        if !quiet {
+            println!("  {} all keys present in {target}", "✓".green().bold());
+        }
         Ok(())
     } else {
         missing.sort();
@@ -372,9 +466,15 @@ fn print_recap(ok: usize, failed: usize, skipped: usize) {
 
 // ── Sample playbook ───────────────────────────────────────────────────────────
 
-fn write_sample(path: &str) -> Result<()> {
+fn write_sample(path: &str, ctx: &Context) -> Result<()> {
+    let json = ctx.output == OutputFormat::Json;
     if std::path::Path::new(path).exists() {
-        bail!("'{}' already exists.", path);
+        let message = format!("'{}' already exists.", path);
+        if json {
+            println!("{}", serde_json::json!({"path": path, "error": message}));
+            std::process::exit(1);
+        }
+        bail!(message);
     }
 
     let sample = r#"name: My Playbook
@@ -413,6 +513,10 @@ tasks:
 "#;
 
     std::fs::write(path, sample)?;
+    if json {
+        println!("{}", serde_json::json!({"created": path}));
+        return Ok(());
+    }
     println!("{} {}", "created".green().bold(), path.cyan());
     println!("{}", "Run it with: tooler play playbook.yml".dimmed());
     Ok(())

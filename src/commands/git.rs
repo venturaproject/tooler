@@ -1,5 +1,6 @@
 use crate::{context::Context, output::OutputFormat};
 use anyhow::{Result, bail};
+use chrono::NaiveDate;
 use clap::{Args, Subcommand};
 use colored::Colorize;
 
@@ -14,7 +15,9 @@ pub enum GitSubcommand {
     /// Compact repo summary: branch, tag, status, recent commits
     Summary,
 
-    /// Delete branches already merged into the current branch
+    /// Delete branches already merged into the current branch, or (with
+    /// --after/--before) any local branch whose name ends in a DDMMYY date
+    /// suffix falling in the given range, regardless of merge status
     Clean {
         /// Also delete from remote
         #[arg(long)]
@@ -22,6 +25,12 @@ pub enum GitSubcommand {
         /// Actually delete (default is preview)
         #[arg(long)]
         confirm: bool,
+        /// Only branches with a trailing DDMMYY date suffix on/after this date (DDMMYY)
+        #[arg(long)]
+        after: Option<String>,
+        /// Only branches with a trailing DDMMYY date suffix on/before this date (DDMMYY)
+        #[arg(long)]
+        before: Option<String>,
     },
 
     /// Generate a changelog from commits since the last tag
@@ -43,9 +52,33 @@ fn git(args: &[&str]) -> Result<String> {
 pub fn run(args: GitArgs, ctx: &Context) -> Result<()> {
     match args.subcommand {
         GitSubcommand::Summary => summary(ctx),
-        GitSubcommand::Clean { remote, confirm } => clean(remote, confirm, ctx),
+        GitSubcommand::Clean {
+            remote,
+            confirm,
+            after,
+            before,
+        } => clean(remote, confirm, after, before, ctx),
         GitSubcommand::Changelog { from } => changelog(from, ctx),
     }
+}
+
+/// Parses a `DDMMYY` string into a date, for the `--after`/`--before` flags.
+fn parse_ddmmyy(s: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%d%m%y")
+        .map_err(|_| anyhow::anyhow!("expected a date in DDMMYY format, got {s:?}"))
+}
+
+/// If `branch` ends in exactly 6 digits, parses them as a `DDMMYY` date suffix.
+/// Works regardless of what separator (`-`, `_`, none) precedes the digits.
+fn date_suffix(branch: &str) -> Option<NaiveDate> {
+    if branch.len() < 6 {
+        return None;
+    }
+    let tail = &branch[branch.len() - 6..];
+    if !tail.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    NaiveDate::parse_from_str(tail, "%d%m%y").ok()
 }
 
 fn summary(ctx: &Context) -> Result<()> {
@@ -145,16 +178,46 @@ fn delete_branches<'a>(to_delete: &[&'a str], remote: bool) -> Vec<DeleteOutcome
         .collect()
 }
 
-fn clean(remote: bool, confirm: bool, ctx: &Context) -> Result<()> {
+fn clean(
+    remote: bool,
+    confirm: bool,
+    after: Option<String>,
+    before: Option<String>,
+    ctx: &Context,
+) -> Result<()> {
     let current = git(&["branch", "--show-current"])?;
     let protected = ["main", "master", "develop", "dev", current.as_str()];
 
-    let merged = git(&["branch", "--merged"])?;
-    let to_delete: Vec<&str> = merged
-        .lines()
-        .map(|l| l.trim().trim_start_matches("* "))
-        .filter(|b| !b.is_empty() && !protected.contains(b))
-        .collect();
+    let by_date = after.is_some() || before.is_some();
+    let after = after.as_deref().map(parse_ddmmyy).transpose()?;
+    let before = before.as_deref().map(parse_ddmmyy).transpose()?;
+
+    let owned_names: Vec<String>;
+    let to_delete: Vec<&str> = if by_date {
+        // Date-suffix cleanup targets any local branch in range, not just
+        // merged ones — the date suffix is the user's own retention signal.
+        let all = git(&["branch", "--list"])?;
+        owned_names = all
+            .lines()
+            .map(|l| l.trim().trim_start_matches("* ").to_string())
+            .filter(|b| {
+                !b.is_empty()
+                    && !protected.contains(&b.as_str())
+                    && date_suffix(b).is_some_and(|d| {
+                        after.is_none_or(|a| d >= a) && before.is_none_or(|bf| d <= bf)
+                    })
+            })
+            .collect();
+        owned_names.iter().map(String::as_str).collect()
+    } else {
+        let merged = git(&["branch", "--merged"])?;
+        owned_names = merged
+            .lines()
+            .map(|l| l.trim().trim_start_matches("* ").to_string())
+            .filter(|b| !b.is_empty() && !protected.contains(&b.as_str()))
+            .collect();
+        owned_names.iter().map(String::as_str).collect()
+    };
 
     if ctx.output == OutputFormat::Json {
         if to_delete.is_empty() {
@@ -187,11 +250,21 @@ fn clean(remote: bool, confirm: bool, ctx: &Context) -> Result<()> {
     }
 
     if to_delete.is_empty() {
-        println!("{}", "No merged branches to delete.".green());
+        let msg = if by_date {
+            "No branches with a date suffix in range."
+        } else {
+            "No merged branches to delete."
+        };
+        println!("{}", msg.green());
         return Ok(());
     }
 
-    println!("{}", "Merged branches to delete:".bold());
+    let heading = if by_date {
+        "Branches in date range to delete:"
+    } else {
+        "Merged branches to delete:"
+    };
+    println!("{}", heading.bold());
     for b in &to_delete {
         println!("  {} {}", "−".red(), b);
     }
@@ -294,4 +367,42 @@ fn changelog(from: Option<String>, ctx: &Context) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_suffix_parses_ddmmyy_with_various_separators() {
+        let expected = NaiveDate::from_ymd_opt(2026, 7, 8).unwrap();
+        assert_eq!(date_suffix("feature-080726"), Some(expected));
+        assert_eq!(date_suffix("feature_080726"), Some(expected));
+        assert_eq!(date_suffix("feature080726"), Some(expected));
+    }
+
+    #[test]
+    fn date_suffix_none_when_no_trailing_digits_or_invalid_date() {
+        assert_eq!(date_suffix("feature-login"), None);
+        assert_eq!(date_suffix("main"), None);
+        // 99 is not a valid month
+        assert_eq!(date_suffix("feature-089999"), None);
+    }
+
+    #[test]
+    fn date_suffix_none_when_branch_shorter_than_six_chars() {
+        assert_eq!(date_suffix("dev"), None);
+    }
+
+    #[test]
+    fn parse_ddmmyy_round_trips_valid_dates() {
+        let d = parse_ddmmyy("080726").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 7, 8).unwrap());
+    }
+
+    #[test]
+    fn parse_ddmmyy_rejects_malformed_input() {
+        assert!(parse_ddmmyy("not-a-date").is_err());
+        assert!(parse_ddmmyy("999999").is_err());
+    }
 }

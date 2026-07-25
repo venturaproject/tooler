@@ -1,4 +1,4 @@
-use crate::context::Context;
+use crate::{context::Context, output::OutputFormat};
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
@@ -191,21 +191,32 @@ fn render(content: &str, vars: &HashMap<&str, String>) -> String {
     out
 }
 
-pub fn run(args: ScaffoldArgs, _ctx: &Context) -> Result<()> {
+pub fn run(args: ScaffoldArgs, ctx: &Context) -> Result<()> {
     match args.subcommand {
-        ScaffoldSubcommand::List => list(),
+        ScaffoldSubcommand::List => list(ctx),
         ScaffoldSubcommand::New {
             template,
             name,
             dir,
-        } => new(&template, &name, dir),
+        } => new(&template, &name, dir, ctx),
     }
 }
 
-fn list() -> Result<()> {
+fn list(ctx: &Context) -> Result<()> {
+    let all = templates();
+
+    if ctx.output == OutputFormat::Json {
+        let templates: Vec<_> = all
+            .iter()
+            .map(|t| serde_json::json!({"name": t.name, "description": t.description}))
+            .collect();
+        println!("{}", serde_json::json!({"templates": templates}));
+        return Ok(());
+    }
+
     println!("{}", "available templates:".bold().cyan());
     println!("{}", "─".repeat(40).dimmed());
-    for t in templates() {
+    for t in all {
         println!("  {:20} {}", t.name.bold(), t.description.dimmed());
     }
     println!();
@@ -216,25 +227,39 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn new(template_name: &str, name: &str, output: Option<String>) -> Result<()> {
+fn new(template_name: &str, name: &str, output: Option<String>, ctx: &Context) -> Result<()> {
+    let json = ctx.output == OutputFormat::Json;
     let all = templates();
-    let tmpl = all
-        .iter()
-        .find(|t| t.name == template_name)
-        .ok_or_else(|| {
+    let tmpl = match all.iter().find(|t| t.name == template_name) {
+        Some(t) => t,
+        None => {
             let names: Vec<&str> = all.iter().map(|t| t.name).collect();
-            anyhow::anyhow!(
+            let message = format!(
                 "Template '{}' not found. Available: {}",
                 template_name,
                 names.join(", ")
-            )
-        })?;
+            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"template": template_name, "error": message})
+                );
+                std::process::exit(1);
+            }
+            bail!(message);
+        }
+    };
 
     let dest = output.unwrap_or_else(|| name.to_string());
     let dest_path = Path::new(&dest);
 
     if dest_path.exists() {
-        bail!("Directory '{}' already exists.", dest);
+        let message = format!("Directory '{}' already exists.", dest);
+        if json {
+            println!("{}", serde_json::json!({"dir": dest, "error": message}));
+            std::process::exit(1);
+        }
+        bail!(message);
     }
 
     let author = std::process::Command::new("git")
@@ -254,9 +279,12 @@ fn new(template_name: &str, name: &str, output: Option<String>) -> Result<()> {
     vars.insert("author", author);
     vars.insert("year", year);
 
-    println!("{} {}", "scaffolding".bold().cyan(), name.green());
-    println!("{}", "─".repeat(40).dimmed());
+    if !json {
+        println!("{} {}", "scaffolding".bold().cyan(), name.green());
+        println!("{}", "─".repeat(40).dimmed());
+    }
 
+    let mut created = Vec::new();
     for (rel_path, content) in &tmpl.files {
         let rendered_content = render(content, &vars);
         let full_path = dest_path.join(rel_path);
@@ -266,7 +294,24 @@ fn new(template_name: &str, name: &str, output: Option<String>) -> Result<()> {
         }
 
         std::fs::write(&full_path, rendered_content)?;
-        println!("  {} {}", "created".green(), full_path.display());
+        if json {
+            created.push(full_path.display().to_string());
+        } else {
+            println!("  {} {}", "created".green(), full_path.display());
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "template": template_name,
+                "name": name,
+                "dir": dest,
+                "files": created,
+            })
+        );
+        return Ok(());
     }
 
     println!();

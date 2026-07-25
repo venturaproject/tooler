@@ -1,4 +1,4 @@
-use crate::{config, config::Server, context::Context};
+use crate::{config::Server, context::Context};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
@@ -76,43 +76,18 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn resolve_server(name: &str) -> Result<Server> {
-    let cfg = config::load()?;
-    cfg.server
+pub(crate) fn resolve_server(ctx: &Context, name: &str) -> Result<Server> {
+    ctx.config
+        .server
         .get(name)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found. Add it with: tooler server add {} --host <ip> --user <user> --key <key>", name, name))
 }
 
-fn ssh_args(server: &Server) -> Vec<String> {
-    let mut args = vec![
-        "-o".into(),
-        "StrictHostKeyChecking=no".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
-    ];
-    if let Some(key) = &server.key {
-        args.push("-i".into());
-        args.push(expand_tilde(key).to_string_lossy().to_string());
-    }
-    if let Some(port) = server.port {
-        args.push("-p".into());
-        args.push(port.to_string());
-    }
-    args
-}
-
-fn host_target(server: &Server) -> String {
-    match &server.user {
-        Some(u) => format!("{u}@{}", server.host),
-        None => server.host.clone(),
-    }
-}
-
 fn run_ssh(server: &Server, command: &str) -> Result<()> {
     let status = std::process::Command::new("ssh")
-        .args(ssh_args(server))
-        .arg(host_target(server))
+        .args(server.ssh_args())
+        .arg(server.host_target())
         .arg(command)
         .status()
         .context("Failed to launch ssh — is it installed?")?;
@@ -124,16 +99,8 @@ fn run_ssh(server: &Server, command: &str) -> Result<()> {
 }
 
 fn run_scp(server: &Server, local: &Path, remote_path: &str) -> Result<()> {
-    let dest = format!("{}:{}", host_target(server), remote_path);
-    let mut scp_args = vec!["-o".to_string(), "StrictHostKeyChecking=no".to_string()];
-    if let Some(key) = &server.key {
-        scp_args.push("-i".into());
-        scp_args.push(expand_tilde(key).to_string_lossy().to_string());
-    }
-    if let Some(port) = server.port {
-        scp_args.push("-P".into());
-        scp_args.push(port.to_string());
-    }
+    let dest = format!("{}:{}", server.host_target(), remote_path);
+    let scp_args = server.scp_args();
 
     let status = std::process::Command::new("scp")
         .args(&scp_args)
@@ -150,15 +117,15 @@ fn run_scp(server: &Server, local: &Path, remote_path: &str) -> Result<()> {
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
-pub fn run(args: SshArgs, _ctx: &Context) -> Result<()> {
+pub fn run(args: SshArgs, ctx: &Context) -> Result<()> {
     match args.subcommand {
-        SshSubcommand::Check { server } => check(&server),
+        SshSubcommand::Check { server } => check(ctx, &server),
         SshSubcommand::Exec {
             server,
             command,
             sudo,
-        } => exec(&server, &command, sudo),
-        SshSubcommand::Copy { local, remote } => copy(&local, &remote),
+        } => exec(ctx, &server, &command, sudo),
+        SshSubcommand::Copy { local, remote } => copy(ctx, &local, &remote),
         SshSubcommand::Ssl {
             server,
             pfx,
@@ -169,6 +136,7 @@ pub fn run(args: SshArgs, _ctx: &Context) -> Result<()> {
             cert_name,
             key_name,
         } => ssl(
+            ctx,
             &server,
             &pfx,
             &key,
@@ -183,19 +151,19 @@ pub fn run(args: SshArgs, _ctx: &Context) -> Result<()> {
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
-fn check(name: &str) -> Result<()> {
-    let server = resolve_server(name)?;
+fn check(ctx: &Context, name: &str) -> Result<()> {
+    let server = resolve_server(ctx, name)?;
     print!(
         "checking {} ({})... ",
         name.cyan(),
-        host_target(&server).dimmed()
+        server.host_target().dimmed()
     );
 
     let status = std::process::Command::new("ssh")
-        .args(ssh_args(&server))
+        .args(server.ssh_args())
         .arg("-o")
         .arg("ConnectTimeout=5")
-        .arg(host_target(&server))
+        .arg(server.host_target())
         .arg("echo ok")
         .output()
         .context("Failed to launch ssh")?;
@@ -209,8 +177,8 @@ fn check(name: &str) -> Result<()> {
     }
 }
 
-fn exec(name: &str, command: &str, sudo: bool) -> Result<()> {
-    let server = resolve_server(name)?;
+fn exec(ctx: &Context, name: &str, command: &str, sudo: bool) -> Result<()> {
+    let server = resolve_server(ctx, name)?;
     let full_cmd = if sudo {
         format!("sudo {command}")
     } else {
@@ -219,18 +187,18 @@ fn exec(name: &str, command: &str, sudo: bool) -> Result<()> {
     println!(
         "{} {} {}",
         "→".bold(),
-        host_target(&server).cyan(),
+        server.host_target().cyan(),
         full_cmd.dimmed()
     );
     run_ssh(&server, &full_cmd)
 }
 
-fn copy(local: &str, remote: &str) -> Result<()> {
+fn copy(ctx: &Context, local: &str, remote: &str) -> Result<()> {
     let (server_name, remote_path) = remote.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("Remote must be in format server:path (e.g. gdn:/tmp/file)")
     })?;
 
-    let server = resolve_server(server_name)?;
+    let server = resolve_server(ctx, server_name)?;
     println!(
         "{} {} → {}:{}",
         "→".bold(),
@@ -245,6 +213,7 @@ fn copy(local: &str, remote: &str) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn ssl(
+    ctx: &Context,
     name: &str,
     pfx_path: &str,
     key_path: &str,
@@ -254,7 +223,7 @@ fn ssl(
     cert_name: &str,
     key_name: &str,
 ) -> Result<()> {
-    let server = resolve_server(name)?;
+    let server = resolve_server(ctx, name)?;
     let ssl_dir = remote_dir
         .or(server.ssl_dir.as_deref())
         .unwrap_or("/etc/nginx/ssl");
@@ -262,7 +231,7 @@ fn ssl(
     println!(
         "{} {}",
         "SSL deploy →".bold().cyan(),
-        host_target(&server).green()
+        server.host_target().green()
     );
     println!("{}", "─".repeat(50).dimmed());
 

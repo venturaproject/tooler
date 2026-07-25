@@ -63,7 +63,7 @@ pub fn run(args: ServerArgs, ctx: &Context) -> Result<()> {
 }
 
 fn list(ctx: &Context) -> Result<()> {
-    let cfg = config::load()?;
+    let cfg = &ctx.config;
     let mut names: Vec<&String> = cfg.server.keys().collect();
     names.sort();
 
@@ -127,7 +127,7 @@ fn add(
     ssl_dir: Option<String>,
     ctx: &Context,
 ) -> Result<()> {
-    let mut cfg = config::load()?;
+    let mut cfg = ctx.config.clone();
     let server = Server {
         host,
         user,
@@ -147,7 +147,7 @@ fn add(
 }
 
 fn show(name: &str, ctx: &Context) -> Result<()> {
-    let cfg = config::load()?;
+    let cfg = &ctx.config;
     let s = cfg
         .server
         .get(name)
@@ -188,7 +188,7 @@ fn show(name: &str, ctx: &Context) -> Result<()> {
 }
 
 fn remove(name: &str, ctx: &Context) -> Result<()> {
-    let mut cfg = config::load()?;
+    let mut cfg = ctx.config.clone();
     if cfg.server.remove(name).is_none() {
         bail!("Server '{}' not found", name);
     }
