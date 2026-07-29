@@ -82,6 +82,136 @@ pub fn fetch_remote_file(server: &Server, path: &str) -> Result<String> {
     ssh_exec_capture(server, &format!("cat {}", shell_quote(path)))
 }
 
+/// Builds a sudo-invocation prefix for a remote command: empty when not using sudo,
+/// `sudo ` when no password is supplied (relies on passwordless/NOPASSWD sudo), or a
+/// piped `echo <pw> | sudo -S ` when a password is supplied. Shared by every command
+/// that can run its remote action via sudo (systemd, ps).
+pub(crate) fn sudo_prefix(sudo: bool, sudo_pass: Option<&str>) -> String {
+    if !sudo {
+        return String::new();
+    }
+    match sudo_pass {
+        Some(pass) => format!("echo {} | sudo -S ", shell_quote(pass)),
+        None => "sudo ".to_string(),
+    }
+}
+
+/// Runs `command` on `server` over SSH and returns its raw stdout bytes, without lossy
+/// UTF-8 conversion -- used for database dumps, which may be gzip-compressed binary
+/// data rather than text.
+pub(crate) fn ssh_exec_capture_bytes(server: &Server, command: &str) -> Result<Vec<u8>> {
+    let output = std::process::Command::new("ssh")
+        .args(server.ssh_args())
+        .arg(server.host_target())
+        .arg(command)
+        .output()
+        .context("Failed to launch ssh — is it installed?")?;
+    if !output.status.success() {
+        bail!(
+            "remote command failed on {}: {}",
+            server.host_target(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// Runs `command` on `server` over SSH, writing `input` to the remote command's stdin
+/// (e.g. piping a local dump file into `psql`/`mysql` for a restore), and returns
+/// (stdout, stderr, exit_success) without bailing on a non-zero exit -- mirrors
+/// [`ssh_exec_capture_lenient`] so callers decide what a failure means.
+pub(crate) fn ssh_exec_with_stdin(
+    server: &Server,
+    command: &str,
+    input: &[u8],
+) -> Result<(String, String, bool)> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new("ssh")
+        .args(server.ssh_args())
+        .arg(server.host_target())
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to launch ssh — is it installed?")?;
+
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(input)
+        .context("writing dump data to ssh stdin")?;
+
+    let output = child
+        .wait_with_output()
+        .context("waiting for ssh to finish")?;
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.success(),
+    ))
+}
+
+/// Builds the remote dump command for a database backup (`pg_dump`/`mysqldump`),
+/// optionally piped through `gzip -c` so the transferred bytes are compressed.
+pub fn dump_command(creds: &Credentials, gzip: bool) -> String {
+    let dump = match creds.engine {
+        Engine::Postgres => format!(
+            "PGPASSWORD={} PGCONNECT_TIMEOUT=10 pg_dump -h {} -p {} -U {} -d {}",
+            shell_quote(&creds.password),
+            shell_quote(&creds.host),
+            creds.port,
+            shell_quote(&creds.user),
+            shell_quote(&creds.database),
+        ),
+        Engine::MySql => format!(
+            "MYSQL_PWD={} mysqldump --single-transaction --connect-timeout=10 -h {} -P {} -u {} {}",
+            shell_quote(&creds.password),
+            shell_quote(&creds.host),
+            creds.port,
+            shell_quote(&creds.user),
+            shell_quote(&creds.database),
+        ),
+    };
+    if gzip {
+        format!("{dump} | gzip -c")
+    } else {
+        dump
+    }
+}
+
+/// Builds the remote restore command (`psql`/`mysql`) that reads a dump from stdin.
+/// When `gzipped_input` is set, prefixes with `gunzip -c |` to decompress the piped
+/// bytes before they reach the database client.
+pub fn restore_command(creds: &Credentials, gzipped_input: bool) -> String {
+    let load = match creds.engine {
+        Engine::Postgres => format!(
+            "PGPASSWORD={} PGCONNECT_TIMEOUT=10 psql -h {} -p {} -U {} -d {}",
+            shell_quote(&creds.password),
+            shell_quote(&creds.host),
+            creds.port,
+            shell_quote(&creds.user),
+            shell_quote(&creds.database),
+        ),
+        Engine::MySql => format!(
+            "MYSQL_PWD={} mysql --connect-timeout=10 -h {} -P {} -u {} {}",
+            shell_quote(&creds.password),
+            shell_quote(&creds.host),
+            creds.port,
+            shell_quote(&creds.user),
+            shell_quote(&creds.database),
+        ),
+    };
+    if gzipped_input {
+        format!("gunzip -c | {load}")
+    } else {
+        load
+    }
+}
+
 /// Parses `KEY=value` lines (dotenv format: `#` comments, optional quotes).
 pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -403,5 +533,73 @@ mod tests {
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote("plain"), "'plain'");
+    }
+
+    #[test]
+    fn sudo_prefix_empty_when_not_sudo() {
+        assert_eq!(sudo_prefix(false, Some("pw")), "");
+    }
+
+    #[test]
+    fn sudo_prefix_plain_sudo_without_password() {
+        assert_eq!(sudo_prefix(true, None), "sudo ");
+    }
+
+    #[test]
+    fn sudo_prefix_pipes_quoted_password() {
+        assert_eq!(
+            sudo_prefix(true, Some("it's")),
+            "echo 'it'\\''s' | sudo -S "
+        );
+    }
+
+    fn pg_creds() -> Credentials {
+        Credentials {
+            engine: Engine::Postgres,
+            host: "db.internal".to_string(),
+            port: 5432,
+            database: "shop".to_string(),
+            user: "app".to_string(),
+            password: "secret".to_string(),
+        }
+    }
+
+    fn mysql_creds() -> Credentials {
+        Credentials {
+            engine: Engine::MySql,
+            host: "db.internal".to_string(),
+            port: 3306,
+            database: "shop".to_string(),
+            user: "app".to_string(),
+            password: "secret".to_string(),
+        }
+    }
+
+    #[test]
+    fn dump_command_postgres_with_gzip() {
+        let cmd = dump_command(&pg_creds(), true);
+        assert!(cmd.starts_with("PGPASSWORD='secret' PGCONNECT_TIMEOUT=10 pg_dump"));
+        assert!(cmd.ends_with("| gzip -c"));
+    }
+
+    #[test]
+    fn dump_command_mysql_without_gzip() {
+        let cmd = dump_command(&mysql_creds(), false);
+        assert!(cmd.starts_with("MYSQL_PWD='secret' mysqldump"));
+        assert!(!cmd.contains("gzip"));
+    }
+
+    #[test]
+    fn restore_command_postgres_with_gzipped_input() {
+        let cmd = restore_command(&pg_creds(), true);
+        assert!(cmd.starts_with("gunzip -c | PGPASSWORD='secret'"));
+        assert!(cmd.contains("psql"));
+    }
+
+    #[test]
+    fn restore_command_mysql_without_gzipped_input() {
+        let cmd = restore_command(&mysql_creds(), false);
+        assert!(cmd.starts_with("MYSQL_PWD='secret' mysql"));
+        assert!(!cmd.contains("gunzip"));
     }
 }

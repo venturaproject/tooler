@@ -479,6 +479,76 @@ struct DbQueryArgs {
     max_rows: Option<usize>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct DbBackupArgs {
+    /// Server profile to run pg_dump/mysqldump on (see tooler_server_list)
+    server: String,
+    /// Local file path to write the dump to
+    out: String,
+    /// Remote path to a dotenv-style file (e.g. Laravel .env) to read DB_* credentials
+    /// from. Preferred over passing credentials explicitly.
+    env: Option<String>,
+    /// DB engine when not using `env`: mysql or postgres
+    engine: Option<String>,
+    /// DB host as reachable from the server profile (when not using `env`)
+    host: Option<String>,
+    /// DB port (when not using `env`; defaults to the engine's standard port)
+    port: Option<u16>,
+    /// Database name (when not using `env`)
+    database: Option<String>,
+    /// DB username (when not using `env`)
+    user: Option<String>,
+    /// Skip gzip compression of the dump
+    #[serde(default)]
+    no_gzip: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DbRestoreArgs {
+    /// Server profile to run psql/mysql on (see tooler_server_list)
+    server: String,
+    /// Local dump file to restore (gzip-compressed input is auto-detected)
+    #[serde(rename = "in")]
+    input: String,
+    env: Option<String>,
+    engine: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    database: Option<String>,
+    user: Option<String>,
+    /// Actually run the restore. Without this, the call only previews what would happen
+    /// (bytes to send, target database) and makes no change.
+    #[serde(default)]
+    confirm: bool,
+}
+
+// ── ps ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct PsListArgs {
+    /// Server profile (see tooler_server_list)
+    server: String,
+    /// Only show processes whose command line (or PID) matches this substring
+    filter: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PsKillArgs {
+    server: String,
+    /// Process ID to signal
+    pid: u32,
+    /// Signal name or number (defaults to TERM)
+    signal: Option<String>,
+    /// Run via sudo. A sudo password, if needed, must never be passed as a tool
+    /// argument -- set TOOLER_SUDO_PASS in the MCP server's own environment instead
+    /// (or rely on passwordless/NOPASSWD sudo).
+    #[serde(default)]
+    sudo: bool,
+    /// Actually send the signal. Without this, the call only previews what would happen.
+    #[serde(default)]
+    confirm: bool,
+}
+
 // ── gh ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
@@ -1238,6 +1308,76 @@ impl ToolerMcp {
     }
 
     #[tool(
+        description = "Dump a remote database (pg_dump/mysqldump) over SSH to a local file, \
+                        gzip-compressed by default. Prefer `env` (a remote dotenv-style file) \
+                        to supply DB_* credentials rather than passing them explicitly; a DB \
+                        password can never be passed as a tool argument — set \
+                        TOOLER_DB_PASSWORD in the environment the tooler MCP server itself \
+                        runs in instead.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_db_backup(
+        &self,
+        Parameters(args): Parameters<DbBackupArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "db".to_string(),
+            "backup".to_string(),
+            args.server.clone(),
+            "--out".to_string(),
+            args.out.clone(),
+        ];
+        push_opt(&mut argv, "--env", &args.env);
+        push_opt(&mut argv, "--engine", &args.engine);
+        push_opt(&mut argv, "--host", &args.host);
+        push_opt_num(&mut argv, "--port", args.port);
+        push_opt(&mut argv, "--database", &args.database);
+        push_opt(&mut argv, "--user", &args.user);
+        push_flag(&mut argv, "--no-gzip", args.no_gzip);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Restore a local dump file into a remote database (psql/mysql) over SSH. \
+                        Without `confirm`, this only previews what would run (byte count, \
+                        target database) and makes no change — pass `confirm: true` to actually \
+                        apply it. Prefer `env` for credentials; a DB password can never be \
+                        passed as a tool argument — set TOOLER_DB_PASSWORD in the MCP server's \
+                        own environment instead.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_db_restore(
+        &self,
+        Parameters(args): Parameters<DbRestoreArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "db".to_string(),
+            "restore".to_string(),
+            args.server.clone(),
+            "--in".to_string(),
+            args.input.clone(),
+        ];
+        push_opt(&mut argv, "--env", &args.env);
+        push_opt(&mut argv, "--engine", &args.engine);
+        push_opt(&mut argv, "--host", &args.host);
+        push_opt_num(&mut argv, "--port", args.port);
+        push_opt(&mut argv, "--database", &args.database);
+        push_opt(&mut argv, "--user", &args.user);
+        push_flag(&mut argv, "--confirm", args.confirm);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
         description = "List pull requests (title, labels, author, dates) via the `gh` CLI, \
                         optionally filtered to a created-date range. Requires `gh` installed \
                         and authenticated in the environment the tooler MCP server runs in. \
@@ -1413,6 +1553,49 @@ impl ToolerMcp {
             args.pattern.clone(),
         ];
         push_opt_num(&mut argv, "--max-lines", args.max_lines);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "List running processes on a remote server over SSH (ps aux), optionally \
+                        filtered by a substring of the command line or an exact PID",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_ps_list(
+        &self,
+        Parameters(args): Parameters<PsListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["ps".to_string(), "list".to_string(), args.server.clone()];
+        push_opt(&mut argv, "--filter", &args.filter);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Send a signal to a process on a remote server over SSH (default: TERM). \
+                        Without `confirm`, this only previews what would happen and sends \
+                        nothing — pass `confirm: true` to actually apply it. A sudo password, \
+                        if needed, must never be passed as a tool argument -- set \
+                        TOOLER_SUDO_PASS in the MCP server's own environment instead.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_ps_kill(
+        &self,
+        Parameters(args): Parameters<PsKillArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "ps".to_string(),
+            "kill".to_string(),
+            args.server.clone(),
+            args.pid.to_string(),
+        ];
+        push_opt(&mut argv, "--signal", &args.signal);
+        push_flag(&mut argv, "--sudo", args.sudo);
+        push_flag(&mut argv, "--confirm", args.confirm);
         self.exec_self(argv, &None).await
     }
 

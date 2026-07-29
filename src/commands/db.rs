@@ -50,6 +50,71 @@ pub enum DbSubcommand {
         #[arg(long, default_value_t = 1000)]
         max_rows: usize,
     },
+    /// Dump a remote database (pg_dump/mysqldump) to a local file, gzip-compressed by default
+    Backup {
+        /// Server profile to run pg_dump/mysqldump through (see: tooler server list)
+        server: String,
+        /// Local file path to write the dump to
+        #[arg(long)]
+        out: String,
+        /// Remote path to a dotenv-style file (e.g. Laravel .env) to read DB_* credentials from
+        #[arg(long)]
+        env: Option<String>,
+        /// DB engine when not using --env: mysql or postgres
+        #[arg(long)]
+        engine: Option<String>,
+        /// DB host as reachable from the server profile (when not using --env)
+        #[arg(long)]
+        host: Option<String>,
+        /// DB port (when not using --env; defaults to the engine's standard port)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Database name (when not using --env)
+        #[arg(long)]
+        database: Option<String>,
+        /// DB username (when not using --env)
+        #[arg(long)]
+        user: Option<String>,
+        /// DB password [env: TOOLER_DB_PASSWORD] (when not using --env)
+        #[arg(long, env = "TOOLER_DB_PASSWORD")]
+        password: Option<String>,
+        /// Skip gzip compression of the dump
+        #[arg(long)]
+        no_gzip: bool,
+    },
+    /// Restore a local dump file into a remote database (psql/mysql). Preview-only unless
+    /// --confirm is passed
+    Restore {
+        /// Server profile to run psql/mysql through (see: tooler server list)
+        server: String,
+        /// Local dump file to restore (gzip-compressed input is auto-detected)
+        #[arg(long = "in")]
+        input: String,
+        /// Remote path to a dotenv-style file (e.g. Laravel .env) to read DB_* credentials from
+        #[arg(long)]
+        env: Option<String>,
+        /// DB engine when not using --env: mysql or postgres
+        #[arg(long)]
+        engine: Option<String>,
+        /// DB host as reachable from the server profile (when not using --env)
+        #[arg(long)]
+        host: Option<String>,
+        /// DB port (when not using --env; defaults to the engine's standard port)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Database name (when not using --env)
+        #[arg(long)]
+        database: Option<String>,
+        /// DB username (when not using --env)
+        #[arg(long)]
+        user: Option<String>,
+        /// DB password [env: TOOLER_DB_PASSWORD] (when not using --env)
+        #[arg(long, env = "TOOLER_DB_PASSWORD")]
+        password: Option<String>,
+        /// Actually run the restore (default is preview-only: shows what would run)
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 pub fn run(args: DbArgs, ctx: &Context) -> Result<()> {
@@ -69,7 +134,7 @@ pub fn run(args: DbArgs, ctx: &Context) -> Result<()> {
             ctx,
             &server,
             &sql,
-            QueryOpts {
+            ConnOpts {
                 env: env.as_deref(),
                 engine: engine.as_deref(),
                 host: host.as_deref(),
@@ -77,13 +142,68 @@ pub fn run(args: DbArgs, ctx: &Context) -> Result<()> {
                 database: database.as_deref(),
                 user: user.as_deref(),
                 password: password.as_deref(),
-                max_rows,
             },
+            max_rows,
+        ),
+        DbSubcommand::Backup {
+            server,
+            out,
+            env,
+            engine,
+            host,
+            port,
+            database,
+            user,
+            password,
+            no_gzip,
+        } => backup(
+            ctx,
+            &server,
+            &out,
+            ConnOpts {
+                env: env.as_deref(),
+                engine: engine.as_deref(),
+                host: host.as_deref(),
+                port,
+                database: database.as_deref(),
+                user: user.as_deref(),
+                password: password.as_deref(),
+            },
+            !no_gzip,
+        ),
+        DbSubcommand::Restore {
+            server,
+            input,
+            env,
+            engine,
+            host,
+            port,
+            database,
+            user,
+            password,
+            confirm,
+        } => restore(
+            ctx,
+            &server,
+            &input,
+            ConnOpts {
+                env: env.as_deref(),
+                engine: engine.as_deref(),
+                host: host.as_deref(),
+                port,
+                database: database.as_deref(),
+                user: user.as_deref(),
+                password: password.as_deref(),
+            },
+            confirm,
         ),
     }
 }
 
-struct QueryOpts<'a> {
+/// Database connection parameters shared by `query`, `backup`, and `restore`: either
+/// `env` (a remote dotenv-style file to read DB_* credentials from) or the explicit
+/// engine/host/port/database/user/password fields.
+struct ConnOpts<'a> {
     env: Option<&'a str>,
     engine: Option<&'a str>,
     host: Option<&'a str>,
@@ -91,7 +211,6 @@ struct QueryOpts<'a> {
     database: Option<&'a str>,
     user: Option<&'a str>,
     password: Option<&'a str>,
-    max_rows: usize,
 }
 
 fn fail(json: bool, message: String) -> Result<()> {
@@ -102,7 +221,7 @@ fn fail(json: bool, message: String) -> Result<()> {
     bail!(message);
 }
 
-fn resolve_credentials(server: &Server, opts: &QueryOpts) -> Result<Credentials> {
+fn resolve_credentials(server: &Server, opts: &ConnOpts) -> Result<Credentials> {
     if let Some(path) = opts.env {
         return db::credentials_from_remote_env(server, path);
     }
@@ -187,7 +306,13 @@ fn print_table(rows: &[serde_json::Value]) {
     }
 }
 
-fn query(ctx: &Context, server_name: &str, sql: &str, opts: QueryOpts) -> Result<()> {
+fn query(
+    ctx: &Context,
+    server_name: &str,
+    sql: &str,
+    opts: ConnOpts,
+    max_rows: usize,
+) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
 
     let server = resolve_server(ctx, server_name)?;
@@ -196,7 +321,7 @@ fn query(ctx: &Context, server_name: &str, sql: &str, opts: QueryOpts) -> Result
         Err(e) => return fail(json, format!("{e:#}")),
     };
 
-    let (rows, truncated) = match db::run_query(&server, &creds, sql, opts.max_rows) {
+    let (rows, truncated) = match db::run_query(&server, &creds, sql, max_rows) {
         Ok(r) => r,
         Err(e) => return fail(json, format!("{e:#}")),
     };
@@ -224,4 +349,143 @@ fn query(ctx: &Context, server_name: &str, sql: &str, opts: QueryOpts) -> Result
     println!("{}", "─".repeat(40).dimmed());
     print_table(&rows);
     Ok(())
+}
+
+fn backup(ctx: &Context, server_name: &str, out: &str, opts: ConnOpts, gzip: bool) -> Result<()> {
+    let json = ctx.output == OutputFormat::Json;
+
+    let server = resolve_server(ctx, server_name)?;
+    let creds = match resolve_credentials(&server, &opts) {
+        Ok(c) => c,
+        Err(e) => return fail(json, format!("{e:#}")),
+    };
+
+    let command = db::dump_command(&creds, gzip);
+    let bytes = match db::ssh_exec_capture_bytes(&server, &command) {
+        Ok(b) => b,
+        Err(e) => return fail(json, format!("{e:#}")),
+    };
+    if let Err(e) = std::fs::write(out, &bytes) {
+        return fail(json, format!("writing {out}: {e}"));
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "server": server_name,
+                "database": creds.database,
+                "out": out,
+                "bytes": bytes.len(),
+                "gzip": gzip,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "{} dumped {} ({} bytes{}) from {} to {}",
+        "✓".green().bold(),
+        creds.database.cyan(),
+        bytes.len(),
+        if gzip { ", gzipped" } else { "" },
+        server_name.cyan(),
+        out.dimmed()
+    );
+    Ok(())
+}
+
+fn restore(
+    ctx: &Context,
+    server_name: &str,
+    input: &str,
+    opts: ConnOpts,
+    confirm: bool,
+) -> Result<()> {
+    let json = ctx.output == OutputFormat::Json;
+
+    let server = resolve_server(ctx, server_name)?;
+    let creds = match resolve_credentials(&server, &opts) {
+        Ok(c) => c,
+        Err(e) => return fail(json, format!("{e:#}")),
+    };
+    let bytes = match std::fs::read(input) {
+        Ok(b) => b,
+        Err(e) => return fail(json, format!("reading {input}: {e}")),
+    };
+    let gzipped = is_gzip(&bytes);
+
+    if !confirm {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "server": server_name,
+                    "database": creds.database,
+                    "in": input,
+                    "bytes": bytes.len(),
+                    "gzip": gzipped,
+                    "confirmed": false,
+                })
+            );
+            return Ok(());
+        }
+        println!(
+            "Would restore {} bytes from {} into {}@{} (database {}{}). Re-run with --confirm to apply.",
+            bytes.len(),
+            input.dimmed(),
+            creds.user,
+            server.host_target().cyan(),
+            creds.database.bold(),
+            if gzipped { ", gzip-compressed" } else { "" }
+        );
+        return Ok(());
+    }
+
+    let command = db::restore_command(&creds, gzipped);
+    let (_, stderr, success) = match db::ssh_exec_with_stdin(&server, &command, &bytes) {
+        Ok(r) => r,
+        Err(e) => return fail(json, format!("{e:#}")),
+    };
+    if !success {
+        return fail(json, format!("restore failed: {}", stderr.trim()));
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "server": server_name,
+                "database": creds.database,
+                "in": input,
+                "restored": true,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "{} restored {} into {} on {}",
+        "✓".green().bold(),
+        input.dimmed(),
+        creds.database.cyan(),
+        server_name.cyan()
+    );
+    Ok(())
+}
+
+/// Detects a gzip stream by its two-byte magic number (`1f 8b`), so restore doesn't
+/// have to rely on the input file's extension.
+fn is_gzip(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x1f, 0x8b])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_gzip_detects_magic_bytes() {
+        assert!(is_gzip(&[0x1f, 0x8b, 0x08, 0x00]));
+        assert!(!is_gzip(b"-- SQL dump\n"));
+        assert!(!is_gzip(&[]));
+    }
 }

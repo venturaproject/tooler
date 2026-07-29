@@ -49,5 +49,6 @@ fn main() -> Result<()> {
         Commands::Systemd(args) => commands::systemd::run(args, &ctx),
         Commands::Cron(args) => commands::cron::run(args, &ctx),
         Commands::Logs(args) => commands::logs::run(args, &ctx),
+        Commands::Ps(args) => commands::ps::run(args, &ctx),
     }
 }

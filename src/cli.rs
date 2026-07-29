@@ -3,7 +3,7 @@ use crate::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, cron::CronArgs,
         db::DbArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs, gh::GhArgs, git::GitArgs,
         http::HttpArgs, info::InfoArgs, json::JsonArgs, logs::LogsArgs, mcp::McpArgs,
-        play::PlayArgs, report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs,
+        play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs,
         server::ServerArgs, ssh::SshArgs, systemd::SystemdArgs,
     },
     output::OutputFormat,
@@ -98,4 +98,7 @@ pub enum Commands {
 
     /// Read remote log files over SSH (tail, grep)
     Logs(LogsArgs),
+
+    /// Manage remote processes over SSH (list, kill)
+    Ps(PsArgs),
 }

@@ -14,6 +14,7 @@ pub mod json;
 pub mod logs;
 pub mod mcp;
 pub mod play;
+pub mod ps;
 pub mod report;
 pub mod run;
 pub mod scaffold;

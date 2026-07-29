@@ -27,6 +27,7 @@
   - [tooler systemd](#tooler-systemd)
   - [tooler cron](#tooler-cron)
   - [tooler logs](#tooler-logs)
+  - [tooler ps](#tooler-ps)
   - [tooler mcp](#tooler-mcp)
 - [Extending tooler](#extending-tooler)
 - [Releasing a new version](#releasing-a-new-version)
@@ -445,6 +446,15 @@ tooler db query myserver "SELECT * FROM orders LIMIT 20" \
 
 Only `SELECT` / `SHOW` / `EXPLAIN` / `WITH` / `DESCRIBE` are accepted — `tooler db query` refuses anything else (including multiple statements), since results are meant for reporting, not for driving writes against a production database.
 
+`backup`/`restore` dump and restore whole databases the same way, over the same SSH connection — no local `psql`/`mysql` install needed either, since the remote host runs the compression/decompression too:
+
+```sh
+tooler db backup myserver --out shop.sql.gz --env backend/.env
+tooler db restore myserver --in shop.sql.gz --env backend/.env --confirm
+```
+
+`backup` pipes `pg_dump`/`mysqldump` through `gzip -c` by default (pass `--no-gzip` to skip it) and writes the raw bytes straight to `--out`. `restore` pipes the local file into `psql`/`mysql` on the remote host, auto-detecting gzip by magic bytes rather than trusting the filename — and, like `tooler git clean`, is **preview-only unless you pass `--confirm`**: without it, it just reports how many bytes would be sent and to which database.
+
 **Full pipeline** — a real report from a live database in three commands:
 
 ```sh
@@ -518,9 +528,24 @@ tooler logs grep myserver /var/log/nginx/error.log "500" --max-lines 50
 
 ---
 
+### tooler ps
+
+List and signal processes on a remote server over SSH — the process-level equivalent of [`tooler systemd`](#tooler-systemd) for hosts that don't have `systemctl` at all (shared hosting, FreeBSD, containers running a bare init).
+
+```sh
+tooler ps list myserver
+tooler ps list myserver --filter keepalive
+tooler ps kill myserver 12345 --confirm
+tooler ps kill myserver 12345 --signal 9 --sudo --confirm
+```
+
+`list` parses `ps aux` (the same 11-column layout on both Linux and BSD) and, with `--filter`, keeps only rows whose command line contains the substring or whose PID matches it exactly. `kill` sends a signal (`--signal`, default `TERM`) and is **preview-only unless you pass `--confirm`**, matching `tooler db restore`'s safety pattern — without it, it just reports what would be sent and to which PID.
+
+---
+
 ### tooler mcp
 
-Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, `tooler_gh_prs`, `tooler_systemd_restart`, `tooler_cron_add`, `tooler_logs_grep`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
+Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, `tooler_gh_prs`, `tooler_systemd_restart`, `tooler_cron_add`, `tooler_logs_grep`, `tooler_ps_kill`, `tooler_db_backup`, `tooler_db_restore`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
 
 ```sh
 tooler mcp
@@ -549,7 +574,7 @@ Most tools accept an optional `cwd` parameter so a single long-running server ca
 
 Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can distinguish safe reads (`tooler_info`, `tooler_env_show`, `tooler_check_url`, ...) from destructive operations (`tooler_ssh_exec`, `tooler_ssh_ssl`, `tooler_git_clean`, ...).
 
-`tooler_ssh_ssl` and `tooler_systemd_restart` never accept `pfx_password`/`sudo_pass` as tool arguments, `tooler_http_get`/`tooler_http_post` never accept a bearer `token`, and `tooler_db_query` never accepts a database `password` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` / `TOOLER_DB_PASSWORD` in the MCP server's own environment instead, e.g.:
+`tooler_ssh_ssl`, `tooler_systemd_restart`, and `tooler_ps_kill` never accept `pfx_password`/`sudo_pass` as tool arguments, `tooler_http_get`/`tooler_http_post` never accept a bearer `token`, and `tooler_db_query`/`tooler_db_backup`/`tooler_db_restore` never accept a database `password` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` / `TOOLER_DB_PASSWORD` in the MCP server's own environment instead, e.g.:
 
 ```json
 {
@@ -567,6 +592,8 @@ Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openW
   }
 }
 ```
+
+`tooler_db_restore` and `tooler_ps_kill` additionally require `confirm: true` to actually apply their change — omit it and the call only previews what would happen, without touching the remote database or process.
 
 Likewise, `tooler_config_get`/`tooler_config_set` refuse `profile.<name>.token` over MCP -- set or read it directly in a terminal (`tooler config set profile.staging.token ...`), where it's stored encrypted in the OS keychain instead of passing through the conversation. `tooler_config_unset` is exempt since it only removes a value.
 

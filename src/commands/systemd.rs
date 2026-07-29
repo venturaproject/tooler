@@ -68,16 +68,6 @@ fn fail(json: bool, message: String) -> Result<()> {
     bail!(message);
 }
 
-fn sudo_prefix(sudo: bool, sudo_pass: Option<&str>) -> String {
-    if !sudo {
-        return String::new();
-    }
-    match sudo_pass {
-        Some(pass) => format!("echo {} | sudo -S ", db::shell_quote(pass)),
-        None => "sudo ".to_string(),
-    }
-}
-
 fn status_cmd(unit: &str) -> String {
     format!("systemctl status {} --no-pager", db::shell_quote(unit))
 }
@@ -85,7 +75,7 @@ fn status_cmd(unit: &str) -> String {
 fn restart_cmd(unit: &str, sudo: bool, sudo_pass: Option<&str>) -> String {
     format!(
         "{}systemctl restart {}",
-        sudo_prefix(sudo, sudo_pass),
+        db::sudo_prefix(sudo, sudo_pass),
         db::shell_quote(unit)
     )
 }
@@ -93,7 +83,7 @@ fn restart_cmd(unit: &str, sudo: bool, sudo_pass: Option<&str>) -> String {
 fn logs_cmd(unit: &str, lines: u32, sudo: bool) -> String {
     format!(
         "{}journalctl -u {} -n {lines} --no-pager",
-        sudo_prefix(sudo, None),
+        db::sudo_prefix(sudo, None),
         db::shell_quote(unit)
     )
 }
@@ -234,24 +224,6 @@ mod tests {
     #[test]
     fn merge_output_empty_when_both_empty() {
         assert_eq!(merge_output(String::new(), String::new()), "");
-    }
-
-    #[test]
-    fn sudo_prefix_empty_when_not_sudo() {
-        assert_eq!(sudo_prefix(false, Some("pw")), "");
-    }
-
-    #[test]
-    fn sudo_prefix_plain_sudo_without_password() {
-        assert_eq!(sudo_prefix(true, None), "sudo ");
-    }
-
-    #[test]
-    fn sudo_prefix_pipes_quoted_password() {
-        assert_eq!(
-            sudo_prefix(true, Some("it's")),
-            "echo 'it'\\''s' | sudo -S "
-        );
     }
 
     #[test]
