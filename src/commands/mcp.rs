@@ -549,6 +549,74 @@ struct PsKillArgs {
     confirm: bool,
 }
 
+// ── fs ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct FsCatArgs {
+    /// Server profile (see tooler_server_list)
+    server: String,
+    /// Remote file path
+    path: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct FsWriteArgs {
+    server: String,
+    path: String,
+    /// Local file to read the new content from (binary-safe). Exactly one of
+    /// `from_file`/`content` must be set.
+    from_file: Option<String>,
+    /// Literal text to write. Exactly one of `from_file`/`content` must be set.
+    content: Option<String>,
+    /// Actually write the file. Without this, the call only previews what would happen
+    /// (byte count) and makes no change.
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct FsDiffArgs {
+    server: String,
+    /// Remote file path
+    path: String,
+    /// Local file to compare against
+    local: String,
+}
+
+// ── deploy ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct DeployRunArgs {
+    /// Server profile (see tooler_server_list)
+    server: String,
+    /// Remote path (git repo) to deploy
+    path: String,
+    /// Pull the latest code (git pull) in `path` before restarting
+    #[serde(default)]
+    pull: bool,
+    /// Command to run remotely in `path` after pulling (e.g. a build step)
+    build: Option<String>,
+    /// Command to restart the service (e.g. "systemctl restart myapp")
+    restart: Option<String>,
+    /// URL to check after restarting
+    health_url: Option<String>,
+    /// Timeout in seconds for each health check attempt (default 5)
+    health_timeout: Option<u64>,
+    /// Number of health check attempts before giving up (default 3)
+    health_retries: Option<u32>,
+    /// Seconds to wait between health check attempts (default 2)
+    health_delay: Option<u64>,
+    /// Run the restart command via sudo. A sudo password, if needed, must never be
+    /// passed as a tool argument -- set TOOLER_SUDO_PASS in the MCP server's own
+    /// environment instead (or rely on passwordless/NOPASSWD sudo).
+    #[serde(default)]
+    sudo: bool,
+    /// Actually run the deploy. Without this, the call only previews the steps that
+    /// would run and makes no change.
+    #[serde(default)]
+    confirm: bool,
+}
+
 // ── gh ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
@@ -765,7 +833,9 @@ impl ToolerMcp {
                  1. Call tooler_env_diff to compare the local .env against .env.example.\n\
                  2. Call tooler_check_url against the profile's base_url to confirm it's reachable.\n\
                  3. Call tooler_git_summary to confirm the working tree is clean.\n\
-                 Summarize pass/fail for each step at the end.",
+                 Summarize pass/fail for each step at the end. If a Playwright MCP server is \
+                 also configured, consider opening the URL with its browser tools to visually \
+                 confirm the page renders correctly.",
                 p = args.profile
             ),
         )]
@@ -1594,6 +1664,108 @@ impl ToolerMcp {
             args.pid.to_string(),
         ];
         push_opt(&mut argv, "--signal", &args.signal);
+        push_flag(&mut argv, "--sudo", args.sudo);
+        push_flag(&mut argv, "--confirm", args.confirm);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Print a remote file's contents over SSH",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_fs_cat(
+        &self,
+        Parameters(args): Parameters<FsCatArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec![
+            "fs".to_string(),
+            "cat".to_string(),
+            args.server.clone(),
+            args.path.clone(),
+        ];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Overwrite a remote file over SSH with local content, from either \
+                        `from_file` (a local path) or `content` (literal text) -- exactly one \
+                        must be set. Without `confirm`, this only previews what would happen \
+                        (byte count) and makes no change — pass `confirm: true` to actually \
+                        apply it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_fs_write(
+        &self,
+        Parameters(args): Parameters<FsWriteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "fs".to_string(),
+            "write".to_string(),
+            args.server.clone(),
+            args.path.clone(),
+        ];
+        push_opt(&mut argv, "--from-file", &args.from_file);
+        push_opt(&mut argv, "--content", &args.content);
+        push_flag(&mut argv, "--confirm", args.confirm);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Diff a remote file against a local file over SSH (unified diff)",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_fs_diff(
+        &self,
+        Parameters(args): Parameters<FsDiffArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec![
+            "fs".to_string(),
+            "diff".to_string(),
+            args.server.clone(),
+            args.path.clone(),
+            "--local".to_string(),
+            args.local.clone(),
+        ];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Orchestrate a remote deploy over SSH: optional git pull, optional build \
+                        command, optional restart command, then an optional HTTP health check \
+                        -- run in that order, failing fast on the first error. Without `confirm`, \
+                        this only previews the steps that would run and makes no change — pass \
+                        `confirm: true` to actually apply it. A sudo password, if needed, must \
+                        never be passed as a tool argument -- set TOOLER_SUDO_PASS in the MCP \
+                        server's own environment instead.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_deploy_run(
+        &self,
+        Parameters(args): Parameters<DeployRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "deploy".to_string(),
+            args.server.clone(),
+            "--path".to_string(),
+            args.path.clone(),
+        ];
+        push_flag(&mut argv, "--pull", args.pull);
+        push_opt(&mut argv, "--build", &args.build);
+        push_opt(&mut argv, "--restart", &args.restart);
+        push_opt(&mut argv, "--health-url", &args.health_url);
+        push_opt_num(&mut argv, "--health-timeout", args.health_timeout);
+        push_opt_num(&mut argv, "--health-retries", args.health_retries);
+        push_opt_num(&mut argv, "--health-delay", args.health_delay);
         push_flag(&mut argv, "--sudo", args.sudo);
         push_flag(&mut argv, "--confirm", args.confirm);
         self.exec_self(argv, &None).await

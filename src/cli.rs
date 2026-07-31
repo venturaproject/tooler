@@ -1,10 +1,10 @@
 use crate::{
     commands::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, cron::CronArgs,
-        db::DbArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs, gh::GhArgs, git::GitArgs,
-        http::HttpArgs, info::InfoArgs, json::JsonArgs, logs::LogsArgs, mcp::McpArgs,
-        play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs,
-        server::ServerArgs, ssh::SshArgs, systemd::SystemdArgs,
+        db::DbArgs, deploy::DeployArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs,
+        fs::FsArgs, gh::GhArgs, git::GitArgs, http::HttpArgs, info::InfoArgs, json::JsonArgs,
+        logs::LogsArgs, mcp::McpArgs, play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs,
+        scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs, systemd::SystemdArgs,
     },
     output::OutputFormat,
 };
@@ -101,4 +101,10 @@ pub enum Commands {
 
     /// Manage remote processes over SSH (list, kill)
     Ps(PsArgs),
+
+    /// Read, write, and diff remote files over SSH
+    Fs(FsArgs),
+
+    /// Orchestrate a remote deploy: pull, build, restart, health check
+    Deploy(DeployArgs),
 }

@@ -28,6 +28,8 @@
   - [tooler cron](#tooler-cron)
   - [tooler logs](#tooler-logs)
   - [tooler ps](#tooler-ps)
+  - [tooler fs](#tooler-fs)
+  - [tooler deploy](#tooler-deploy)
   - [tooler mcp](#tooler-mcp)
 - [Extending tooler](#extending-tooler)
 - [Releasing a new version](#releasing-a-new-version)
@@ -543,9 +545,37 @@ tooler ps kill myserver 12345 --signal 9 --sudo --confirm
 
 ---
 
+### tooler fs
+
+Read, write, and diff arbitrary files on a remote server over SSH — the general-purpose counterpart to [`tooler env`](#tooler-env) (which only diffs `.env` key sets) and [`tooler logs`](#tooler-logs) (which only tails/greps).
+
+```sh
+tooler fs cat myserver /etc/nginx/nginx.conf
+tooler fs diff myserver /etc/nginx/nginx.conf --local ./nginx.conf
+tooler fs write myserver /etc/nginx/nginx.conf --from-file ./nginx.conf --confirm
+```
+
+`cat` prints the remote file's raw content. `diff` fetches the remote file and runs it through the system `diff -u` against a local file, so you get a normal unified diff (or a plain "identical" when there's no drift). `write` overwrites the remote file with either `--from-file <local path>` (binary-safe) or `--content <text>` — exactly one is required — and is **preview-only unless you pass `--confirm`**, matching `tooler db restore`'s safety pattern.
+
+---
+
+### tooler deploy
+
+Orchestrate a remote deploy over SSH — `git pull`, an optional build step, a restart command, and an HTTP health check — as one command instead of chaining several `tooler ssh exec`/`tooler systemd restart`/`tooler check url` calls by hand.
+
+```sh
+tooler deploy myserver --path /var/www/app \
+  --pull --restart "systemctl restart myapp" \
+  --health-url https://myapp.example.com/health --confirm
+```
+
+Pass only the steps you want — `--pull`, `--build <cmd>`, `--restart <cmd>`, `--health-url <url>` are all optional, but at least one is required. Steps run in that fixed order and stop at the first failure (there's no automatic rollback: a failed step leaves the server exactly where a hand-run shell script would). The health check retries up to `--health-retries` times (default 3) with `--health-delay` seconds between attempts (default 2). `--restart` runs via `--sudo`/`--sudo-pass` (or `TOOLER_SUDO_PASS`) the same way as [`tooler systemd restart`](#tooler-systemd). Like `tooler db restore`, `tooler deploy` is **preview-only unless you pass `--confirm`** — without it, it prints the ordered plan and touches nothing.
+
+---
+
 ### tooler mcp
 
-Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, `tooler_gh_prs`, `tooler_systemd_restart`, `tooler_cron_add`, `tooler_logs_grep`, `tooler_ps_kill`, `tooler_db_backup`, `tooler_db_restore`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
+Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, `tooler_gh_prs`, `tooler_systemd_restart`, `tooler_cron_add`, `tooler_logs_grep`, `tooler_ps_kill`, `tooler_db_backup`, `tooler_db_restore`, `tooler_fs_write`, `tooler_deploy_run`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
 
 ```sh
 tooler mcp
@@ -574,7 +604,7 @@ Most tools accept an optional `cwd` parameter so a single long-running server ca
 
 Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can distinguish safe reads (`tooler_info`, `tooler_env_show`, `tooler_check_url`, ...) from destructive operations (`tooler_ssh_exec`, `tooler_ssh_ssl`, `tooler_git_clean`, ...).
 
-`tooler_ssh_ssl`, `tooler_systemd_restart`, and `tooler_ps_kill` never accept `pfx_password`/`sudo_pass` as tool arguments, `tooler_http_get`/`tooler_http_post` never accept a bearer `token`, and `tooler_db_query`/`tooler_db_backup`/`tooler_db_restore` never accept a database `password` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` / `TOOLER_DB_PASSWORD` in the MCP server's own environment instead, e.g.:
+`tooler_ssh_ssl`, `tooler_systemd_restart`, `tooler_ps_kill`, and `tooler_deploy_run` never accept `pfx_password`/`sudo_pass` as tool arguments, `tooler_http_get`/`tooler_http_post` never accept a bearer `token`, and `tooler_db_query`/`tooler_db_backup`/`tooler_db_restore` never accept a database `password` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` / `TOOLER_DB_PASSWORD` in the MCP server's own environment instead, e.g.:
 
 ```json
 {
@@ -593,7 +623,7 @@ Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openW
 }
 ```
 
-`tooler_db_restore` and `tooler_ps_kill` additionally require `confirm: true` to actually apply their change — omit it and the call only previews what would happen, without touching the remote database or process.
+`tooler_db_restore`, `tooler_ps_kill`, `tooler_fs_write`, and `tooler_deploy_run` additionally require `confirm: true` to actually apply their change — omit it and the call only previews what would happen, without touching the remote database, process, file, or deploy target.
 
 Likewise, `tooler_config_get`/`tooler_config_set` refuse `profile.<name>.token` over MCP -- set or read it directly in a terminal (`tooler config set profile.staging.token ...`), where it's stored encrypted in the OS keychain instead of passing through the conversation. `tooler_config_unset` is exempt since it only removes a value.
 
@@ -619,6 +649,15 @@ tooler mcp --http --bind 0.0.0.0:8642 --token ...      # expose beyond localhost
 ```
 
 `--token` can also come from `TOOLER_MCP_TOKEN`. Clients must send `Authorization: Bearer <token>`; requests without it (or with the wrong token) get `401`.
+
+**Pairing with Playwright MCP**: `tooler` deliberately doesn't wrap browser automation — for visually verifying what it just deployed or checked, pair it with the official [`@playwright/mcp`](https://github.com/microsoft/playwright-mcp) server instead:
+
+```sh
+claude mcp add tooler -- tooler mcp
+claude mcp add playwright -- npx @playwright/mcp@latest
+```
+
+With both configured, an agent can call `tooler_deploy_run` (or `tooler_check_url`) and then use Playwright's own `browser_navigate`/`browser_snapshot` tools to open the URL in a real browser — catching a blank page or a JS error that an HTTP 200 wouldn't.
 
 ---
 

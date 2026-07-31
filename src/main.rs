@@ -50,5 +50,7 @@ fn main() -> Result<()> {
         Commands::Cron(args) => commands::cron::run(args, &ctx),
         Commands::Logs(args) => commands::logs::run(args, &ctx),
         Commands::Ps(args) => commands::ps::run(args, &ctx),
+        Commands::Fs(args) => commands::fs::run(args, &ctx),
+        Commands::Deploy(args) => commands::deploy::run(args, &ctx),
     }
 }
