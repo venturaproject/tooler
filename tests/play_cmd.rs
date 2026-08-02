@@ -294,3 +294,151 @@ fn list_marks_entries_that_have_notes() {
     assert!(with_notes_line.contains("[notes]"));
     assert!(!without_notes_line.contains("[notes]"));
 }
+
+#[test]
+fn register_captures_run_output_and_when_uses_it() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Register test\n\
+         tasks:\n\
+         \x20\x20- name: capture\n\
+         \x20\x20\x20\x20run: echo captured-value\n\
+         \x20\x20\x20\x20register: result\n\
+         \x20\x20- name: use it\n\
+         \x20\x20\x20\x20when: \"{{result}} == captured-value\"\n\
+         \x20\x20\x20\x20run: echo used-it\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][0]["status"], "ok");
+    assert_eq!(value["tasks"][1]["status"], "ok");
+    assert_eq!(value["ok"], 2);
+}
+
+#[test]
+fn retries_eventually_succeeds() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Retry test\n\
+         tasks:\n\
+         \x20\x20- name: flaky\n\
+         \x20\x20\x20\x20run: test -f marker && exit 0 || { touch marker; exit 1; }\n\
+         \x20\x20\x20\x20retries: 1\n\
+         \x20\x20\x20\x20delay: 0\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn retries_exhausted_fails_the_task_with_a_retry_log_line() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Retry exhaustion test\n\
+         tasks:\n\
+         \x20\x20- name: always fails\n\
+         \x20\x20\x20\x20run: exit 1\n\
+         \x20\x20\x20\x20retries: 1\n\
+         \x20\x20\x20\x20delay: 0\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("attempt 1/2 failed"));
+}
+
+#[test]
+fn include_runs_a_sub_playbook_and_shares_vars() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("sub.yml"),
+        "name: Sub\ntasks:\n  - name: register something\n    run: echo from-sub\n    register: sub_result\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Parent\n\
+         tasks:\n\
+         \x20\x20- name: run sub\n\
+         \x20\x20\x20\x20include: sub.yml\n\
+         \x20\x20- name: use sub var\n\
+         \x20\x20\x20\x20when: \"{{sub_result}} == from-sub\"\n\
+         \x20\x20\x20\x20run: echo parent-used-it\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][0]["status"], "ok");
+    assert_eq!(value["tasks"][1]["status"], "ok");
+}
+
+#[test]
+fn include_cycle_is_rejected() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("a.yml"),
+        "name: A\ntasks:\n  - name: include b\n    include: b.yml\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("b.yml"),
+        "name: B\ntasks:\n  - name: include a\n    include: a.yml\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "a.yml"])
+            .timeout(std::time::Duration::from_secs(10))
+            .assert()
+            .failure(),
+    );
+    assert!(out.to_lowercase().contains("cycle"));
+}
+
+#[test]
+fn fleet_task_parallel_flag_runs_without_hanging_or_panicking() {
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args(["server", "add", "s1", "--host", "127.0.0.1", "--port", "1"])
+        .assert()
+        .success();
+    tooler_in(dir.path())
+        .args(["server", "add", "s2", "--host", "127.0.0.1", "--port", "2"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Parallel fleet test\n\
+         tasks:\n\
+         \x20\x20- name: fan out\n\
+         \x20\x20\x20\x20fleet:\n\
+         \x20\x20\x20\x20\x20\x20servers: s1,s2\n\
+         \x20\x20\x20\x20\x20\x20command: echo hi\n\
+         \x20\x20\x20\x20\x20\x20parallel: true\n\
+         \x20\x20\x20\x20ignore_errors: true\n",
+    )
+    .unwrap();
+
+    // Unreachable servers, so the fleet: task itself fails — but ignore_errors keeps the
+    // playbook going. The point is proving the parallel path completes (doesn't hang or
+    // panic across threads), not that SSH actually succeeds.
+    cmd.args(["--output", "json", "play", "playbook.yml"])
+        .timeout(std::time::Duration::from_secs(15))
+        .assert()
+        .success();
+}

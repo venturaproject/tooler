@@ -47,7 +47,7 @@ struct Playbook {
     tasks: Vec<Task>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct Task {
     name: String,
     #[serde(default)]
@@ -64,6 +64,18 @@ struct Task {
     /// `ignore_errors`, the whole playbook) — remaining items are not attempted.
     #[serde(default, rename = "loop")]
     loop_items: Option<Vec<String>>,
+    /// Capture this task's output into a variable, usable by later tasks via
+    /// `{{name}}`. Supported on run/ssh/fleet only (see `run_task_once`). Inside a
+    /// `loop:`, only the last iteration's value persists.
+    #[serde(default)]
+    register: Option<String>,
+    /// Retry this task up to N times (total attempts = retries + 1) before giving up.
+    /// Applies per `loop:` iteration if combined with `loop:`. Ignored in `--dry`.
+    #[serde(default)]
+    retries: Option<u32>,
+    /// Seconds to wait between retry attempts (default 1 if `retries:` is set).
+    #[serde(default)]
+    delay: Option<u64>,
 
     // Actions — only one should be set per task
     run: Option<String>,
@@ -72,6 +84,9 @@ struct Task {
     env_check: Option<EnvCheckSpec>,
     ssh: Option<SshSpec>,
     fleet: Option<FleetSpec>,
+    /// Run another whole playbook (by bare playbooks/ name, or a path relative to this
+    /// playbook's own directory) as a single task. See `resolve_include_path`.
+    include: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +111,9 @@ struct FleetSpec {
     command: String,
     #[serde(default)]
     sudo: bool,
+    /// Run on all targeted servers concurrently instead of one at a time
+    #[serde(default)]
+    parallel: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +196,18 @@ fn print_notes_only(file_path: &Path, ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+/// Mostly-static, per-run execution context threaded through the dispatch chain —
+/// bundled into one struct because the parameter list (playbook_dir, project_root, dry,
+/// quiet, ctx, plus mutable vars/include_stack passed alongside) got too long to stay
+/// readable as positional args once `register:`/`include:` needed threading through too.
+struct RunEnv<'a> {
+    playbook_dir: PathBuf,
+    project_root: PathBuf,
+    dry: bool,
+    quiet: bool,
+    ctx: &'a Context,
+}
+
 pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     let (_, project_root) = project::load()?;
     let playbooks_dir = project_root.join("playbooks");
@@ -228,7 +258,25 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         .as_deref()
         .map(|t| t.split(',').map(str::trim).collect());
 
-    execute_playbook(&playbook, &playbook_dir, &tag_filter, args.dry, &notes, ctx)
+    let mut vars = playbook.vars.clone();
+    let mut include_stack: Vec<PathBuf> = vec![file_path];
+    let env = RunEnv {
+        playbook_dir,
+        project_root,
+        dry: args.dry,
+        quiet: ctx.output == OutputFormat::Json,
+        ctx,
+    };
+
+    execute_playbook(
+        &playbook,
+        &tag_filter,
+        &notes,
+        &mut vars,
+        &mut include_stack,
+        true,
+        &env,
+    )
 }
 
 // ── Runner ────────────────────────────────────────────────────────────────────
@@ -240,15 +288,17 @@ struct TaskOutcome {
     error: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_playbook(
     playbook: &Playbook,
-    playbook_dir: &Path,
     tag_filter: &Option<Vec<&str>>,
-    dry: bool,
     notes: &Option<String>,
-    ctx: &Context,
+    vars: &mut HashMap<String, String>,
+    include_stack: &mut Vec<PathBuf>,
+    is_top_level: bool,
+    env: &RunEnv,
 ) -> Result<()> {
-    let json = ctx.output == OutputFormat::Json;
+    let json = env.quiet;
     let sep = "─".repeat(56);
 
     if !json {
@@ -256,7 +306,7 @@ fn execute_playbook(
             "\n{} {} {}",
             "PLAY".bold().cyan(),
             format!("[{}]", playbook.name).bold(),
-            playbook_dir.display().to_string().dimmed()
+            env.playbook_dir.display().to_string().dimmed()
         );
         if let Some(desc) = &playbook.description {
             println!("     {}", desc.dimmed());
@@ -299,7 +349,7 @@ fn execute_playbook(
         }
 
         if let Some(w) = &task.when
-            && !eval_when(w, &playbook.vars)
+            && !eval_when(w, vars)
         {
             if !json {
                 println!("  {}", format!("(skipped — when: {w} was false)").dimmed());
@@ -313,11 +363,11 @@ fn execute_playbook(
             continue;
         }
 
-        let result = run_task(task, &playbook.vars, playbook_dir, dry, json, ctx);
+        let result = run_task(task, vars, include_stack, env);
 
         match result {
             Ok(_) => {
-                if dry {
+                if env.dry {
                     if !json {
                         println!("  {}", "(dry run — skipped)".dimmed());
                     }
@@ -365,7 +415,7 @@ fn execute_playbook(
                             "{}",
                             serde_json::json!({
                                 "playbook": playbook.name,
-                                "dry": dry,
+                                "dry": env.dry,
                                 "notes": notes,
                                 "tasks": outcomes,
                                 "ok": ok,
@@ -374,7 +424,10 @@ fn execute_playbook(
                                 "success": false,
                             })
                         );
-                        std::process::exit(1);
+                        if is_top_level {
+                            std::process::exit(1);
+                        }
+                        bail!("playbook failed");
                     }
 
                     println!("  {} {}", "✗".red().bold(), e.to_string().red());
@@ -397,7 +450,7 @@ fn execute_playbook(
             "{}",
             serde_json::json!({
                 "playbook": playbook.name,
-                "dry": dry,
+                "dry": env.dry,
                 "notes": notes,
                 "tasks": outcomes,
                 "ok": ok,
@@ -429,62 +482,149 @@ fn eval_when(expr: &str, vars: &HashMap<String, String>) -> bool {
     !rendered.is_empty() && rendered != "false" && rendered != "0"
 }
 
-/// Expands `loop:` (if present) into one `run_task_once` call per item, with `{{item}}`
-/// added to that iteration's vars. The first failing iteration fails the whole task —
-/// remaining items are not attempted, same as any other task failure.
+/// Expands `loop:` (if present) into one retried-`run_task_once` call per item, with
+/// `{{item}}` added to that iteration's vars. The first failing iteration (after its own
+/// retries are exhausted) fails the whole task — remaining items are not attempted. If
+/// `register:` is set, only the *last* iteration's captured value persists into the
+/// outer `vars` (simplest well-defined rule for a loop+register combination).
 fn run_task(
     task: &Task,
-    vars: &HashMap<String, String>,
-    playbook_dir: &Path,
-    dry: bool,
-    quiet: bool,
-    ctx: &Context,
+    vars: &mut HashMap<String, String>,
+    include_stack: &mut Vec<PathBuf>,
+    env: &RunEnv,
 ) -> Result<()> {
     let Some(items) = &task.loop_items else {
-        return run_task_once(task, vars, playbook_dir, dry, quiet, ctx);
+        return run_task_once_with_retries(task, vars, include_stack, env);
     };
     for item in items {
         let mut loop_vars = vars.clone();
         loop_vars.insert("item".to_string(), item.clone());
-        if !quiet {
+        if !env.quiet {
             println!("  {} item={}", "→".dimmed(), item.dimmed());
         }
-        run_task_once(task, &loop_vars, playbook_dir, dry, quiet, ctx)?;
+        run_task_once_with_retries(task, &mut loop_vars, include_stack, env)?;
+        if let Some(reg) = &task.register
+            && let Some(val) = loop_vars.get(reg)
+        {
+            vars.insert(reg.clone(), val.clone());
+        }
     }
     Ok(())
 }
 
+/// Retries a single (non-loop-expanded) task invocation up to `task.retries` extra times,
+/// waiting `task.delay` (default 1s) between attempts. A no-op wrapper when `retries:`
+/// isn't set (attempts=1) or in `--dry` (nothing ever fails in dry mode, since every
+/// action's real work is itself gated on `!env.dry`).
+fn run_task_once_with_retries(
+    task: &Task,
+    vars: &mut HashMap<String, String>,
+    include_stack: &mut Vec<PathBuf>,
+    env: &RunEnv,
+) -> Result<()> {
+    let attempts = task.retries.unwrap_or(0) + 1;
+    for attempt in 1..=attempts {
+        match run_task_once(task, vars, include_stack, env) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < attempts && !env.dry => {
+                let delay = task.delay.unwrap_or(1);
+                if !env.quiet {
+                    println!(
+                        "  {} attempt {attempt}/{attempts} failed: {e} — retrying in {delay}s...",
+                        "!".yellow().bold()
+                    );
+                }
+                std::thread::sleep(Duration::from_secs(delay));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop always returns on the last attempt")
+}
+
+/// Resolves an `include:` target the same way a top-level playbook argument is
+/// resolved, except a literal path is relative to *this playbook's own directory*
+/// (`env.playbook_dir`, matching how `run:`/`env_check:` paths already resolve) rather
+/// than the process's CWD — `include: ./helpers/build.yml` means "next to me."
+fn resolve_include_path(file: &str, env: &RunEnv) -> Result<PathBuf> {
+    if is_literal_path(file) {
+        return env
+            .playbook_dir
+            .join(file)
+            .canonicalize()
+            .with_context(|| format!("Cannot resolve include: {file}"));
+    }
+    let dir = env.project_root.join("playbooks");
+    for ext in ["yml", "yaml"] {
+        let candidate = dir.join(format!("{file}.{ext}"));
+        if candidate.exists() {
+            return candidate
+                .canonicalize()
+                .with_context(|| format!("Cannot resolve include: {}", candidate.display()));
+        }
+    }
+    bail!(
+        "No playbook named '{file}' in {} for include (looked for {file}.yml, {file}.yaml)",
+        dir.display()
+    );
+}
+
 fn run_task_once(
     task: &Task,
-    vars: &HashMap<String, String>,
-    playbook_dir: &Path,
-    dry: bool,
-    quiet: bool,
-    ctx: &Context,
+    vars: &mut HashMap<String, String>,
+    include_stack: &mut Vec<PathBuf>,
+    env: &RunEnv,
 ) -> Result<()> {
+    if task.register.is_some()
+        && (task.check_url.is_some()
+            || task.check_port.is_some()
+            || task.env_check.is_some()
+            || task.include.is_some())
+    {
+        bail!("register: is not supported for check_url/check_port/env_check/include tasks");
+    }
+
     if let Some(cmd) = &task.run {
-        let cmd = render(cmd, vars);
-        if !quiet {
-            println!("  {} {}", "$".bold().green(), cmd.dimmed());
+        let rendered_cmd = render(cmd, vars);
+        if !env.quiet {
+            println!("  {} {}", "$".bold().green(), rendered_cmd.dimmed());
         }
-        if !dry {
+        if !env.dry {
             let start = Instant::now();
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .current_dir(playbook_dir)
-                .status()?;
+            let (success, code, captured) = if task.register.is_some() {
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&rendered_cmd)
+                    .current_dir(&env.playbook_dir)
+                    .output()?;
+                let captured = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                (
+                    output.status.success(),
+                    output.status.code(),
+                    Some(captured),
+                )
+            } else {
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&rendered_cmd)
+                    .current_dir(&env.playbook_dir)
+                    .status()?;
+                (status.success(), status.code(), None)
+            };
             let elapsed = start.elapsed();
-            if status.success() {
-                if !quiet {
+            if success {
+                if !env.quiet {
                     println!(
                         "  {} {}",
                         "✓ ok".green().bold(),
                         format!("({:.1}s)", elapsed.as_secs_f32()).dimmed()
                     );
                 }
+                if let (Some(reg), Some(val)) = (&task.register, captured) {
+                    vars.insert(reg.clone(), val);
+                }
             } else {
-                bail!("command exited with code {}", status.code().unwrap_or(1));
+                bail!("command exited with code {}", code.unwrap_or(1));
             }
         }
         return Ok(());
@@ -492,30 +632,30 @@ fn run_task_once(
 
     if let Some(url) = &task.check_url {
         let url = render(url, vars);
-        if !quiet {
+        if !env.quiet {
             println!("  {} {}", "→".bold(), url.dimmed());
         }
-        if !dry {
-            check_url(&url, quiet)?;
+        if !env.dry {
+            check_url(&url, env.quiet)?;
         }
         return Ok(());
     }
 
     if let Some(spec) = &task.check_port {
         let host = render(&spec.host, vars);
-        if !quiet {
+        if !env.quiet {
             println!("  {} {}:{}", "→".bold(), host.dimmed(), spec.port);
         }
-        if !dry {
-            check_port(&host, spec.port, spec.timeout, quiet)?;
+        if !env.dry {
+            check_port(&host, spec.port, spec.timeout, env.quiet)?;
         }
         return Ok(());
     }
 
     if let Some(spec) = &task.env_check {
-        let reference = playbook_dir.join(render(&spec.reference, vars));
-        let target = playbook_dir.join(render(&spec.target, vars));
-        if !quiet {
+        let reference = env.playbook_dir.join(render(&spec.reference, vars));
+        let target = env.playbook_dir.join(render(&spec.target, vars));
+        if !env.quiet {
             println!(
                 "  {} {} → {}",
                 "→".bold(),
@@ -523,11 +663,11 @@ fn run_task_once(
                 target.display().to_string().dimmed()
             );
         }
-        if !dry {
+        if !env.dry {
             env_check(
                 &reference.to_string_lossy(),
                 &target.to_string_lossy(),
-                quiet,
+                env.quiet,
             )?;
         }
         return Ok(());
@@ -537,7 +677,7 @@ fn run_task_once(
         let server_name = render(&spec.server, vars);
         let cmd = render(&spec.command, vars);
         let full_cmd = crate::commands::fleet::exec_command(&cmd, spec.sudo);
-        if !quiet {
+        if !env.quiet {
             println!(
                 "  {} {} {} {}",
                 "→".bold(),
@@ -546,14 +686,17 @@ fn run_task_once(
                 server_name.dimmed()
             );
         }
-        if !dry {
-            let server = crate::commands::ssh::resolve_server(ctx, &server_name)?;
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
             let (stdout, stderr, success) =
                 crate::db::ssh_exec_capture_lenient(&server, &full_cmd)?;
             if success {
                 let out = stdout.trim();
-                if !quiet && !out.is_empty() {
+                if !env.quiet && !out.is_empty() {
                     println!("{out}");
+                }
+                if let Some(reg) = &task.register {
+                    vars.insert(reg.clone(), out.to_string());
                 }
             } else {
                 let err = stderr.trim();
@@ -572,21 +715,23 @@ fn run_task_once(
 
     if let Some(spec) = &task.fleet {
         let command = render(&spec.command, vars);
-        if !quiet {
+        if !env.quiet {
             println!("  {} {}", "→".bold(), command.dimmed());
         }
-        if !dry {
+        if !env.dry {
             let results = crate::commands::fleet::run_on_targets(
-                ctx,
+                env.ctx,
                 spec.servers.as_deref(),
                 spec.all,
                 spec.group.as_deref(),
                 &command,
                 spec.sudo,
+                spec.parallel,
             )?;
             let ok_count = results.iter().filter(|r| r.success).count();
-            let all_succeeded = ok_count == results.len();
-            if !quiet {
+            let total = results.len();
+            let all_succeeded = ok_count == total;
+            if !env.quiet {
                 for r in &results {
                     if r.success {
                         println!("    {} {}", "✓".green().bold(), r.server.cyan());
@@ -595,15 +740,75 @@ fn run_task_once(
                     }
                 }
             }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), format!("{ok_count}/{total}"));
+            }
             if !all_succeeded {
-                bail!("{}/{} servers succeeded", ok_count, results.len());
+                bail!("{ok_count}/{total} servers succeeded");
             }
         }
         return Ok(());
     }
 
+    if let Some(include_file) = &task.include {
+        let rendered = render(include_file, vars);
+        let include_path = resolve_include_path(&rendered, env)?;
+        if include_stack.contains(&include_path) {
+            let chain = include_stack
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            bail!(
+                "include cycle detected: '{}' is already being included ({chain})",
+                include_path.display()
+            );
+        }
+        if !env.quiet {
+            println!(
+                "  {} include {}",
+                "→".bold(),
+                include_path.display().to_string().dimmed()
+            );
+        }
+        if !env.dry {
+            let content = std::fs::read_to_string(&include_path).with_context(|| {
+                format!("Cannot read included playbook: {}", include_path.display())
+            })?;
+            let sub_playbook: Playbook = serde_yaml::from_str(&content)
+                .with_context(|| format!("Invalid YAML in {}", include_path.display()))?;
+            for (k, v) in &sub_playbook.vars {
+                vars.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            let sub_notes = read_notes(&include_path);
+            let sub_env = RunEnv {
+                playbook_dir: include_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .to_path_buf(),
+                project_root: env.project_root.clone(),
+                dry: env.dry,
+                quiet: env.quiet,
+                ctx: env.ctx,
+            };
+            include_stack.push(include_path);
+            let result = execute_playbook(
+                &sub_playbook,
+                &None,
+                &sub_notes,
+                vars,
+                include_stack,
+                false,
+                &sub_env,
+            );
+            include_stack.pop();
+            result?;
+        }
+        return Ok(());
+    }
+
     bail!(
-        "task '{}' has no action (run, check_url, check_port, env_check, ssh, fleet)",
+        "task '{}' has no action (run, check_url, check_port, env_check, ssh, fleet, include)",
         task.name
     );
 }
@@ -909,5 +1114,63 @@ mod tests {
             notes_path(Path::new("playbooks/deploy.yaml")),
             PathBuf::from("playbooks/deploy.md")
         );
+    }
+
+    #[test]
+    fn register_is_rejected_for_check_and_include_actions() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = RunEnv {
+            playbook_dir: PathBuf::from("."),
+            project_root: PathBuf::from("."),
+            dry: true,
+            quiet: true,
+            ctx: &ctx,
+        };
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+
+        let task = Task {
+            register: Some("x".to_string()),
+            check_url: Some("http://example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+
+        let task = Task {
+            register: Some("x".to_string()),
+            include: Some("sub.yml".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+    }
+
+    #[test]
+    fn register_is_allowed_for_run_action() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        // dry: true — no real subprocess runs, so this only exercises the upfront
+        // register-validation guard, not actual command execution.
+        let env = RunEnv {
+            playbook_dir: PathBuf::from("."),
+            project_root: PathBuf::from("."),
+            dry: true,
+            quiet: true,
+            ctx: &ctx,
+        };
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            register: Some("x".to_string()),
+            run: Some("echo hi".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
     }
 }

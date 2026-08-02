@@ -636,6 +636,9 @@ struct FleetExecArgs {
     /// Run command with sudo
     #[serde(default)]
     sudo: bool,
+    /// Run on all targeted servers concurrently instead of one at a time
+    #[serde(default)]
+    parallel: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -647,6 +650,9 @@ struct FleetCheckArgs {
     all: bool,
     /// Target a named server group (see tooler_group_list)
     group: Option<String>,
+    /// Check all targeted servers concurrently instead of one at a time
+    #[serde(default)]
+    parallel: bool,
 }
 
 // ── group ─────────────────────────────────────────────────────────────────
@@ -1848,6 +1854,7 @@ impl ToolerMcp {
         push_opt(&mut argv, "--group", &args.group);
         argv.push(args.command.clone());
         push_flag(&mut argv, "--sudo", args.sudo);
+        push_flag(&mut argv, "--parallel", args.parallel);
         self.exec_self(argv, &None).await
     }
 
@@ -1865,6 +1872,7 @@ impl ToolerMcp {
         push_opt(&mut argv, "--servers", &args.servers);
         push_flag(&mut argv, "--all", args.all);
         push_opt(&mut argv, "--group", &args.group);
+        push_flag(&mut argv, "--parallel", args.parallel);
         self.exec_self(argv, &None).await
     }
 

@@ -319,7 +319,8 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `check_port: {host, port}` | TCP connectivity check |
 | `env_check: {reference, target}` | Verify .env has all keys from reference |
 | `ssh: {server, command, sudo}` | Run a command on one remote server profile over SSH |
-| `fleet: {servers/group/all, command, sudo}` | Run a command on multiple server profiles (same targeting as [`tooler fleet`](#tooler-fleet)) |
+| `fleet: {servers/group/all, command, sudo, parallel}` | Run a command on multiple server profiles (same targeting as [`tooler fleet`](#tooler-fleet)) |
+| `include: <name-or-path>` | Run another whole playbook as a single task |
 
 ```yaml
 tasks:
@@ -329,19 +330,43 @@ tasks:
       command: systemctl restart myapp
       sudo: true
 
-  - name: Roll the whole web group
+  - name: Roll the whole web group, all at once
     fleet:
       group: web
       command: systemctl restart myapp
       sudo: true
+      parallel: true
+
+  - name: Run a shared pre-flight playbook first
+    include: preflight.yml
 ```
 
-`ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed.
+`ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed; `parallel: true` runs all targeted servers concurrently instead of one at a time (same flag as `tooler fleet exec/check --parallel`, see [`tooler fleet`](#tooler-fleet)).
+
+`include:` resolves a bare name against `playbooks/` (same lookup as the top-level command) or a path relative to *this playbook's own directory*; the included playbook shares the same live variables (so it can read what the parent has set/registered, and anything it registers is visible back in the parent afterward), runs its own tasks unfiltered by the parent's `--tags`, and counts as a single ok/failed task in the parent's recap — its own tasks aren't flattened into the parent's totals. Include cycles are rejected with a clear error rather than hanging.
 
 **Per-task modifiers**, usable with any action above:
 
 - `when: "{{env}} == prod"` — skip the task unless the condition (evaluated once against the playbook's vars, after `{{var}}` substitution) holds. Supports `==`, `!=`, or a bare truthy check — not a full expression language.
 - `loop: [a, b, c]` — run the task once per item, with `{{item}}` available to the action (e.g. `run: systemctl restart {{item}}`). The first failing iteration fails the task; remaining items aren't attempted.
+- `register: <name>` — capture the task's output into a variable, usable by any later task via `{{name}}`. Supported on `run:`/`ssh:`/`fleet:` only (an upfront error otherwise). `run:` normally streams its subprocess's output live; it only switches to capturing (needed to register it) when `register:` is actually set on that task, so every other `run:` task is unaffected. Inside a `loop:`, only the last iteration's value persists.
+- `retries: N` / `delay: S` — retry a failing task up to N extra times, waiting `delay` seconds (default 1) between attempts, before giving up. Applies per `loop:` iteration if combined with `loop:`; ignored entirely in `--dry`.
+
+```yaml
+tasks:
+  - name: Deploy
+    run: ./deploy.sh
+    register: deploy_output
+
+  - name: Only notify if the deploy actually changed something
+    when: "{{deploy_output}} != no-op"
+    run: ./notify.sh
+
+  - name: Wait for the app to come back up
+    check_url: http://{{host}}/health
+    retries: 5
+    delay: 3
+```
 
 Commands and file paths in tasks always resolve **relative to the playbook file's directory**, not where you run `tooler play` from.
 
@@ -667,10 +692,11 @@ Run a command, or check SSH reachability, against *multiple* server profiles in 
 tooler fleet exec --servers web1,web2,web3 -- "uptime"
 tooler fleet exec --all "systemctl is-active myapp" --sudo
 tooler fleet exec --group web "uptime"
+tooler fleet exec --group web "systemctl restart myapp" --sudo --parallel
 tooler fleet check --all
 ```
 
-Target servers with `--servers a,b,c` (comma-separated profile names), `--all` (every configured profile), or `--group <name>` (a named group, see [`tooler group`](#tooler-group) below) — exactly one of the three is required. `exec` runs the command on each server and **continues past a failing server**, reporting per-server stdout/stderr/success rather than aborting the whole batch (this is a fan-out/observability primitive, not an ordered pipeline like `tooler deploy`); it exits non-zero if any server failed. `exec` has **no `--confirm` gate** — it's exactly as unguarded as `tooler ssh exec`, just run against several servers at once, so treat the command you pass it with the same care. `check` verifies full SSH connectivity (not just a TCP port) to each server and reports which ones are reachable.
+Target servers with `--servers a,b,c` (comma-separated profile names), `--all` (every configured profile), or `--group <name>` (a named group, see [`tooler group`](#tooler-group) below) — exactly one of the three is required. `exec` runs the command on each server and **continues past a failing server**, reporting per-server stdout/stderr/success rather than aborting the whole batch (this is a fan-out/observability primitive, not an ordered pipeline like `tooler deploy`); it exits non-zero if any server failed. `exec` has **no `--confirm` gate** — it's exactly as unguarded as `tooler ssh exec`, just run against several servers at once, so treat the command you pass it with the same care. `check` verifies full SSH connectivity (not just a TCP port) to each server and reports which ones are reachable. Both accept `--parallel` to run every targeted server concurrently instead of one at a time — output is identical either way, just faster for larger batches.
 
 ---
 

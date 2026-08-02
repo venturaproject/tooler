@@ -28,6 +28,9 @@ pub enum FleetSubcommand {
         /// Run command with sudo
         #[arg(long)]
         sudo: bool,
+        /// Run on all targeted servers concurrently instead of one at a time
+        #[arg(long)]
+        parallel: bool,
     },
     /// Check SSH connectivity to multiple servers
     Check {
@@ -40,6 +43,9 @@ pub enum FleetSubcommand {
         /// Target a named server group (see: tooler group list)
         #[arg(long, conflicts_with_all = ["servers", "all"])]
         group: Option<String>,
+        /// Check all targeted servers concurrently instead of one at a time
+        #[arg(long)]
+        parallel: bool,
     },
 }
 
@@ -51,19 +57,22 @@ pub fn run(args: FleetArgs, ctx: &Context) -> Result<()> {
             group,
             command,
             sudo,
+            parallel,
         } => exec(
             servers.as_deref(),
             all,
             group.as_deref(),
             &command,
             sudo,
+            parallel,
             ctx,
         ),
         FleetSubcommand::Check {
             servers,
             all,
             group,
-        } => check(servers.as_deref(), all, group.as_deref(), ctx),
+            parallel,
+        } => check(servers.as_deref(), all, group.as_deref(), parallel, ctx),
     }
 }
 
@@ -125,9 +134,37 @@ pub(crate) struct ExecResult {
     pub(crate) stderr: String,
 }
 
+fn exec_on_server(ctx: &Context, name: &str, full_cmd: &str) -> ExecResult {
+    match resolve_server(ctx, name) {
+        Ok(server) => match db::ssh_exec_capture_lenient(&server, full_cmd) {
+            Ok((stdout, stderr, success)) => ExecResult {
+                server: name.to_string(),
+                success,
+                stdout,
+                stderr,
+            },
+            Err(e) => ExecResult {
+                server: name.to_string(),
+                success: false,
+                stdout: String::new(),
+                stderr: format!("{e:#}"),
+            },
+        },
+        Err(e) => ExecResult {
+            server: name.to_string(),
+            success: false,
+            stdout: String::new(),
+            stderr: format!("{e:#}"),
+        },
+    }
+}
+
 /// Resolves targets (`--servers`/`--all`/`--group`) and runs `command` on each over SSH,
 /// continuing past a failing/unresolvable server rather than aborting the batch. Shared
-/// by `tooler fleet exec` and `tooler play`'s native `fleet:` task type.
+/// by `tooler fleet exec` and `tooler play`'s native `fleet:` task type. `parallel: true`
+/// runs all targets concurrently (`std::thread::scope` — `Context` is plain owned data,
+/// safe to share by reference across threads); output order matches `resolve_targets`'
+/// (already sorted) either way.
 pub(crate) fn run_on_targets(
     ctx: &Context,
     servers: Option<&str>,
@@ -135,6 +172,7 @@ pub(crate) fn run_on_targets(
     group: Option<&str>,
     command: &str,
     sudo: bool,
+    parallel: bool,
 ) -> Result<Vec<ExecResult>> {
     let names = resolve_targets(ctx, servers, all, group)?;
     if names.is_empty() {
@@ -143,31 +181,20 @@ pub(crate) fn run_on_targets(
 
     let full_cmd = exec_command(command, sudo);
 
-    Ok(names
-        .iter()
-        .map(|name| match resolve_server(ctx, name) {
-            Ok(server) => match db::ssh_exec_capture_lenient(&server, &full_cmd) {
-                Ok((stdout, stderr, success)) => ExecResult {
-                    server: name.clone(),
-                    success,
-                    stdout,
-                    stderr,
-                },
-                Err(e) => ExecResult {
-                    server: name.clone(),
-                    success: false,
-                    stdout: String::new(),
-                    stderr: format!("{e:#}"),
-                },
-            },
-            Err(e) => ExecResult {
-                server: name.clone(),
-                success: false,
-                stdout: String::new(),
-                stderr: format!("{e:#}"),
-            },
-        })
-        .collect())
+    if parallel {
+        Ok(std::thread::scope(|scope| {
+            let handles: Vec<_> = names
+                .iter()
+                .map(|name| scope.spawn(|| exec_on_server(ctx, name, &full_cmd)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        }))
+    } else {
+        Ok(names
+            .iter()
+            .map(|name| exec_on_server(ctx, name, &full_cmd))
+            .collect())
+    }
 }
 
 fn exec(
@@ -176,12 +203,13 @@ fn exec(
     group: Option<&str>,
     command: &str,
     sudo: bool,
+    parallel: bool,
     ctx: &Context,
 ) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
 
     let full_cmd = exec_command(command, sudo);
-    let results = match run_on_targets(ctx, servers, all, group, command, sudo) {
+    let results = match run_on_targets(ctx, servers, all, group, command, sudo, parallel) {
         Ok(r) => r,
         Err(e) => return fail(json, format!("{e:#}")),
     };
@@ -232,7 +260,45 @@ struct CheckResult {
     error: Option<String>,
 }
 
-fn check(servers: Option<&str>, all: bool, group: Option<&str>, ctx: &Context) -> Result<()> {
+fn check_on_server(ctx: &Context, name: &str) -> CheckResult {
+    match resolve_server(ctx, name) {
+        Ok(server) => {
+            let host = server.host_target();
+            match db::ssh_exec_capture_lenient(&server, "echo ok") {
+                Ok((_, stderr, success)) => CheckResult {
+                    server: name.to_string(),
+                    host,
+                    success,
+                    error: if success {
+                        None
+                    } else {
+                        Some(stderr.trim().to_string())
+                    },
+                },
+                Err(e) => CheckResult {
+                    server: name.to_string(),
+                    host,
+                    success: false,
+                    error: Some(format!("{e:#}")),
+                },
+            }
+        }
+        Err(e) => CheckResult {
+            server: name.to_string(),
+            host: String::new(),
+            success: false,
+            error: Some(format!("{e:#}")),
+        },
+    }
+}
+
+fn check(
+    servers: Option<&str>,
+    all: bool,
+    group: Option<&str>,
+    parallel: bool,
+    ctx: &Context,
+) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
 
     let names = match resolve_targets(ctx, servers, all, group) {
@@ -243,38 +309,20 @@ fn check(servers: Option<&str>, all: bool, group: Option<&str>, ctx: &Context) -
         return fail(json, "no servers matched".to_string());
     }
 
-    let results: Vec<CheckResult> = names
-        .iter()
-        .map(|name| match resolve_server(ctx, name) {
-            Ok(server) => {
-                let host = server.host_target();
-                match db::ssh_exec_capture_lenient(&server, "echo ok") {
-                    Ok((_, stderr, success)) => CheckResult {
-                        server: name.clone(),
-                        host,
-                        success,
-                        error: if success {
-                            None
-                        } else {
-                            Some(stderr.trim().to_string())
-                        },
-                    },
-                    Err(e) => CheckResult {
-                        server: name.clone(),
-                        host,
-                        success: false,
-                        error: Some(format!("{e:#}")),
-                    },
-                }
-            }
-            Err(e) => CheckResult {
-                server: name.clone(),
-                host: String::new(),
-                success: false,
-                error: Some(format!("{e:#}")),
-            },
+    let results: Vec<CheckResult> = if parallel {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = names
+                .iter()
+                .map(|name| scope.spawn(|| check_on_server(ctx, name)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         })
-        .collect();
+    } else {
+        names
+            .iter()
+            .map(|name| check_on_server(ctx, name))
+            .collect()
+    };
 
     let ok_count = results.iter().filter(|r| r.success).count();
     let all_succeeded = ok_count == results.len();
