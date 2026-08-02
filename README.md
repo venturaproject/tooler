@@ -30,6 +30,8 @@
   - [tooler ps](#tooler-ps)
   - [tooler fs](#tooler-fs)
   - [tooler deploy](#tooler-deploy)
+  - [tooler fleet](#tooler-fleet)
+  - [tooler stat](#tooler-stat)
   - [tooler mcp](#tooler-mcp)
 - [Extending tooler](#extending-tooler)
 - [Releasing a new version](#releasing-a-new-version)
@@ -182,6 +184,23 @@ Tokens are never written to `config.toml` in plaintext — they're stored encryp
 
 A profile's stored token is only ever attached automatically when the request's URL has the same scheme+host+port as that profile's `base_url` — a relative path (which is always resolved against `base_url`) or an absolute URL that happens to match it. A request to any other host (e.g. one an MCP tool caller supplies) is sent without it; pass `--token` explicitly if you really want to send a credential somewhere else.
 
+#### OAuth2 profiles (refresh-token grant)
+
+For APIs that require OAuth2 instead of a static bearer token (e.g. Exact Online/Exact Synergy, and most REST ERP APIs), configure a profile with a `token_url` instead of (or in addition to) a static `token`. Once `token_url` is set, `tooler http` automatically exchanges the stored `refresh_token` for a short-lived access token, caches it until shortly before it expires, and transparently refreshes it again as needed — no static token to keep in sync.
+
+```sh
+tooler config set profile.exact.base_url https://start.exactonline.nl/api/v1/<division>
+tooler config set profile.exact.token_url https://start.exactonline.nl/api/oauth2/token
+tooler config set profile.exact.client_id <client_id>
+tooler config set profile.exact.client_secret <client_secret>
+tooler config set profile.exact.refresh_token <initial_refresh_token>
+tooler http get /crm/Accounts --profile exact
+```
+
+`tooler` does **not** perform the initial interactive OAuth2 login. Obtaining that first `client_id`/`client_secret`/`refresh_token` triple is a one-time step you do yourself against the provider (register an app, complete the authorization-code login in a browser) — from then on, `tooler` handles every refresh automatically, including providers like Exact that rotate the refresh token on every use (the newly issued one silently replaces the stored one).
+
+Like `token`, `client_secret` and `refresh_token` are stored only in the OS credential store, never in `config.toml`. The cached access token and its expiry live there too. `tooler config profiles` marks OAuth2-managed profiles with `[oauth2]`.
+
 ---
 
 ### tooler check
@@ -283,7 +302,7 @@ tasks:
 ```
 
 ```sh
-tooler play --init                          # generate a sample playbook.yml
+tooler play --init                          # generate playbooks/playbook.yml
 tooler play playbook.yml                    # run all tasks
 tooler play playbook.yml --dry              # preview without executing
 tooler play playbook.yml --tags build,test  # run only tagged tasks
@@ -300,6 +319,27 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `env_check: {reference, target}` | Verify .env has all keys from reference |
 
 Commands and file paths in tasks always resolve **relative to the playbook file's directory**, not where you run `tooler play` from.
+
+#### The `playbooks/` directory
+
+For projects with more than one playbook, keep them in a `playbooks/` directory (found by
+walking up from cwd to the nearest `.tooler.toml`, same lookup as `tooler run`'s
+`[scripts]` — falls back to the current directory if there's no `.tooler.toml`) and run
+them **by name** instead of by path:
+
+```sh
+tooler play --init deploy-staging     # writes playbooks/deploy-staging.yml
+tooler play --init smoke-test         # writes playbooks/smoke-test.yml
+tooler play                           # lists everything in playbooks/
+tooler play deploy-staging            # runs playbooks/deploy-staging.yml
+```
+
+A bare name (no `/`, no `.yml`/`.yaml`) is always looked up in `playbooks/`. Anything
+that looks like a path — contains a `/` or already ends in `.yml`/`.yaml` — is still
+opened literally at that path, exactly as before, so `tooler play ./one-off.yml` (or any
+existing path-based invocation) keeps working unchanged. Note a `run:`/`env_check:` path
+inside a `playbooks/`-based playbook still resolves relative to `playbooks/` itself, not
+the project root.
 
 ---
 
@@ -573,9 +613,35 @@ Pass only the steps you want — `--pull`, `--build <cmd>`, `--restart <cmd>`, `
 
 ---
 
+### tooler fleet
+
+Run a command, or check SSH reachability, against *multiple* server profiles in one call — the batch counterpart to [`tooler ssh exec`](#tooler-ssh)/[`tooler ssh check`](#tooler-ssh) for anyone tired of looping over servers by hand.
+
+```sh
+tooler fleet exec --servers web1,web2,web3 -- "uptime"
+tooler fleet exec --all "systemctl is-active myapp" --sudo
+tooler fleet check --all
+```
+
+Target servers with `--servers a,b,c` (comma-separated profile names) or `--all` (every configured profile) — exactly one of the two is required. `exec` runs the command on each server and **continues past a failing server**, reporting per-server stdout/stderr/success rather than aborting the whole batch (this is a fan-out/observability primitive, not an ordered pipeline like `tooler deploy`); it exits non-zero if any server failed. `exec` has **no `--confirm` gate** — it's exactly as unguarded as `tooler ssh exec`, just run against several servers at once, so treat the command you pass it with the same care. `check` verifies full SSH connectivity (not just a TCP port) to each server and reports which ones are reachable.
+
+---
+
+### tooler stat
+
+Resource snapshot — uptime/load average, memory, disk usage — for one remote server over SSH, complementing [`tooler ps list`](#tooler-ps)'s process view.
+
+```sh
+tooler stat myserver
+```
+
+Fetches all three in a single SSH round trip and prints them as-is (no fragile per-OS numeric parsing — `free -h` output differs across distros and doesn't exist on BSD/macOS-family hosts at all, so `stat` falls back to `vm_stat` or reports "unavailable" rather than guessing at a format). Read-only, no `--confirm` needed.
+
+---
+
 ### tooler mcp
 
-Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, `tooler_gh_prs`, `tooler_systemd_restart`, `tooler_cron_add`, `tooler_logs_grep`, `tooler_ps_kill`, `tooler_db_backup`, `tooler_db_restore`, `tooler_fs_write`, `tooler_deploy_run`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
+Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, `tooler_gh_prs`, `tooler_systemd_restart`, `tooler_cron_add`, `tooler_logs_grep`, `tooler_ps_kill`, `tooler_db_backup`, `tooler_db_restore`, `tooler_fs_write`, `tooler_deploy_run`, `tooler_fleet_exec`, `tooler_fleet_check`, `tooler_stat`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
 
 ```sh
 tooler mcp
@@ -602,7 +668,7 @@ claude mcp add tooler -- tooler mcp
 
 Most tools accept an optional `cwd` parameter so a single long-running server can target different project directories across a session.
 
-Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can distinguish safe reads (`tooler_info`, `tooler_env_show`, `tooler_check_url`, ...) from destructive operations (`tooler_ssh_exec`, `tooler_ssh_ssl`, `tooler_git_clean`, ...).
+Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can distinguish safe reads (`tooler_info`, `tooler_env_show`, `tooler_check_url`, `tooler_stat`, `tooler_fleet_check`, ...) from destructive operations (`tooler_ssh_exec`, `tooler_ssh_ssl`, `tooler_git_clean`, `tooler_fleet_exec`, ...).
 
 `tooler_ssh_ssl`, `tooler_systemd_restart`, `tooler_ps_kill`, and `tooler_deploy_run` never accept `pfx_password`/`sudo_pass` as tool arguments, `tooler_http_get`/`tooler_http_post` never accept a bearer `token`, and `tooler_db_query`/`tooler_db_backup`/`tooler_db_restore` never accept a database `password` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` / `TOOLER_DB_PASSWORD` in the MCP server's own environment instead, e.g.:
 

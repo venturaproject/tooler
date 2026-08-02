@@ -77,14 +77,17 @@ fn active_token(token: Option<String>, ctx: &Context, url: &str) -> Result<Optio
     if token.is_some() {
         return Ok(token);
     }
-    let base_matches = ctx
-        .config
-        .profile
-        .get(&ctx.profile)
+    let profile = ctx.config.profile.get(&ctx.profile);
+    let base_matches = profile
         .and_then(|p| p.base_url.as_deref())
         .is_some_and(|base| same_origin(base, url));
     if !base_matches {
         return Ok(None);
+    }
+    if let Some(p) = profile
+        && p.token_url.is_some()
+    {
+        return crate::oauth::get_valid_access_token(&ctx.profile, p);
     }
     crate::secrets::get_token(&ctx.profile)
 }

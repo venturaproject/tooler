@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod context;
 mod db;
+mod oauth;
 mod output;
 mod project;
 mod report;
@@ -52,5 +53,7 @@ fn main() -> Result<()> {
         Commands::Ps(args) => commands::ps::run(args, &ctx),
         Commands::Fs(args) => commands::fs::run(args, &ctx),
         Commands::Deploy(args) => commands::deploy::run(args, &ctx),
+        Commands::Fleet(args) => commands::fleet::run(args, &ctx),
+        Commands::Stat(args) => commands::stat::run(args, &ctx),
     }
 }

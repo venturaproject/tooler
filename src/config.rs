@@ -31,6 +31,13 @@ impl Default for DefaultSection {
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Profile {
     pub base_url: Option<String>,
+    /// OAuth2 token endpoint. Its presence marks this profile as OAuth2-managed:
+    /// `tooler http` refreshes and caches an access token instead of using a static
+    /// bearer token (see `oauth::get_valid_access_token`).
+    pub token_url: Option<String>,
+    /// OAuth2 client ID. Not treated as secret (unlike `client_secret`/`refresh_token`,
+    /// which live in the OS keychain via `secrets.rs`).
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

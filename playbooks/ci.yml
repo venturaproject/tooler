@@ -1,0 +1,19 @@
+name: CI checks
+description: Format, lint and test tooler itself — same checks run before every commit
+
+tasks:
+  - name: Check formatting
+    run: cargo fmt --check
+    tags: [fmt]
+
+  - name: Lint with clippy
+    run: cargo clippy --all-targets -- -D warnings
+    tags: [lint]
+
+  - name: Run test suite
+    run: cargo test
+    tags: [test]
+
+  - name: Build release binary
+    run: cargo build --release
+    tags: [build]

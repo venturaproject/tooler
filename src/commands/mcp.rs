@@ -617,6 +617,39 @@ struct DeployRunArgs {
     confirm: bool,
 }
 
+// ── fleet ─────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct FleetExecArgs {
+    /// Comma-separated server profile names (omit if all=true)
+    servers: Option<String>,
+    /// Target every configured server profile
+    #[serde(default)]
+    all: bool,
+    /// Command to run
+    command: String,
+    /// Run command with sudo
+    #[serde(default)]
+    sudo: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct FleetCheckArgs {
+    /// Comma-separated server profile names (omit if all=true)
+    servers: Option<String>,
+    /// Target every configured server profile
+    #[serde(default)]
+    all: bool,
+}
+
+// ── stat ──────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct StatArgs {
+    /// Server profile (see tooler_server_list)
+    server: String,
+}
+
 // ── gh ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
@@ -1768,6 +1801,59 @@ impl ToolerMcp {
         push_opt_num(&mut argv, "--health-delay", args.health_delay);
         push_flag(&mut argv, "--sudo", args.sudo);
         push_flag(&mut argv, "--confirm", args.confirm);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Run a command on multiple servers over SSH at once (pass `servers` as a \
+                        comma-separated list of profile names, or `all: true` for every \
+                        configured profile). Continues past a failing server and reports \
+                        per-server results rather than aborting the whole batch.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_fleet_exec(
+        &self,
+        Parameters(args): Parameters<FleetExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["fleet".to_string(), "exec".to_string()];
+        push_opt(&mut argv, "--servers", &args.servers);
+        push_flag(&mut argv, "--all", args.all);
+        argv.push(args.command.clone());
+        push_flag(&mut argv, "--sudo", args.sudo);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Check SSH connectivity to multiple servers at once (pass `servers` as a \
+                        comma-separated list of profile names, or `all: true` for every \
+                        configured profile)",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_fleet_check(
+        &self,
+        Parameters(args): Parameters<FleetCheckArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["fleet".to_string(), "check".to_string()];
+        push_opt(&mut argv, "--servers", &args.servers);
+        push_flag(&mut argv, "--all", args.all);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Get a resource snapshot (uptime/load average, memory, disk usage) for a \
+                        remote server over SSH",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_stat(
+        &self,
+        Parameters(args): Parameters<StatArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec!["stat".to_string(), args.server.clone()];
         self.exec_self(argv, &None).await
     }
 

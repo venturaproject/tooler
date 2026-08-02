@@ -2,9 +2,10 @@ use crate::{
     commands::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, cron::CronArgs,
         db::DbArgs, deploy::DeployArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs,
-        fs::FsArgs, gh::GhArgs, git::GitArgs, http::HttpArgs, info::InfoArgs, json::JsonArgs,
-        logs::LogsArgs, mcp::McpArgs, play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs,
-        scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs, systemd::SystemdArgs,
+        fleet::FleetArgs, fs::FsArgs, gh::GhArgs, git::GitArgs, http::HttpArgs, info::InfoArgs,
+        json::JsonArgs, logs::LogsArgs, mcp::McpArgs, play::PlayArgs, ps::PsArgs,
+        report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs,
+        stat::StatArgs, systemd::SystemdArgs,
     },
     output::OutputFormat,
 };
@@ -107,4 +108,10 @@ pub enum Commands {
 
     /// Orchestrate a remote deploy: pull, build, restart, health check
     Deploy(DeployArgs),
+
+    /// Run a command or check SSH connectivity against multiple server profiles at once
+    Fleet(FleetArgs),
+
+    /// Resource snapshot (uptime/load, memory, disk) for a remote server over SSH
+    Stat(StatArgs),
 }

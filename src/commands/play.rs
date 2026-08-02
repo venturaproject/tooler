@@ -1,4 +1,4 @@
-use crate::{context::Context, output::OutputFormat};
+use crate::{context::Context, output::OutputFormat, project};
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use colored::Colorize;
@@ -82,23 +82,56 @@ fn default_env_target() -> String {
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
+/// A playbook argument is a literal path (existing, unchanged behavior) if it contains a
+/// `/` or already ends in `.yml`/`.yaml`; otherwise it's a bare name, resolved against
+/// `<project_root>/playbooks/<name>.yml` (then `.yaml`).
+fn is_literal_path(s: &str) -> bool {
+    s.contains('/') || s.ends_with(".yml") || s.ends_with(".yaml")
+}
+
+fn resolve_playbook_file(file: &str, project_root: &Path) -> Result<PathBuf> {
+    if is_literal_path(file) {
+        return PathBuf::from(file)
+            .canonicalize()
+            .with_context(|| format!("Cannot resolve path: {file}"));
+    }
+    let dir = project_root.join("playbooks");
+    for ext in ["yml", "yaml"] {
+        let candidate = dir.join(format!("{file}.{ext}"));
+        if candidate.exists() {
+            return candidate
+                .canonicalize()
+                .with_context(|| format!("Cannot resolve path: {}", candidate.display()));
+        }
+    }
+    bail!(
+        "No playbook named '{file}' in {} (looked for {file}.yml, {file}.yaml).\n  \
+         Create one with: tooler play --init {file}",
+        dir.display()
+    );
+}
+
 pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
+    let (_, project_root) = project::load()?;
+    let playbooks_dir = project_root.join("playbooks");
+
     if args.init {
-        let path = args.file.as_deref().unwrap_or("playbook.yml");
-        return write_sample(path, ctx);
+        let name = args.file.as_deref().unwrap_or("playbook");
+        let path = if is_literal_path(name) {
+            PathBuf::from(name)
+        } else {
+            std::fs::create_dir_all(&playbooks_dir)?;
+            playbooks_dir.join(format!("{name}.yml"))
+        };
+        return write_sample(&path, ctx);
     }
 
-    let file = args.file.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("Specify a playbook file, or use --init to generate one.")
-    })?;
+    let Some(file) = args.file.as_deref() else {
+        return list_playbooks(&playbooks_dir, ctx);
+    };
 
-    let file_path = PathBuf::from(file);
-    let playbook_dir = file_path
-        .canonicalize()
-        .with_context(|| format!("Cannot resolve path: {file}"))?
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    let file_path = resolve_playbook_file(file, &project_root)?;
+    let playbook_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     let content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Cannot read playbook: {file}"))?;
@@ -466,12 +499,16 @@ fn print_recap(ok: usize, failed: usize, skipped: usize) {
 
 // ── Sample playbook ───────────────────────────────────────────────────────────
 
-fn write_sample(path: &str, ctx: &Context) -> Result<()> {
+fn write_sample(path: &Path, ctx: &Context) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
-    if std::path::Path::new(path).exists() {
-        let message = format!("'{}' already exists.", path);
+    let path_str = path.display().to_string();
+    if path.exists() {
+        let message = format!("'{}' already exists.", path_str);
         if json {
-            println!("{}", serde_json::json!({"path": path, "error": message}));
+            println!(
+                "{}",
+                serde_json::json!({"path": path_str, "error": message})
+            );
             std::process::exit(1);
         }
         bail!(message);
@@ -514,10 +551,105 @@ tasks:
 
     std::fs::write(path, sample)?;
     if json {
-        println!("{}", serde_json::json!({"created": path}));
+        println!("{}", serde_json::json!({"created": path_str}));
         return Ok(());
     }
-    println!("{} {}", "created".green().bold(), path.cyan());
-    println!("{}", "Run it with: tooler play playbook.yml".dimmed());
+    println!("{} {}", "created".green().bold(), path_str.cyan());
+    let invocation =
+        if path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("playbooks")) {
+            path.file_stem().unwrap().to_string_lossy().to_string()
+        } else {
+            path_str
+        };
+    println!(
+        "{}",
+        format!("Run it with: tooler play {invocation}").dimmed()
+    );
     Ok(())
+}
+
+// ── Listing ───────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct PlaybookHeader {
+    #[serde(default)]
+    description: Option<String>,
+}
+
+fn list_playbooks(dir: &Path, ctx: &Context) -> Result<()> {
+    let json = ctx.output == OutputFormat::Json;
+
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
+                let name = path.file_stem().unwrap().to_string_lossy().to_string();
+                entries.push((name, path));
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let describe = |path: &Path| -> Option<String> {
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_yaml::from_str::<PlaybookHeader>(&content)
+            .ok()?
+            .description
+    };
+
+    if json {
+        let playbooks: Vec<_> = entries
+            .iter()
+            .map(|(name, path)| {
+                serde_json::json!({
+                    "name": name,
+                    "file": path.display().to_string(),
+                    "description": describe(path),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"dir": dir.display().to_string(), "playbooks": playbooks})
+        );
+        return Ok(());
+    }
+
+    if entries.is_empty() {
+        println!("{}", "No playbooks found.".dimmed());
+        println!("Create one with: {}", "tooler play --init <name>".dimmed());
+        return Ok(());
+    }
+
+    println!(
+        "{} {}",
+        "playbooks:".bold().cyan(),
+        dir.display().to_string().dimmed()
+    );
+    println!("{}", "─".repeat(40).dimmed());
+    for (name, path) in &entries {
+        let desc = describe(path).unwrap_or_default();
+        println!("  {:20} {}", name.bold(), desc.dimmed());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_literal_path_detects_slash_and_extensions() {
+        assert!(is_literal_path("playbook.yml"));
+        assert!(is_literal_path("playbook.yaml"));
+        assert!(is_literal_path("./playbooks/deploy.yml"));
+        assert!(is_literal_path("sub/deploy"));
+    }
+
+    #[test]
+    fn is_literal_path_false_for_bare_names() {
+        assert!(!is_literal_path("deploy"));
+        assert!(!is_literal_path("smoke-test"));
+    }
 }
