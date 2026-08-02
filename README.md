@@ -31,6 +31,7 @@
   - [tooler fs](#tooler-fs)
   - [tooler deploy](#tooler-deploy)
   - [tooler fleet](#tooler-fleet)
+  - [tooler group](#tooler-group)
   - [tooler stat](#tooler-stat)
   - [tooler mcp](#tooler-mcp)
 - [Extending tooler](#extending-tooler)
@@ -317,6 +318,30 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `check_url: <url>` | HTTP health check (expects 2xx) |
 | `check_port: {host, port}` | TCP connectivity check |
 | `env_check: {reference, target}` | Verify .env has all keys from reference |
+| `ssh: {server, command, sudo}` | Run a command on one remote server profile over SSH |
+| `fleet: {servers/group/all, command, sudo}` | Run a command on multiple server profiles (same targeting as [`tooler fleet`](#tooler-fleet)) |
+
+```yaml
+tasks:
+  - name: Restart the app on the primary
+    ssh:
+      server: web1
+      command: systemctl restart myapp
+      sudo: true
+
+  - name: Roll the whole web group
+    fleet:
+      group: web
+      command: systemctl restart myapp
+      sudo: true
+```
+
+`ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed.
+
+**Per-task modifiers**, usable with any action above:
+
+- `when: "{{env}} == prod"` — skip the task unless the condition (evaluated once against the playbook's vars, after `{{var}}` substitution) holds. Supports `==`, `!=`, or a bare truthy check — not a full expression language.
+- `loop: [a, b, c]` — run the task once per item, with `{{item}}` available to the action (e.g. `run: systemctl restart {{item}}`). The first failing iteration fails the task; remaining items aren't attempted.
 
 Commands and file paths in tasks always resolve **relative to the playbook file's directory**, not where you run `tooler play` from.
 
@@ -620,10 +645,26 @@ Run a command, or check SSH reachability, against *multiple* server profiles in 
 ```sh
 tooler fleet exec --servers web1,web2,web3 -- "uptime"
 tooler fleet exec --all "systemctl is-active myapp" --sudo
+tooler fleet exec --group web "uptime"
 tooler fleet check --all
 ```
 
-Target servers with `--servers a,b,c` (comma-separated profile names) or `--all` (every configured profile) — exactly one of the two is required. `exec` runs the command on each server and **continues past a failing server**, reporting per-server stdout/stderr/success rather than aborting the whole batch (this is a fan-out/observability primitive, not an ordered pipeline like `tooler deploy`); it exits non-zero if any server failed. `exec` has **no `--confirm` gate** — it's exactly as unguarded as `tooler ssh exec`, just run against several servers at once, so treat the command you pass it with the same care. `check` verifies full SSH connectivity (not just a TCP port) to each server and reports which ones are reachable.
+Target servers with `--servers a,b,c` (comma-separated profile names), `--all` (every configured profile), or `--group <name>` (a named group, see [`tooler group`](#tooler-group) below) — exactly one of the three is required. `exec` runs the command on each server and **continues past a failing server**, reporting per-server stdout/stderr/success rather than aborting the whole batch (this is a fan-out/observability primitive, not an ordered pipeline like `tooler deploy`); it exits non-zero if any server failed. `exec` has **no `--confirm` gate** — it's exactly as unguarded as `tooler ssh exec`, just run against several servers at once, so treat the command you pass it with the same care. `check` verifies full SSH connectivity (not just a TCP port) to each server and reports which ones are reachable.
+
+---
+
+### tooler group
+
+Named sets of server profiles ("inventory groups"), so `tooler fleet` and playbook `ssh:`/`fleet:` tasks (see [`tooler play`](#tooler-play)) can target a group by name instead of listing `--servers a,b,c` every time.
+
+```sh
+tooler group add web --members web1,web2,web3
+tooler group list
+tooler group show web
+tooler group remove web
+```
+
+`add` is an upsert (re-running it replaces the member list) and validates every member already exists as a server profile — an unknown name is rejected immediately with a hint to `tooler server add` it first, rather than failing later at `fleet`/playbook run time.
 
 ---
 
@@ -641,7 +682,8 @@ Fetches all three in a single SSH round trip and prints them as-is (no fragile p
 
 ### tooler mcp
 
-Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, `tooler_gh_prs`, `tooler_systemd_restart`, `tooler_cron_add`, `tooler_logs_grep`, `tooler_ps_kill`, `tooler_db_backup`, `tooler_db_restore`, `tooler_fs_write`, `tooler_deploy_run`, `tooler_fleet_exec`, `tooler_fleet_check`, `tooler_stat`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
+Run tooler as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing every subcommand as a typed tool (`tooler_info`, `tooler_env_show`, `tooler_ssh_exec`, `tooler_git_clean`, `tooler_gh_prs`, `tooler_systemd_restart`, `tooler_cron_add`, `tooler_logs_grep`, `tooler_ps_kill`, `tooler_db_backup`, `tooler_db_restore`, `tooler_fs_write`, `tooler_deploy_run`, `tooler_fleet_exec`, `tooler_fleet_check`, `tooler_stat`,
+`tooler_group_add`, `tooler_group_list`, ...) so Claude and other MCP clients can drive tooler directly instead of shelling out.
 
 ```sh
 tooler mcp

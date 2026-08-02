@@ -50,12 +50,48 @@ struct Task {
     ignore_errors: bool,
     #[serde(default)]
     tags: Vec<String>,
+    /// Simple condition evaluated once against the playbook's vars, before any `loop:`
+    /// expansion (does not see `{{item}}`). Supports "<a> == <b>", "<a> != <b>", or a
+    /// bare truthy check after `{{var}}` substitution — not a full expression language.
+    #[serde(default)]
+    when: Option<String>,
+    /// Run this task once per item, with `{{item}}` available to the action for that
+    /// iteration. The first failing iteration fails the task (and, unless
+    /// `ignore_errors`, the whole playbook) — remaining items are not attempted.
+    #[serde(default, rename = "loop")]
+    loop_items: Option<Vec<String>>,
 
     // Actions — only one should be set per task
     run: Option<String>,
     check_url: Option<String>,
     check_port: Option<CheckPortSpec>,
     env_check: Option<EnvCheckSpec>,
+    ssh: Option<SshSpec>,
+    fleet: Option<FleetSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SshSpec {
+    /// Server profile name (see: tooler server list)
+    server: String,
+    command: String,
+    #[serde(default)]
+    sudo: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetSpec {
+    /// Comma-separated server profile names (mutually exclusive with all/group)
+    #[serde(default)]
+    servers: Option<String>,
+    /// Named server group (see: tooler group list)
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    all: bool,
+    command: String,
+    #[serde(default)]
+    sudo: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,7 +252,22 @@ fn execute_playbook(
             );
         }
 
-        let result = run_task(task, &playbook.vars, playbook_dir, dry, json);
+        if let Some(w) = &task.when
+            && !eval_when(w, &playbook.vars)
+        {
+            if !json {
+                println!("  {}", format!("(skipped — when: {w} was false)").dimmed());
+            }
+            skipped += 1;
+            outcomes.push(TaskOutcome {
+                name: task.name.clone(),
+                status: "skipped",
+                error: None,
+            });
+            continue;
+        }
+
+        let result = run_task(task, &playbook.vars, playbook_dir, dry, json, ctx);
 
         match result {
             Ok(_) => {
@@ -315,12 +366,53 @@ fn execute_playbook(
     Ok(())
 }
 
+/// A minimal condition language over `render()`-substituted strings: "<a> == <b>",
+/// "<a> != <b>", or a bare truthy check. Not a full expression language — matches
+/// tooler's existing plain `{{var}}` templating rather than adding a new one.
+fn eval_when(expr: &str, vars: &HashMap<String, String>) -> bool {
+    let rendered = render(expr, vars);
+    let rendered = rendered.trim();
+    if let Some((lhs, rhs)) = rendered.split_once("!=") {
+        return lhs.trim() != rhs.trim();
+    }
+    if let Some((lhs, rhs)) = rendered.split_once("==") {
+        return lhs.trim() == rhs.trim();
+    }
+    !rendered.is_empty() && rendered != "false" && rendered != "0"
+}
+
+/// Expands `loop:` (if present) into one `run_task_once` call per item, with `{{item}}`
+/// added to that iteration's vars. The first failing iteration fails the whole task —
+/// remaining items are not attempted, same as any other task failure.
 fn run_task(
     task: &Task,
     vars: &HashMap<String, String>,
     playbook_dir: &Path,
     dry: bool,
     quiet: bool,
+    ctx: &Context,
+) -> Result<()> {
+    let Some(items) = &task.loop_items else {
+        return run_task_once(task, vars, playbook_dir, dry, quiet, ctx);
+    };
+    for item in items {
+        let mut loop_vars = vars.clone();
+        loop_vars.insert("item".to_string(), item.clone());
+        if !quiet {
+            println!("  {} item={}", "→".dimmed(), item.dimmed());
+        }
+        run_task_once(task, &loop_vars, playbook_dir, dry, quiet, ctx)?;
+    }
+    Ok(())
+}
+
+fn run_task_once(
+    task: &Task,
+    vars: &HashMap<String, String>,
+    playbook_dir: &Path,
+    dry: bool,
+    quiet: bool,
+    ctx: &Context,
 ) -> Result<()> {
     if let Some(cmd) = &task.run {
         let cmd = render(cmd, vars);
@@ -393,8 +485,77 @@ fn run_task(
         return Ok(());
     }
 
+    if let Some(spec) = &task.ssh {
+        let server_name = render(&spec.server, vars);
+        let cmd = render(&spec.command, vars);
+        let full_cmd = crate::commands::fleet::exec_command(&cmd, spec.sudo);
+        if !quiet {
+            println!(
+                "  {} {} {} {}",
+                "→".bold(),
+                full_cmd.dimmed(),
+                "on".dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !dry {
+            let server = crate::commands::ssh::resolve_server(ctx, &server_name)?;
+            let (stdout, stderr, success) =
+                crate::db::ssh_exec_capture_lenient(&server, &full_cmd)?;
+            if success {
+                let out = stdout.trim();
+                if !quiet && !out.is_empty() {
+                    println!("{out}");
+                }
+            } else {
+                let err = stderr.trim();
+                bail!(
+                    "{}",
+                    if err.is_empty() {
+                        "command failed"
+                    } else {
+                        err
+                    }
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.fleet {
+        let command = render(&spec.command, vars);
+        if !quiet {
+            println!("  {} {}", "→".bold(), command.dimmed());
+        }
+        if !dry {
+            let results = crate::commands::fleet::run_on_targets(
+                ctx,
+                spec.servers.as_deref(),
+                spec.all,
+                spec.group.as_deref(),
+                &command,
+                spec.sudo,
+            )?;
+            let ok_count = results.iter().filter(|r| r.success).count();
+            let all_succeeded = ok_count == results.len();
+            if !quiet {
+                for r in &results {
+                    if r.success {
+                        println!("    {} {}", "✓".green().bold(), r.server.cyan());
+                    } else {
+                        println!("    {} {}", "✗".red().bold(), r.server.cyan());
+                    }
+                }
+            }
+            if !all_succeeded {
+                bail!("{}/{} servers succeeded", ok_count, results.len());
+            }
+        }
+        return Ok(());
+    }
+
     bail!(
-        "task '{}' has no action (run, check_url, check_port, env_check)",
+        "task '{}' has no action (run, check_url, check_port, env_check, ssh, fleet)",
         task.name
     );
 }
@@ -651,5 +812,36 @@ mod tests {
     fn is_literal_path_false_for_bare_names() {
         assert!(!is_literal_path("deploy"));
         assert!(!is_literal_path("smoke-test"));
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn eval_when_equality() {
+        let v = vars(&[("env", "prod")]);
+        assert!(eval_when("{{env}} == prod", &v));
+        assert!(!eval_when("{{env}} == staging", &v));
+    }
+
+    #[test]
+    fn eval_when_inequality() {
+        let v = vars(&[("env", "prod")]);
+        assert!(eval_when("{{env}} != staging", &v));
+        assert!(!eval_when("{{env}} != prod", &v));
+    }
+
+    #[test]
+    fn eval_when_truthy_bare_value() {
+        let v = vars(&[("enabled", "yes")]);
+        assert!(eval_when("{{enabled}}", &v));
+        let v = vars(&[("enabled", "false")]);
+        assert!(!eval_when("{{enabled}}", &v));
+        let v = vars(&[("enabled", "")]);
+        assert!(!eval_when("{{enabled}}", &v));
     }
 }

@@ -621,11 +621,13 @@ struct DeployRunArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct FleetExecArgs {
-    /// Comma-separated server profile names (omit if all=true)
+    /// Comma-separated server profile names (omit if all=true or group is set)
     servers: Option<String>,
     /// Target every configured server profile
     #[serde(default)]
     all: bool,
+    /// Target a named server group (see tooler_group_list)
+    group: Option<String>,
     /// Command to run
     command: String,
     /// Run command with sudo
@@ -635,11 +637,27 @@ struct FleetExecArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct FleetCheckArgs {
-    /// Comma-separated server profile names (omit if all=true)
+    /// Comma-separated server profile names (omit if all=true or group is set)
     servers: Option<String>,
     /// Target every configured server profile
     #[serde(default)]
     all: bool,
+    /// Target a named server group (see tooler_group_list)
+    group: Option<String>,
+}
+
+// ── group ─────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct GroupNameArgs {
+    name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GroupAddArgs {
+    name: String,
+    /// Server profile names that must already exist (see tooler_server_list)
+    members: Vec<String>,
 }
 
 // ── stat ──────────────────────────────────────────────────────────────────
@@ -1823,6 +1841,7 @@ impl ToolerMcp {
         let mut argv = vec!["fleet".to_string(), "exec".to_string()];
         push_opt(&mut argv, "--servers", &args.servers);
         push_flag(&mut argv, "--all", args.all);
+        push_opt(&mut argv, "--group", &args.group);
         argv.push(args.command.clone());
         push_flag(&mut argv, "--sudo", args.sudo);
         self.exec_self(argv, &None).await
@@ -1841,6 +1860,7 @@ impl ToolerMcp {
         let mut argv = vec!["fleet".to_string(), "check".to_string()];
         push_opt(&mut argv, "--servers", &args.servers);
         push_flag(&mut argv, "--all", args.all);
+        push_opt(&mut argv, "--group", &args.group);
         self.exec_self(argv, &None).await
     }
 
@@ -1854,6 +1874,69 @@ impl ToolerMcp {
         Parameters(args): Parameters<StatArgs>,
     ) -> Result<CallToolResult, McpError> {
         let argv = vec!["stat".to_string(), args.server.clone()];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "List configured server groups (named sets of server profiles used by \
+                        tooler_fleet_exec/check and playbook ssh:/fleet: tasks)",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn tooler_group_list(&self) -> Result<CallToolResult, McpError> {
+        self.exec_self(vec!["group".to_string(), "list".to_string()], &None)
+            .await
+    }
+
+    #[tool(
+        description = "Add or update a server group. All members must already exist as server \
+                        profiles (see tooler_server_add)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_group_add(
+        &self,
+        Parameters(args): Parameters<GroupAddArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec![
+            "group".to_string(),
+            "add".to_string(),
+            args.name.clone(),
+            "--members".to_string(),
+            args.members.join(","),
+        ];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Show the members of a server group",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn tooler_group_show(
+        &self,
+        Parameters(args): Parameters<GroupNameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec!["group".to_string(), "show".to_string(), args.name.clone()];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Remove a server group",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_group_remove(
+        &self,
+        Parameters(args): Parameters<GroupNameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec!["group".to_string(), "remove".to_string(), args.name.clone()];
         self.exec_self(argv, &None).await
     }
 

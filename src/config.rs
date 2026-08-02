@@ -11,6 +11,8 @@ pub struct Config {
     pub profile: HashMap<String, Profile>,
     #[serde(default)]
     pub server: HashMap<String, Server>,
+    #[serde(default)]
+    pub group: HashMap<String, Group>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -38,6 +40,12 @@ pub struct Profile {
     /// OAuth2 client ID. Not treated as secret (unlike `client_secret`/`refresh_token`,
     /// which live in the OS keychain via `secrets.rs`).
     pub client_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct Group {
+    #[serde(default)]
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

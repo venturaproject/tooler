@@ -55,5 +55,6 @@ fn main() -> Result<()> {
         Commands::Deploy(args) => commands::deploy::run(args, &ctx),
         Commands::Fleet(args) => commands::fleet::run(args, &ctx),
         Commands::Stat(args) => commands::stat::run(args, &ctx),
+        Commands::Group(args) => commands::group::run(args, &ctx),
     }
 }

@@ -11,6 +11,7 @@ pub mod fleet;
 pub mod fs;
 pub mod gh;
 pub mod git;
+pub mod group;
 pub mod http;
 pub mod info;
 pub mod json;

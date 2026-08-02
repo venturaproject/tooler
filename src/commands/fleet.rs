@@ -14,12 +14,15 @@ pub struct FleetArgs {
 pub enum FleetSubcommand {
     /// Run a command on multiple servers over SSH
     Exec {
-        /// Comma-separated server profile names (mutually exclusive with --all)
-        #[arg(long, conflicts_with = "all")]
+        /// Comma-separated server profile names (mutually exclusive with --all/--group)
+        #[arg(long, conflicts_with_all = ["all", "group"])]
         servers: Option<String>,
         /// Target every configured server profile
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["servers", "group"])]
         all: bool,
+        /// Target a named server group (see: tooler group list)
+        #[arg(long, conflicts_with_all = ["servers", "all"])]
+        group: Option<String>,
         /// Command to run
         command: String,
         /// Run command with sudo
@@ -28,12 +31,15 @@ pub enum FleetSubcommand {
     },
     /// Check SSH connectivity to multiple servers
     Check {
-        /// Comma-separated server profile names (mutually exclusive with --all)
-        #[arg(long, conflicts_with = "all")]
+        /// Comma-separated server profile names (mutually exclusive with --all/--group)
+        #[arg(long, conflicts_with_all = ["all", "group"])]
         servers: Option<String>,
         /// Target every configured server profile
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["servers", "group"])]
         all: bool,
+        /// Target a named server group (see: tooler group list)
+        #[arg(long, conflicts_with_all = ["servers", "all"])]
+        group: Option<String>,
     },
 }
 
@@ -42,10 +48,22 @@ pub fn run(args: FleetArgs, ctx: &Context) -> Result<()> {
         FleetSubcommand::Exec {
             servers,
             all,
+            group,
             command,
             sudo,
-        } => exec(servers.as_deref(), all, &command, sudo, ctx),
-        FleetSubcommand::Check { servers, all } => check(servers.as_deref(), all, ctx),
+        } => exec(
+            servers.as_deref(),
+            all,
+            group.as_deref(),
+            &command,
+            sudo,
+            ctx,
+        ),
+        FleetSubcommand::Check {
+            servers,
+            all,
+            group,
+        } => check(servers.as_deref(), all, group.as_deref(), ctx),
     }
 }
 
@@ -57,12 +75,28 @@ fn fail(json: bool, message: String) -> Result<()> {
     bail!(message);
 }
 
-/// Resolves `--servers a,b,c` / `--all` into an ordered list of server profile names.
-fn resolve_targets(ctx: &Context, servers: Option<&str>, all: bool) -> Result<Vec<String>> {
+/// Resolves `--servers a,b,c` / `--all` / `--group <name>` into an ordered list of
+/// server profile names.
+pub(crate) fn resolve_targets(
+    ctx: &Context,
+    servers: Option<&str>,
+    all: bool,
+    group: Option<&str>,
+) -> Result<Vec<String>> {
     if all {
         let mut names: Vec<String> = ctx.config.server.keys().cloned().collect();
         names.sort();
         return Ok(names);
+    }
+    if let Some(g) = group {
+        let grp = ctx
+            .config
+            .group
+            .get(g)
+            .ok_or_else(|| anyhow::anyhow!("Group '{g}' not found"))?;
+        let mut members = grp.members.clone();
+        members.sort();
+        return Ok(members);
     }
     match servers {
         Some(list) => Ok(list
@@ -71,11 +105,11 @@ fn resolve_targets(ctx: &Context, servers: Option<&str>, all: bool) -> Result<Ve
             .filter(|s| !s.is_empty())
             .map(String::from)
             .collect()),
-        None => bail!("pass --servers <a,b,c> or --all"),
+        None => bail!("pass --servers <a,b,c>, --group <name>, or --all"),
     }
 }
 
-fn exec_command(command: &str, sudo: bool) -> String {
+pub(crate) fn exec_command(command: &str, sudo: bool) -> String {
     if sudo {
         format!("sudo {command}")
     } else {
@@ -84,27 +118,32 @@ fn exec_command(command: &str, sudo: bool) -> String {
 }
 
 #[derive(Serialize)]
-struct ExecResult {
-    server: String,
-    success: bool,
-    stdout: String,
-    stderr: String,
+pub(crate) struct ExecResult {
+    pub(crate) server: String,
+    pub(crate) success: bool,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
-fn exec(servers: Option<&str>, all: bool, command: &str, sudo: bool, ctx: &Context) -> Result<()> {
-    let json = ctx.output == OutputFormat::Json;
-
-    let names = match resolve_targets(ctx, servers, all) {
-        Ok(n) => n,
-        Err(e) => return fail(json, format!("{e:#}")),
-    };
+/// Resolves targets (`--servers`/`--all`/`--group`) and runs `command` on each over SSH,
+/// continuing past a failing/unresolvable server rather than aborting the batch. Shared
+/// by `tooler fleet exec` and `tooler play`'s native `fleet:` task type.
+pub(crate) fn run_on_targets(
+    ctx: &Context,
+    servers: Option<&str>,
+    all: bool,
+    group: Option<&str>,
+    command: &str,
+    sudo: bool,
+) -> Result<Vec<ExecResult>> {
+    let names = resolve_targets(ctx, servers, all, group)?;
     if names.is_empty() {
-        return fail(json, "no servers matched".to_string());
+        bail!("no servers matched");
     }
 
     let full_cmd = exec_command(command, sudo);
 
-    let results: Vec<ExecResult> = names
+    Ok(names
         .iter()
         .map(|name| match resolve_server(ctx, name) {
             Ok(server) => match db::ssh_exec_capture_lenient(&server, &full_cmd) {
@@ -128,7 +167,24 @@ fn exec(servers: Option<&str>, all: bool, command: &str, sudo: bool, ctx: &Conte
                 stderr: format!("{e:#}"),
             },
         })
-        .collect();
+        .collect())
+}
+
+fn exec(
+    servers: Option<&str>,
+    all: bool,
+    group: Option<&str>,
+    command: &str,
+    sudo: bool,
+    ctx: &Context,
+) -> Result<()> {
+    let json = ctx.output == OutputFormat::Json;
+
+    let full_cmd = exec_command(command, sudo);
+    let results = match run_on_targets(ctx, servers, all, group, command, sudo) {
+        Ok(r) => r,
+        Err(e) => return fail(json, format!("{e:#}")),
+    };
 
     let ok_count = results.iter().filter(|r| r.success).count();
     let all_succeeded = ok_count == results.len();
@@ -176,10 +232,10 @@ struct CheckResult {
     error: Option<String>,
 }
 
-fn check(servers: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
+fn check(servers: Option<&str>, all: bool, group: Option<&str>, ctx: &Context) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
 
-    let names = match resolve_targets(ctx, servers, all) {
+    let names = match resolve_targets(ctx, servers, all, group) {
         Ok(n) => n,
         Err(e) => return fail(json, format!("{e:#}")),
     };
@@ -265,7 +321,7 @@ fn check(servers: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Server};
+    use crate::config::{Config, Group, Server};
     use crate::output::OutputFormat;
     use std::collections::HashMap;
 
@@ -281,24 +337,52 @@ mod tests {
         Context::new(OutputFormat::Json, "default".to_string(), config)
     }
 
+    fn ctx_with_group(group_name: &str, members: &[&str]) -> Context {
+        let mut group = HashMap::new();
+        group.insert(
+            group_name.to_string(),
+            Group {
+                members: members.iter().map(|m| (*m).to_string()).collect(),
+            },
+        );
+        let config = Config {
+            group,
+            ..Default::default()
+        };
+        Context::new(OutputFormat::Json, "default".to_string(), config)
+    }
+
     #[test]
     fn resolve_targets_splits_comma_list_and_trims_whitespace() {
         let ctx = ctx_with_servers(&[]);
-        let names = resolve_targets(&ctx, Some("a, b ,c"), false).unwrap();
+        let names = resolve_targets(&ctx, Some("a, b ,c"), false, None).unwrap();
         assert_eq!(names, vec!["a", "b", "c"]);
     }
 
     #[test]
     fn resolve_targets_all_returns_sorted_names() {
         let ctx = ctx_with_servers(&["zebra", "alpha", "mid"]);
-        let names = resolve_targets(&ctx, None, true).unwrap();
+        let names = resolve_targets(&ctx, None, true, None).unwrap();
         assert_eq!(names, vec!["alpha", "mid", "zebra"]);
     }
 
     #[test]
     fn resolve_targets_errors_when_neither_given() {
         let ctx = ctx_with_servers(&[]);
-        assert!(resolve_targets(&ctx, None, false).is_err());
+        assert!(resolve_targets(&ctx, None, false, None).is_err());
+    }
+
+    #[test]
+    fn resolve_targets_group_returns_sorted_members() {
+        let ctx = ctx_with_group("web", &["zebra", "alpha"]);
+        let names = resolve_targets(&ctx, None, false, Some("web")).unwrap();
+        assert_eq!(names, vec!["alpha", "zebra"]);
+    }
+
+    #[test]
+    fn resolve_targets_errors_on_unknown_group() {
+        let ctx = ctx_with_group("web", &["alpha"]);
+        assert!(resolve_targets(&ctx, None, false, Some("bogus")).is_err());
     }
 
     #[test]

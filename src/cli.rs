@@ -2,8 +2,8 @@ use crate::{
     commands::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, cron::CronArgs,
         db::DbArgs, deploy::DeployArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs,
-        fleet::FleetArgs, fs::FsArgs, gh::GhArgs, git::GitArgs, http::HttpArgs, info::InfoArgs,
-        json::JsonArgs, logs::LogsArgs, mcp::McpArgs, play::PlayArgs, ps::PsArgs,
+        fleet::FleetArgs, fs::FsArgs, gh::GhArgs, git::GitArgs, group::GroupArgs, http::HttpArgs,
+        info::InfoArgs, json::JsonArgs, logs::LogsArgs, mcp::McpArgs, play::PlayArgs, ps::PsArgs,
         report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs,
         stat::StatArgs, systemd::SystemdArgs,
     },
@@ -114,4 +114,7 @@ pub enum Commands {
 
     /// Resource snapshot (uptime/load, memory, disk) for a remote server over SSH
     Stat(StatArgs),
+
+    /// Manage named groups of server profiles (used by tooler fleet and playbook tasks)
+    Group(GroupArgs),
 }
