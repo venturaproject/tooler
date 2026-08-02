@@ -211,3 +211,86 @@ fn dry_run_reports_skipped_without_executing() {
 
     assert!(!dir.path().join("log.txt").exists());
 }
+
+#[test]
+fn notes_are_shown_automatically_on_a_normal_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Notes test\ntasks:\n  - name: t\n    run: echo hi\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("playbook.md"),
+        "# Heads up\n\nBe careful.\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["notes"], "# Heads up\n\nBe careful.\n");
+}
+
+#[test]
+fn notes_flag_prints_without_running_tasks() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Notes test\ntasks:\n  - name: t\n    run: echo hi >> log.txt\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("playbook.md"), "Read this first.\n").unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--notes"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("Read this first."));
+    assert!(!dir.path().join("log.txt").exists());
+}
+
+#[test]
+fn notes_flag_reports_null_when_no_md_file_exists() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: No notes\ntasks:\n  - name: t\n    run: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--notes"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(value["notes"].is_null());
+}
+
+#[test]
+fn list_marks_entries_that_have_notes() {
+    let (mut cmd, dir) = tooler();
+    std::fs::create_dir_all(dir.path().join("playbooks")).unwrap();
+    std::fs::write(
+        dir.path().join("playbooks/with-notes.yml"),
+        "name: A\ntasks:\n  - name: t\n    run: echo hi\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("playbooks/with-notes.md"), "notes\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbooks/without-notes.yml"),
+        "name: B\ntasks:\n  - name: t\n    run: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play"]).assert().success());
+    let with_notes_line = out.lines().find(|l| l.contains("with-notes")).unwrap();
+    let without_notes_line = out.lines().find(|l| l.contains("without-notes")).unwrap();
+    assert!(with_notes_line.contains("[notes]"));
+    assert!(!without_notes_line.contains("[notes]"));
+}

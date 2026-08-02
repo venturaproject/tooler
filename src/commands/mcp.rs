@@ -391,6 +391,9 @@ struct PlayMcpArgs {
     /// Generate a sample playbook.yml instead of running one
     #[serde(default)]
     init: bool,
+    /// Print the companion .md notes (if any) and exit without running any tasks
+    #[serde(default)]
+    notes: bool,
     cwd: Option<String>,
 }
 
@@ -1262,6 +1265,7 @@ impl ToolerMcp {
         push_repeated(&mut argv, "--var", &args.vars);
         push_opt(&mut argv, "--tags", &args.tags);
         push_flag(&mut argv, "--init", args.init);
+        push_flag(&mut argv, "--notes", args.notes);
         self.exec_self(argv, &args.cwd).await
     }
 

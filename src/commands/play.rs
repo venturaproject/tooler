@@ -29,6 +29,10 @@ pub struct PlayArgs {
     /// Generate a sample playbook.yml in the current directory
     #[arg(long)]
     pub init: bool,
+
+    /// Print the companion playbooks/<name>.md notes (if any) and exit without running
+    #[arg(long)]
+    pub notes: bool,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
@@ -147,6 +151,33 @@ fn resolve_playbook_file(file: &str, project_root: &Path) -> Result<PathBuf> {
     );
 }
 
+/// Companion runbook path for a resolved playbook file — same directory/stem, `.md`
+/// extension. Works uniformly whether `file_path` came from `playbooks/<name>.yml` or a
+/// literal path, since it's derived from the already-resolved path.
+fn notes_path(file_path: &Path) -> PathBuf {
+    file_path.with_extension("md")
+}
+
+fn read_notes(file_path: &Path) -> Option<String> {
+    std::fs::read_to_string(notes_path(file_path)).ok()
+}
+
+fn print_notes_only(file_path: &Path, ctx: &Context) -> Result<()> {
+    let notes = read_notes(file_path);
+    if ctx.output == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({"file": file_path.display().to_string(), "notes": notes})
+        );
+        return Ok(());
+    }
+    match notes {
+        Some(n) => println!("{}", n.trim_end()),
+        None => println!("{}", "No notes for this playbook.".dimmed()),
+    }
+    Ok(())
+}
+
 pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     let (_, project_root) = project::load()?;
     let playbooks_dir = project_root.join("playbooks");
@@ -167,6 +198,12 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     };
 
     let file_path = resolve_playbook_file(file, &project_root)?;
+
+    if args.notes {
+        return print_notes_only(&file_path, ctx);
+    }
+    let notes = read_notes(&file_path);
+
     let playbook_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     let content = std::fs::read_to_string(&file_path)
@@ -191,7 +228,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         .as_deref()
         .map(|t| t.split(',').map(str::trim).collect());
 
-    execute_playbook(&playbook, &playbook_dir, &tag_filter, args.dry, ctx)
+    execute_playbook(&playbook, &playbook_dir, &tag_filter, args.dry, &notes, ctx)
 }
 
 // ── Runner ────────────────────────────────────────────────────────────────────
@@ -208,6 +245,7 @@ fn execute_playbook(
     playbook_dir: &Path,
     tag_filter: &Option<Vec<&str>>,
     dry: bool,
+    notes: &Option<String>,
     ctx: &Context,
 ) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
@@ -224,6 +262,14 @@ fn execute_playbook(
             println!("     {}", desc.dimmed());
         }
         println!("{}", sep.dimmed());
+        if let Some(n) = notes {
+            println!("\n{}", "NOTES".bold().yellow());
+            println!("{}", sep.dimmed());
+            for line in n.trim_end().lines() {
+                println!("{line}");
+            }
+            println!("{}", sep.dimmed());
+        }
     }
 
     let tasks: Vec<&Task> = playbook
@@ -320,6 +366,7 @@ fn execute_playbook(
                             serde_json::json!({
                                 "playbook": playbook.name,
                                 "dry": dry,
+                                "notes": notes,
                                 "tasks": outcomes,
                                 "ok": ok,
                                 "failed": failed,
@@ -351,6 +398,7 @@ fn execute_playbook(
             serde_json::json!({
                 "playbook": playbook.name,
                 "dry": dry,
+                "notes": notes,
                 "tasks": outcomes,
                 "ok": ok,
                 "failed": failed,
@@ -767,6 +815,7 @@ fn list_playbooks(dir: &Path, ctx: &Context) -> Result<()> {
                     "name": name,
                     "file": path.display().to_string(),
                     "description": describe(path),
+                    "has_notes": notes_path(path).exists(),
                 })
             })
             .collect();
@@ -791,7 +840,12 @@ fn list_playbooks(dir: &Path, ctx: &Context) -> Result<()> {
     println!("{}", "─".repeat(40).dimmed());
     for (name, path) in &entries {
         let desc = describe(path).unwrap_or_default();
-        println!("  {:20} {}", name.bold(), desc.dimmed());
+        let notes_marker = if notes_path(path).exists() {
+            " [notes]".dimmed().to_string()
+        } else {
+            String::new()
+        };
+        println!("  {:20} {}{}", name.bold(), desc.dimmed(), notes_marker);
     }
     Ok(())
 }
@@ -843,5 +897,17 @@ mod tests {
         assert!(!eval_when("{{enabled}}", &v));
         let v = vars(&[("enabled", "")]);
         assert!(!eval_when("{{enabled}}", &v));
+    }
+
+    #[test]
+    fn notes_path_swaps_yml_extension_for_md() {
+        assert_eq!(
+            notes_path(Path::new("playbooks/deploy.yml")),
+            PathBuf::from("playbooks/deploy.md")
+        );
+        assert_eq!(
+            notes_path(Path::new("playbooks/deploy.yaml")),
+            PathBuf::from("playbooks/deploy.md")
+        );
     }
 }

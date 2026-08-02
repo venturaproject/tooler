@@ -366,6 +366,27 @@ existing path-based invocation) keeps working unchanged. Note a `run:`/`env_chec
 inside a `playbooks/`-based playbook still resolves relative to `playbooks/` itself, not
 the project root.
 
+#### Markdown runbooks
+
+Drop a `playbooks/<name>.md` next to `playbooks/<name>.yml` and `tooler` picks it up
+automatically — free-form context (why this playbook exists, what to check before
+running it, what to do if it fails) for whoever is about to run it, human or agent:
+
+```sh
+tooler play deploy-prod            # runs the playbook; playbooks/deploy-prod.md, if
+                                    # present, prints under a NOTES banner first
+tooler play deploy-prod --notes    # prints just the notes and exits — no tasks run
+tooler play                        # bare list marks entries that have notes: [notes]
+```
+
+`tooler` never executes this content — it's pure context, not a task type. `--notes` is
+useful for an agent driving `tooler play` over MCP: it can read a playbook's notes before
+deciding whether to actually run it, without any side effects. Notes are also included in
+`--output json`'s summary (as `"notes"`), so a normal run's output carries them too, not
+only the `--notes`-only introspection mode. There's no `--init` shortcut for the `.md`
+file — writing one is a deliberate act (by you, or by an agent's own file tools), not a
+default every playbook gets.
+
 ---
 
 ### tooler git
