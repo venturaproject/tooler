@@ -63,11 +63,12 @@ struct Task {
     /// bare truthy check after `{{var}}` substitution — not a full expression language.
     #[serde(default)]
     when: Option<String>,
-    /// Run this task once per item, with `{{item}}` available to the action for that
-    /// iteration. The first failing iteration fails the task (and, unless
-    /// `ignore_errors`, the whole playbook) — remaining items are not attempted.
+    /// Run this task once per item. A scalar item is available as `{{item}}`; a map
+    /// item exposes `{{item.<field>}}` per key (bare `{{item}}` stays literal for a map
+    /// item). The first failing iteration fails the task (and, unless `ignore_errors`,
+    /// the whole playbook) — remaining items are not attempted.
     #[serde(default, rename = "loop")]
-    loop_items: Option<Vec<String>>,
+    loop_items: Option<Vec<LoopItem>>,
     /// Capture this task's output into a variable, usable by later tasks via
     /// `{{name}}`. Supported on run/ssh/fleet only (see `run_task_once`). Inside a
     /// `loop:`, only the last iteration's value persists.
@@ -113,6 +114,22 @@ struct Task {
     /// Always run after `block:`/`rescue:`, regardless of outcome; a failure here fails
     /// the block even after a successful rescue.
     always: Option<Vec<Task>>,
+    /// Print a rendered message; no side effects.
+    debug: Option<String>,
+    /// Kill the task if it runs longer than this many seconds. Only supported on
+    /// `run:` — there's no process handle to kill for `ssh:`/`fleet:` without changing
+    /// the shared SSH helper they route through, so those reject `timeout:` upfront
+    /// rather than silently not honoring it.
+    #[serde(default)]
+    timeout: Option<u64>,
+}
+
+/// One `loop:` item — a plain scalar (`{{item}}`) or a map (`{{item.<field>}}` per key).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum LoopItem {
+    Scalar(String),
+    Map(HashMap<String, String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -633,9 +650,26 @@ fn run_task(
     };
     for item in items {
         let mut loop_vars = vars.clone();
-        loop_vars.insert("item".to_string(), item.clone());
-        if !env.quiet {
-            println!("  {} item={}", "→".dimmed(), item.dimmed());
+        match item {
+            LoopItem::Scalar(s) => {
+                loop_vars.insert("item".to_string(), s.clone());
+                if !env.quiet {
+                    println!("  {} item={}", "→".dimmed(), s.dimmed());
+                }
+            }
+            LoopItem::Map(m) => {
+                for (k, v) in m {
+                    loop_vars.insert(format!("item.{k}"), v.clone());
+                }
+                if !env.quiet {
+                    let joined = m
+                        .iter()
+                        .map(|(k, v)| format!("item.{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("  {} {joined}", "→".dimmed());
+                }
+            }
         }
         run_task_once_with_retries(task, &mut loop_vars, include_stack, env)?;
         if let Some(reg) = &task.register
@@ -787,11 +821,21 @@ fn run_task_once(
             || task.env_check.is_some()
             || task.include.is_some()
             || task.assert.is_some()
-            || task.block.is_some())
+            || task.block.is_some()
+            || task.debug.is_some())
     {
         bail!(
-            "register: is not supported for check_url/check_port/env_check/include/assert/block tasks"
+            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug tasks"
         );
+    }
+
+    if task.timeout.is_some() && task.run.is_none() {
+        bail!("timeout: is only supported on run: tasks");
+    }
+
+    if let Some(msg) = &task.debug {
+        println!("  {} {}", "ℹ".cyan().bold(), render(msg, vars));
+        return Ok(());
     }
 
     if let Some(expr) = &task.assert {
@@ -819,26 +863,12 @@ fn run_task_once(
         }
         if !env.dry {
             let start = Instant::now();
-            let (success, code, captured) = if task.register.is_some() {
-                let output = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&rendered_cmd)
-                    .current_dir(&env.playbook_dir)
-                    .output()?;
-                let captured = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                (
-                    output.status.success(),
-                    output.status.code(),
-                    Some(captured),
-                )
-            } else {
-                let status = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&rendered_cmd)
-                    .current_dir(&env.playbook_dir)
-                    .status()?;
-                (status.success(), status.code(), None)
-            };
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg(&rendered_cmd)
+                .current_dir(&env.playbook_dir);
+            let (success, code, captured) =
+                run_with_timeout(cmd, task.register.is_some(), task.timeout)?;
             let elapsed = start.elapsed();
             if success {
                 if !env.quiet {
@@ -943,15 +973,17 @@ fn run_task_once(
 
     if let Some(spec) = &task.fleet {
         let command = render(&spec.command, vars);
+        let servers = spec.servers.as_deref().map(|s| render(s, vars));
+        let group = spec.group.as_deref().map(|s| render(s, vars));
         if !env.quiet {
             println!("  {} {}", "→".bold(), command.dimmed());
         }
         if !env.dry {
             let results = crate::commands::fleet::run_on_targets(
                 env.ctx,
-                spec.servers.as_deref(),
+                servers.as_deref(),
                 spec.all,
-                spec.group.as_deref(),
+                group.as_deref(),
                 &command,
                 spec.sudo,
                 spec.parallel,
@@ -1036,9 +1068,52 @@ fn run_task_once(
     }
 
     bail!(
-        "task '{}' has no action (run, check_url, check_port, env_check, ssh, fleet, include)",
+        "task '{}' has no action (run, check_url, check_port, env_check, ssh, fleet, include, \
+         assert, block, debug)",
         task.name
     );
+}
+
+/// Spawns `cmd`, optionally capturing stdout (draining it on a concurrent reader thread
+/// so a chatty child can't deadlock against an undrained pipe while the caller is only
+/// polling `try_wait()`), and kills it if `timeout` elapses first. `timeout: None` means
+/// wait indefinitely, same as the plain `.status()`/`.output()` this replaces.
+fn run_with_timeout(
+    mut cmd: std::process::Command,
+    capture: bool,
+    timeout: Option<u64>,
+) -> Result<(bool, Option<i32>, Option<String>)> {
+    if capture {
+        cmd.stdout(std::process::Stdio::piped());
+    }
+    let mut child = cmd.spawn()?;
+    let reader = capture.then(|| {
+        let mut out = child.stdout.take().expect("stdout was piped");
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = out.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("command timed out after {}s", timeout.unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let captured = reader.map(|r| r.join().unwrap_or_default().trim().to_string());
+    Ok((status.success(), status.code(), captured))
 }
 
 // ── Actions ───────────────────────────────────────────────────────────────────
@@ -1521,5 +1596,60 @@ mod tests {
             }],
         };
         assert!(validate_handlers(&playbook).is_ok());
+    }
+
+    #[test]
+    fn loop_item_deserializes_scalar_list() {
+        let items: Vec<LoopItem> = serde_yaml::from_str("[a, b, c]").unwrap();
+        assert!(matches!(&items[0], LoopItem::Scalar(s) if s == "a"));
+        assert!(matches!(&items[2], LoopItem::Scalar(s) if s == "c"));
+    }
+
+    #[test]
+    fn loop_item_deserializes_map_list() {
+        let items: Vec<LoopItem> =
+            serde_yaml::from_str("- name: a\n  port: \"1\"\n- name: b\n  port: \"2\"\n").unwrap();
+        let LoopItem::Map(m) = &items[0] else {
+            panic!("expected a map item");
+        };
+        assert_eq!(m.get("name"), Some(&"a".to_string()));
+        assert_eq!(m.get("port"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn timeout_without_run_is_rejected() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            timeout: Some(5),
+            check_url: Some("http://example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+    }
+
+    #[test]
+    fn timeout_with_run_is_accepted() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        // dry: true — only the upfront validation runs, no real subprocess/timeout.
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            timeout: Some(5),
+            run: Some("echo hi".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
     }
 }

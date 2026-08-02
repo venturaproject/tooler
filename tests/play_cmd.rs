@@ -647,3 +647,128 @@ fn secret_templating_leaves_token_literal_when_unresolvable() {
     let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
     assert!(log.contains("{{secret.definitely_not_a_real_profile_xyz.token}}"));
 }
+
+#[test]
+fn debug_prints_a_rendered_message() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Debug test\n\
+         tasks:\n\
+         \x20\x20- name: capture\n\
+         \x20\x20\x20\x20run: echo captured-value\n\
+         \x20\x20\x20\x20register: result\n\
+         \x20\x20- name: show it\n\
+         \x20\x20\x20\x20debug: \"result is {{result}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    assert!(out.contains("result is captured-value"));
+}
+
+#[test]
+fn fleet_servers_field_is_templated() {
+    // Plain (non-JSON) output, since fleet:'s per-server ✓/✗ lines print the resolved
+    // server name directly — the clearest observable proof that servers: was rendered
+    // through {{var}} rather than treated as the literal string "{{target}}".
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args([
+            "server",
+            "add",
+            "realserver",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "1",
+        ])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Templated fleet test\n\
+         tasks:\n\
+         \x20\x20- name: fan out\n\
+         \x20\x20\x20\x20fleet:\n\
+         \x20\x20\x20\x20\x20\x20servers: \"{{target}}\"\n\
+         \x20\x20\x20\x20\x20\x20command: echo hi\n\
+         \x20\x20\x20\x20ignore_errors: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--var", "target=realserver"])
+            .timeout(std::time::Duration::from_secs(10))
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("realserver"));
+    assert!(!out.contains("{{target}}"));
+}
+
+#[test]
+fn loop_over_map_items_exposes_item_fields() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Structured loop test\n\
+         tasks:\n\
+         \x20\x20- name: append pairs\n\
+         \x20\x20\x20\x20loop:\n\
+         \x20\x20\x20\x20\x20\x20- name: a\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20port: \"1\"\n\
+         \x20\x20\x20\x20\x20\x20- name: b\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20port: \"2\"\n\
+         \x20\x20\x20\x20run: echo \"{{item.name}}:{{item.port}}\" >> log.txt\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+    assert_eq!(log.lines().collect::<Vec<_>>(), vec!["a:1", "b:2"]);
+}
+
+#[test]
+fn timeout_kills_a_hung_command() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Timeout test\n\
+         tasks:\n\
+         \x20\x20- name: hangs\n\
+         \x20\x20\x20\x20run: sleep 5\n\
+         \x20\x20\x20\x20timeout: 1\n",
+    )
+    .unwrap();
+
+    let start = std::time::Instant::now();
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml"])
+            .timeout(std::time::Duration::from_secs(10))
+            .assert()
+            .failure(),
+    );
+    let elapsed = start.elapsed();
+    assert!(out.to_lowercase().contains("timed out"));
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "expected the timeout to cut this short, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn timeout_without_run_is_rejected() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Bad timeout\n\
+         tasks:\n\
+         \x20\x20- name: t1\n\
+         \x20\x20\x20\x20check_url: http://example.com\n\
+         \x20\x20\x20\x20timeout: 5\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().failure();
+}
