@@ -321,6 +321,8 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `ssh: {server, command, sudo}` | Run a command on one remote server profile over SSH |
 | `fleet: {servers/group/all, command, sudo, parallel}` | Run a command on multiple server profiles (same targeting as [`tooler fleet`](#tooler-fleet)) |
 | `include: <name-or-path>` | Run another whole playbook as a single task |
+| `assert: "<condition>"` | Fail the task immediately (not skip) unless the condition holds |
+| `block: [...]` | Run a list of tasks as a unit, with `rescue:`/`always:` |
 
 ```yaml
 tasks:
@@ -339,7 +341,25 @@ tasks:
 
   - name: Run a shared pre-flight playbook first
     include: preflight.yml
+
+  - name: Refuse to run without a target host
+    assert: "{{host}} != ''"
+
+  - name: Deploy with a fallback
+    block:
+      - name: pull latest
+        run: git pull
+      - name: build
+        run: cargo build --release
+    rescue:
+      - name: roll back
+        run: git checkout -- .
+    always:
+      - name: clear the lock file
+        run: rm -f deploy.lock
 ```
+
+`block:`/`rescue:`/`always:` run in that order — `rescue:` only if `block:` failed (and, if it succeeds, the block is considered recovered), `always:` unconditionally afterward regardless of outcome (and a failure there fails the block even after a successful rescue). Like `include:`, a `block:` counts as a single ok/failed task in the parent's recap — its own tasks print for visibility but aren't flattened into the parent's totals. Nested tasks get the full `when:`/`loop:`/`retries:`/`register:` support, and can themselves contain another `block:`.
 
 `ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed; `parallel: true` runs all targeted servers concurrently instead of one at a time (same flag as `tooler fleet exec/check --parallel`, see [`tooler fleet`](#tooler-fleet)).
 
@@ -351,8 +371,16 @@ tasks:
 - `loop: [a, b, c]` — run the task once per item, with `{{item}}` available to the action (e.g. `run: systemctl restart {{item}}`). The first failing iteration fails the task; remaining items aren't attempted.
 - `register: <name>` — capture the task's output into a variable, usable by any later task via `{{name}}`. Supported on `run:`/`ssh:`/`fleet:` only (an upfront error otherwise). `run:` normally streams its subprocess's output live; it only switches to capturing (needed to register it) when `register:` is actually set on that task, so every other `run:` task is unaffected. Inside a `loop:`, only the last iteration's value persists.
 - `retries: N` / `delay: S` — retry a failing task up to N extra times, waiting `delay` seconds (default 1) between attempts, before giving up. Applies per `loop:` iteration if combined with `loop:`; ignored entirely in `--dry`.
+- `notify: [handler, ...]` / `changed_when: "<condition>"` — trigger one or more `handlers:` (a playbook-level list of tasks, matched by name) when this task succeeds. Each notified handler runs **at most once**, after every regular task has succeeded, deduplicated across however many tasks notified it. Without `changed_when:`, a successful task always counts as "changed"; with it, only when the condition holds (typically checking a `register:`ed value). Notifying a handler name with no matching `handlers:` entry is rejected upfront, before any task runs — not silently ignored.
 
 ```yaml
+handlers:
+  - name: restart nginx
+    ssh:
+      server: web1
+      command: systemctl restart nginx
+      sudo: true
+
 tasks:
   - name: Deploy
     run: ./deploy.sh
@@ -362,11 +390,18 @@ tasks:
     when: "{{deploy_output}} != no-op"
     run: ./notify.sh
 
+  - name: Update nginx config
+    run: cp nginx.conf /etc/nginx/nginx.conf
+    changed_when: "{{deploy_output}} != no-op"
+    notify: [restart nginx]
+
   - name: Wait for the app to come back up
     check_url: http://{{host}}/health
     retries: 5
     delay: 3
 ```
+
+**Templating** — `{{...}}` inside any string field resolves, in order: a playbook/`--var` variable, then `env.<NAME>` (the process environment, e.g. `{{env.HOME}}`), then `secret.<profile>.<key>` (the OS keychain, the same store `tooler config set profile.<name>.token` and OAuth2 profiles already use — e.g. `{{secret.exact.token}}`). Anything that doesn't resolve is left exactly as written, so a missing var/secret never crashes a playbook, it just doesn't get substituted. **Security note**: a rendered secret ends up in a `run:` task's shell command line, which — like any subprocess argv — is visible to other local processes via `ps`/`/proc` while it runs; `ssh:`/`fleet:` carry the same exposure over SSH, no different from how `sudo:` already works today.
 
 Commands and file paths in tasks always resolve **relative to the playbook file's directory**, not where you run `tooler play` from.
 

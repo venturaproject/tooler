@@ -45,6 +45,10 @@ struct Playbook {
     #[serde(default)]
     vars: HashMap<String, String>,
     tasks: Vec<Task>,
+    /// Tasks triggered by `notify:`, run at most once each after all regular tasks
+    /// succeed, in first-notified order. Matched by `name` — see `validate_handlers`.
+    #[serde(default)]
+    handlers: Vec<Task>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -76,6 +80,16 @@ struct Task {
     /// Seconds to wait between retry attempts (default 1 if `retries:` is set).
     #[serde(default)]
     delay: Option<u64>,
+    /// Handler names (matching an entry in the playbook's `handlers:`) to trigger when
+    /// this task succeeds and is considered "changed" (see `changed_when`). Deduplicated
+    /// and run at most once each, after all regular tasks succeed.
+    #[serde(default)]
+    notify: Vec<String>,
+    /// Condition (same syntax as `when:`) deciding whether this task's success counts as
+    /// "changed" for `notify:` purposes. Absent means always changed on success —
+    /// matches how a plain shell command has no built-in idempotency signal.
+    #[serde(default)]
+    changed_when: Option<String>,
 
     // Actions — only one should be set per task
     run: Option<String>,
@@ -87,6 +101,18 @@ struct Task {
     /// Run another whole playbook (by bare playbooks/ name, or a path relative to this
     /// playbook's own directory) as a single task. See `resolve_include_path`.
     include: Option<String>,
+    /// Fails the task immediately (not skips) unless the condition (same syntax as
+    /// `when:`) holds.
+    assert: Option<String>,
+    /// Run these tasks in order as a single unit; see `rescue`/`always`. Counts as one
+    /// outcome in the parent's recap — its own tasks aren't flattened into the parent's
+    /// totals (same scope line as `include:`).
+    block: Option<Vec<Task>>,
+    /// Run only if `block:` failed; if these succeed, the block is considered recovered.
+    rescue: Option<Vec<Task>>,
+    /// Always run after `block:`/`rescue:`, regardless of outcome; a failure here fails
+    /// the block even after a successful rescue.
+    always: Option<Vec<Task>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +314,35 @@ struct TaskOutcome {
     error: Option<String>,
 }
 
+/// Rejects a `notify:` name with no matching `playbook.handlers` entry upfront, rather
+/// than silently never running it — walks into `block:`/`rescue:`/`always:` too, since
+/// those tasks can `notify:` just like any other.
+fn validate_handlers(playbook: &Playbook) -> Result<()> {
+    let handler_names: std::collections::HashSet<&str> =
+        playbook.handlers.iter().map(|h| h.name.as_str()).collect();
+
+    fn walk(tasks: &[Task], handler_names: &std::collections::HashSet<&str>) -> Result<()> {
+        for t in tasks {
+            for n in &t.notify {
+                if !handler_names.contains(n.as_str()) {
+                    bail!("task '{}' notifies unknown handler '{}'", t.name, n);
+                }
+            }
+            if let Some(b) = &t.block {
+                walk(b, handler_names)?;
+            }
+            if let Some(r) = &t.rescue {
+                walk(r, handler_names)?;
+            }
+            if let Some(a) = &t.always {
+                walk(a, handler_names)?;
+            }
+        }
+        Ok(())
+    }
+    walk(&playbook.tasks, &handler_names)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_playbook(
     playbook: &Playbook,
@@ -298,6 +353,8 @@ fn execute_playbook(
     is_top_level: bool,
     env: &RunEnv,
 ) -> Result<()> {
+    validate_handlers(playbook)?;
+
     let json = env.quiet;
     let sep = "─".repeat(56);
 
@@ -336,6 +393,7 @@ fn execute_playbook(
     let mut failed = 0usize;
     let mut skipped = 0usize;
     let mut outcomes: Vec<TaskOutcome> = Vec::new();
+    let mut notified: Vec<String> = Vec::new();
 
     for (i, task) in tasks.iter().enumerate() {
         if !json {
@@ -384,6 +442,18 @@ fn execute_playbook(
                         status: "ok",
                         error: None,
                     });
+
+                    let changed = match &task.changed_when {
+                        Some(expr) => eval_when(expr, vars),
+                        None => true,
+                    };
+                    if changed {
+                        for h in &task.notify {
+                            if !notified.contains(h) {
+                                notified.push(h.clone());
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -441,6 +511,71 @@ fn execute_playbook(
                     print_recap(ok, failed, skipped);
                     bail!("playbook failed");
                 }
+            }
+        }
+    }
+
+    // Reached only if every regular task above succeeded (or was skipped/ignored) —
+    // any unhandled failure already returned or exited above. Handlers use the same
+    // failure-reporting shape as a regular task failure, addressed to the handler
+    // instead of an indexed task.
+    for name in &notified {
+        let handler = playbook
+            .handlers
+            .iter()
+            .find(|h| &h.name == name)
+            .expect("validated by validate_handlers");
+
+        if !json {
+            println!("\n{} [{}]", "HANDLER".bold().magenta(), handler.name.bold());
+        }
+
+        match run_task(handler, vars, include_stack, env) {
+            Ok(()) => {
+                ok += 1;
+                outcomes.push(TaskOutcome {
+                    name: handler.name.clone(),
+                    status: "ok",
+                    error: None,
+                });
+            }
+            Err(e) => {
+                failed += 1;
+                outcomes.push(TaskOutcome {
+                    name: handler.name.clone(),
+                    status: "failed",
+                    error: Some(e.to_string()),
+                });
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "playbook": playbook.name,
+                            "dry": env.dry,
+                            "notes": notes,
+                            "tasks": outcomes,
+                            "ok": ok,
+                            "failed": failed,
+                            "skipped": skipped,
+                            "success": false,
+                        })
+                    );
+                    if is_top_level {
+                        std::process::exit(1);
+                    }
+                    bail!("playbook failed");
+                }
+
+                println!("  {} {}", "✗".red().bold(), e.to_string().red());
+                println!("\n{}", sep.dimmed());
+                println!(
+                    "\n{} failed at handler \"{}\".",
+                    "PLAY".bold().red(),
+                    handler.name.bold()
+                );
+                print_recap(ok, failed, skipped);
+                bail!("playbook failed");
             }
         }
     }
@@ -569,6 +704,77 @@ fn resolve_include_path(file: &str, env: &RunEnv) -> Result<PathBuf> {
     );
 }
 
+/// Runs a list of tasks in order (used for `block:`/`rescue:`/`always:`), stopping at
+/// the first unhandled failure — the same when:/loop:/retries:/register: support as the
+/// top-level playbook loop, just without its JSON-summary/recap bookkeeping, since a
+/// `block:` counts as a single outcome from its caller's perspective (see `run_block`).
+fn run_task_sequence(
+    tasks: &[Task],
+    vars: &mut HashMap<String, String>,
+    include_stack: &mut Vec<PathBuf>,
+    env: &RunEnv,
+) -> Result<()> {
+    for task in tasks {
+        if !env.quiet {
+            println!("    {} {}", "•".dimmed(), task.name.dimmed());
+        }
+        if let Some(w) = &task.when
+            && !eval_when(w, vars)
+        {
+            if !env.quiet {
+                println!(
+                    "      {}",
+                    format!("(skipped — when: {w} was false)").dimmed()
+                );
+            }
+            continue;
+        }
+        if let Err(e) = run_task(task, vars, include_stack, env) {
+            if task.ignore_errors {
+                if !env.quiet {
+                    println!("      {} failed (ignored): {e}", "!".yellow().bold());
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `block:` runs first; on failure, `rescue:` (if any) runs and — if it succeeds —
+/// recovers the block. `always:` then runs unconditionally, and a failure there fails
+/// the block even after a successful rescue.
+fn run_block(
+    block: &[Task],
+    rescue: &[Task],
+    always: &[Task],
+    vars: &mut HashMap<String, String>,
+    include_stack: &mut Vec<PathBuf>,
+    env: &RunEnv,
+) -> Result<()> {
+    let result = match run_task_sequence(block, vars, include_stack, env) {
+        Ok(()) => Ok(()),
+        Err(e) if rescue.is_empty() => Err(e),
+        Err(e) => {
+            if !env.quiet {
+                println!(
+                    "    {} block failed: {e} — running rescue",
+                    "!".yellow().bold()
+                );
+            }
+            run_task_sequence(rescue, vars, include_stack, env)
+        }
+    };
+    if !always.is_empty() {
+        if !env.quiet {
+            println!("    {} running always", "→".dimmed());
+        }
+        run_task_sequence(always, vars, include_stack, env)?;
+    }
+    result
+}
+
 fn run_task_once(
     task: &Task,
     vars: &mut HashMap<String, String>,
@@ -579,9 +785,31 @@ fn run_task_once(
         && (task.check_url.is_some()
             || task.check_port.is_some()
             || task.env_check.is_some()
-            || task.include.is_some())
+            || task.include.is_some()
+            || task.assert.is_some()
+            || task.block.is_some())
     {
-        bail!("register: is not supported for check_url/check_port/env_check/include tasks");
+        bail!(
+            "register: is not supported for check_url/check_port/env_check/include/assert/block tasks"
+        );
+    }
+
+    if let Some(expr) = &task.assert {
+        if !eval_when(expr, vars) {
+            bail!("assertion failed: {expr}");
+        }
+        return Ok(());
+    }
+
+    if let Some(block_tasks) = &task.block {
+        return run_block(
+            block_tasks,
+            task.rescue.as_deref().unwrap_or(&[]),
+            task.always.as_deref().unwrap_or(&[]),
+            vars,
+            include_stack,
+            env,
+        );
     }
 
     if let Some(cmd) = &task.run {
@@ -889,11 +1117,45 @@ fn env_check(reference: &str, target: &str, quiet: bool) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn render(s: &str, vars: &HashMap<String, String>) -> String {
-    let mut out = s.to_string();
-    for (k, v) in vars {
-        out = out.replace(&format!("{{{{{k}}}}}"), v);
+/// Resolves a single `{{token}}`: the playbook's own vars first, then `env.<name>` (the
+/// process environment) and `secret.<profile>.<key>` (the OS keychain, same store as
+/// `tooler config set profile.<name>.token`/OAuth2 profiles — see `secrets::get_secret`).
+/// `None` means "leave the token literal" — covers both a genuinely unknown name and a
+/// secret lookup that failed (unset key, or the keychain itself being unreachable), so a
+/// playbook never crashes over a missing secret, it just doesn't get substituted.
+fn resolve_token(token: &str, vars: &HashMap<String, String>) -> Option<String> {
+    if let Some(v) = vars.get(token) {
+        return Some(v.clone());
     }
+    if let Some(name) = token.strip_prefix("env.") {
+        return std::env::var(name).ok();
+    }
+    if let Some(rest) = token.strip_prefix("secret.") {
+        let (profile, key) = rest.split_once('.')?;
+        return crate::secrets::get_secret(profile, key).ok().flatten();
+    }
+    None
+}
+
+/// Single-pass `{{token}}` substitution — see `resolve_token` for resolution order.
+/// Unresolvable tokens are left exactly as written, same as the old known-vars-only
+/// replace loop this superseded.
+fn render(s: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str("{{");
+            rest = after;
+            continue;
+        };
+        let token = after[..end].trim();
+        out.push_str(&resolve_token(token, vars).unwrap_or_else(|| format!("{{{{{token}}}}}")));
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -1172,5 +1434,92 @@ mod tests {
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+    }
+
+    fn dry_env(ctx: &Context) -> RunEnv<'_> {
+        RunEnv {
+            playbook_dir: PathBuf::from("."),
+            project_root: PathBuf::from("."),
+            dry: true,
+            quiet: true,
+            ctx,
+        }
+    }
+
+    #[test]
+    fn assert_true_succeeds_and_assert_false_fails() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = vars(&[("env", "prod")]);
+        let mut include_stack = Vec::new();
+
+        let task = Task {
+            assert: Some("{{env}} == prod".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+
+        let task = Task {
+            assert: Some("{{env}} == staging".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+    }
+
+    #[test]
+    fn render_still_substitutes_known_vars() {
+        let v = vars(&[("name", "world")]);
+        assert_eq!(render("hello {{name}}", &v), "hello world");
+    }
+
+    #[test]
+    fn render_leaves_unknown_and_unresolvable_tokens_literal() {
+        let v = vars(&[]);
+        assert_eq!(render("{{nope}}", &v), "{{nope}}");
+        // A profile/key that was never stored resolves to None the same way an unknown
+        // plain var does — never crashes, just leaves the token as-is.
+        assert_eq!(
+            render("{{secret.nonexistent_profile.nonexistent_key}}", &v),
+            "{{secret.nonexistent_profile.nonexistent_key}}"
+        );
+    }
+
+    #[test]
+    fn validate_handlers_rejects_unknown_notify_target() {
+        let playbook = Playbook {
+            name: "t".to_string(),
+            description: None,
+            vars: HashMap::new(),
+            handlers: vec![],
+            tasks: vec![Task {
+                name: "t1".to_string(),
+                notify: vec!["nonexistent_handler".to_string()],
+                ..Default::default()
+            }],
+        };
+        assert!(validate_handlers(&playbook).is_err());
+    }
+
+    #[test]
+    fn validate_handlers_accepts_a_matching_notify_target() {
+        let playbook = Playbook {
+            name: "t".to_string(),
+            description: None,
+            vars: HashMap::new(),
+            handlers: vec![Task {
+                name: "restart".to_string(),
+                ..Default::default()
+            }],
+            tasks: vec![Task {
+                name: "t1".to_string(),
+                notify: vec!["restart".to_string()],
+                ..Default::default()
+            }],
+        };
+        assert!(validate_handlers(&playbook).is_ok());
     }
 }

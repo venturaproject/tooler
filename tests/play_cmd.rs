@@ -442,3 +442,208 @@ fn fleet_task_parallel_flag_runs_without_hanging_or_panicking() {
         .assert()
         .success();
 }
+
+#[test]
+fn assert_failure_aborts_the_playbook_with_a_clear_message() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Assert test\n\
+         vars:\n  env: staging\n\
+         tasks:\n\
+         \x20\x20- name: must be prod\n\
+         \x20\x20\x20\x20assert: \"{{env}} == prod\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.to_lowercase().contains("assertion failed"));
+}
+
+#[test]
+fn block_runs_tasks_in_order_and_counts_as_one_outcome() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Block test\n\
+         tasks:\n\
+         \x20\x20- name: my block\n\
+         \x20\x20\x20\x20block:\n\
+         \x20\x20\x20\x20\x20\x20- name: t1\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20run: echo one >> log.txt\n\
+         \x20\x20\x20\x20\x20\x20- name: t2\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20run: echo two >> log.txt\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(value["ok"], 1);
+
+    let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+    assert_eq!(log.lines().collect::<Vec<_>>(), vec!["one", "two"]);
+}
+
+#[test]
+fn block_failure_runs_rescue_and_recovers() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Rescue test\n\
+         tasks:\n\
+         \x20\x20- name: risky block\n\
+         \x20\x20\x20\x20block:\n\
+         \x20\x20\x20\x20\x20\x20- name: fails\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20run: exit 1\n\
+         \x20\x20\x20\x20rescue:\n\
+         \x20\x20\x20\x20\x20\x20- name: recover\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20run: echo recovered >> log.txt\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+    assert!(log.contains("recovered"));
+}
+
+#[test]
+fn always_runs_even_after_a_successful_rescue_and_can_still_fail_the_block() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Always test\n\
+         tasks:\n\
+         \x20\x20- name: risky block\n\
+         \x20\x20\x20\x20block:\n\
+         \x20\x20\x20\x20\x20\x20- name: fails\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20run: exit 1\n\
+         \x20\x20\x20\x20rescue:\n\
+         \x20\x20\x20\x20\x20\x20- name: recover\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20run: echo recovered\n\
+         \x20\x20\x20\x20always:\n\
+         \x20\x20\x20\x20\x20\x20- name: cleanup fails\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20run: exit 1\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().failure();
+}
+
+#[test]
+fn handler_runs_once_when_notified_and_deduplicates() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Handler test\n\
+         handlers:\n\
+         \x20\x20- name: restart\n\
+         \x20\x20\x20\x20run: echo restarted >> log.txt\n\
+         tasks:\n\
+         \x20\x20- name: t1\n\
+         \x20\x20\x20\x20run: echo t1\n\
+         \x20\x20\x20\x20notify: [restart]\n\
+         \x20\x20- name: t2\n\
+         \x20\x20\x20\x20run: echo t2\n\
+         \x20\x20\x20\x20notify: [restart]\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    let restart_count = value["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["name"] == "restart")
+        .count();
+    assert_eq!(restart_count, 1);
+
+    let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+    assert_eq!(log.lines().count(), 1);
+}
+
+#[test]
+fn changed_when_false_suppresses_notification() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Changed test\n\
+         handlers:\n\
+         \x20\x20- name: restart\n\
+         \x20\x20\x20\x20run: echo restarted >> log.txt\n\
+         tasks:\n\
+         \x20\x20- name: t1\n\
+         \x20\x20\x20\x20run: echo t1\n\
+         \x20\x20\x20\x20changed_when: \"false\"\n\
+         \x20\x20\x20\x20notify: [restart]\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    assert!(!dir.path().join("log.txt").exists());
+}
+
+#[test]
+fn unknown_notify_target_is_rejected_upfront() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Bad notify\n\
+         tasks:\n\
+         \x20\x20- name: t1\n\
+         \x20\x20\x20\x20run: echo hi >> log.txt\n\
+         \x20\x20\x20\x20notify: [nonexistent]\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().failure();
+    // The task never actually ran — validation happens before any task executes.
+    assert!(!dir.path().join("log.txt").exists());
+}
+
+#[test]
+fn env_templating_resolves_from_the_process_environment() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Env template test\n\
+         tasks:\n\
+         \x20\x20- name: use env var\n\
+         \x20\x20\x20\x20run: echo \"{{env.TOOLER_TEST_VAR}}\" >> log.txt\n",
+    )
+    .unwrap();
+
+    cmd.env("TOOLER_TEST_VAR", "hello-env")
+        .args(["play", "playbook.yml"])
+        .assert()
+        .success();
+
+    let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+    assert_eq!(log.trim(), "hello-env");
+}
+
+#[test]
+fn secret_templating_leaves_token_literal_when_unresolvable() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Secret template test\n\
+         tasks:\n\
+         \x20\x20- name: use secret\n\
+         \x20\x20\x20\x20run: echo \"{{secret.definitely_not_a_real_profile_xyz.token}}\" >> log.txt\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+    assert!(log.contains("{{secret.definitely_not_a_real_profile_xyz.token}}"));
+}
