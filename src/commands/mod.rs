@@ -14,6 +14,7 @@ pub mod git;
 pub mod group;
 pub mod http;
 pub mod info;
+pub mod jobs;
 pub mod json;
 pub mod logs;
 pub mod mcp;

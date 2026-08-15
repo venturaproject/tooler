@@ -772,3 +772,47 @@ fn timeout_without_run_is_rejected() {
 
     cmd.args(["play", "playbook.yml"]).assert().failure();
 }
+
+#[test]
+fn sync_db_reports_a_structured_failure_against_an_unreachable_server() {
+    // Same "point a throwaway server profile at an unreachable port" trick as
+    // fleet_servers_field_is_templated — proves sync_db: actually reaches out over SSH
+    // and fails cleanly rather than hanging, without needing real DB infra.
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args([
+            "server",
+            "add",
+            "realserver",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "1",
+        ])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: DB sync test\n\
+         tasks:\n\
+         \x20\x20- name: sync\n\
+         \x20\x20\x20\x20sync_db:\n\
+         \x20\x20\x20\x20\x20\x20server: realserver\n\
+         \x20\x20\x20\x20\x20\x20from:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20engine: mysql\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20host: 127.0.0.1\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20database: a\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20user: u\n\
+         \x20\x20\x20\x20\x20\x20to:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20engine: mysql\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20host: 127.0.0.1\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20database: b\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20user: u\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure();
+}

@@ -12,6 +12,7 @@
   - [tooler info](#tooler-info)
   - [tooler env](#tooler-env)
   - [tooler http](#tooler-http)
+  - [tooler jobs](#tooler-jobs)
   - [tooler check](#tooler-check)
   - [tooler json](#tooler-json)
   - [tooler run](#tooler-run)
@@ -204,6 +205,31 @@ Like `token`, `client_secret` and `refresh_token` are stored only in the OS cred
 
 ---
 
+### tooler jobs
+
+Search job listings via [Adzuna](https://developer.adzuna.com/) (free API, instant self-serve key). Defaults to `desarrollador` roles in Madrid, Spain — Spanish keywords match Spain listings noticeably better than their English translations (e.g. `desarrollador` over `developer`).
+
+```sh
+tooler jobs configure --app-id <id> --app-key <key>     # one-time, stores in the OS keychain
+tooler jobs categories                                   # list valid --category tags for Spain
+tooler jobs search                                       # desarrollador jobs in Madrid (defaults)
+tooler jobs search --what "desarrollador java" --where barcelona
+tooler jobs search --category it-jobs --where madrid     # filter by sector, not just keyword
+tooler jobs search --what developer --country gb --where london --results 10
+```
+
+| Command | Description |
+|---|---|
+| `search` | Search listings — `--what`, `--where`, `--country`, `--category`, `--page`, `--results` |
+| `categories` | List valid `--category` tags for a country (`--country`) |
+| `configure` | Store `--app-id`/`--app-key` in the OS keychain for the active profile |
+
+`--category` filters by sector using Adzuna's own taxonomy (e.g. `it-jobs`, `engineering-jobs`) rather than relying on keyword matching alone — run `tooler jobs categories` to see the exact tags available for a country.
+
+Credentials are resolved in this order: `--app-id`/`--app-key` flags → `TOOLER_ADZUNA_APP_ID`/`TOOLER_ADZUNA_APP_KEY` env vars → the OS keychain (set via `configure`). `tooler jobs configure` is CLI-only — it's deliberately not exposed as an MCP tool, since an agent storing a credential through a tool call would mean the credential passes through the LLM's context.
+
+---
+
 ### tooler check
 
 Health-check URLs and TCP ports.
@@ -324,6 +350,8 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `assert: "<condition>"` | Fail the task immediately (not skip) unless the condition holds |
 | `block: [...]` | Run a list of tasks as a unit, with `rescue:`/`always:` |
 | `debug: "<message>"` | Print a rendered message; no side effects |
+| `sync_db: {server, from, to}` | Dump `from`'s database and restore it into `to`'s, both reached through the same server |
+| `sync_files: {server, from, to, delete}` | Rsync a directory from one path to another on the same server |
 
 ```yaml
 tasks:
@@ -363,6 +391,42 @@ tasks:
 `block:`/`rescue:`/`always:` run in that order — `rescue:` only if `block:` failed (and, if it succeeds, the block is considered recovered), `always:` unconditionally afterward regardless of outcome (and a failure there fails the block even after a successful rescue). Like `include:`, a `block:` counts as a single ok/failed task in the parent's recap — its own tasks print for visibility but aren't flattened into the parent's totals. Nested tasks get the full `when:`/`loop:`/`retries:`/`register:` support, and can themselves contain another `block:`.
 
 `ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed; `parallel: true` runs all targeted servers concurrently instead of one at a time (same flag as `tooler fleet exec/check --parallel`, see [`tooler fleet`](#tooler-fleet)). `ssh:`'s `server:` and `fleet:`'s `servers:`/`group:` are all rendered through `{{var}}` like any other field, so the target can be chosen at invocation time — `fleet: {group: "{{target}}"}` plus `tooler play deploy --var target=web-canary` — instead of hardcoded in the YAML.
+
+`sync_db:` and `sync_files:` align a dev environment with production **on the same
+server** — e.g. two Laravel apps sharing one host, each with its own database and
+`storage/`. `sync_db:` dumps `from`'s database and restores it into `to`'s in one step,
+piping the dump straight from SSH to SSH — it never touches local disk. Each side
+(`from:`/`to:`) is either `env: <remote .env path>` (reads `DB_*` credentials from a
+dotenv-style file, same as `tooler db backup/restore --env`) or explicit
+`engine:`/`host:`/`port:`/`database:`/`user:`/`password:` fields. `sync_files:` runs
+`rsync -a` between two remote paths on the same server, automatically appending a
+trailing `/` to `from:` if missing (a well-known rsync footgun — without it, the source
+directory is copied *into* the destination instead of its contents landing there); pass
+`delete: true` to also remove destination files no longer present in `from:`.
+
+```yaml
+tasks:
+  - name: Sync production DB into dev
+    sync_db:
+      server: serv00
+      from:
+        env: backend_prod/.env
+      to:
+        env: backend_dev/.env
+
+  - name: Sync uploaded files into dev
+    sync_files:
+      server: serv00
+      from: backend_prod/storage/app/public
+      to: backend_dev/storage/app/public
+      delete: true
+```
+
+Inherited from `tooler db backup`/`restore` (see [`tooler db`](#tooler-db)): a MySQL
+restore includes `DROP TABLE IF EXISTS`, so it cleanly overwrites existing tables; a
+Postgres restore has no `--clean` step, so restoring into a **non-empty** database can
+error on `CREATE TABLE` — if `to:`'s database already has data and you need a truly clean
+sync, add a preceding `ssh:`/`run:` task that drops and recreates the target schema.
 
 `include:` resolves a bare name against `playbooks/` (same lookup as the top-level command) or a path relative to *this playbook's own directory*; the included playbook shares the same live variables (so it can read what the parent has set/registered, and anything it registers is visible back in the parent afterward), runs its own tasks unfiltered by the parent's `--tags`, and counts as a single ok/failed task in the parent's recap — its own tasks aren't flattened into the parent's totals. Include cycles are rejected with a clear error rather than hanging.
 

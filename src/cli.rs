@@ -3,9 +3,9 @@ use crate::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, cron::CronArgs,
         db::DbArgs, deploy::DeployArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs,
         fleet::FleetArgs, fs::FsArgs, gh::GhArgs, git::GitArgs, group::GroupArgs, http::HttpArgs,
-        info::InfoArgs, json::JsonArgs, logs::LogsArgs, mcp::McpArgs, play::PlayArgs, ps::PsArgs,
-        report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs,
-        stat::StatArgs, systemd::SystemdArgs,
+        info::InfoArgs, jobs::JobsArgs, json::JsonArgs, logs::LogsArgs, mcp::McpArgs,
+        play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs,
+        server::ServerArgs, ssh::SshArgs, stat::StatArgs, systemd::SystemdArgs,
     },
     output::OutputFormat,
 };
@@ -48,6 +48,9 @@ pub enum Commands {
 
     /// Make HTTP requests (GET, POST) with profile auth
     Http(HttpArgs),
+
+    /// Search job listings (Adzuna)
+    Jobs(JobsArgs),
 
     /// Health-check URLs and TCP ports
     Check(CheckArgs),

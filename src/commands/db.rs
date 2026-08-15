@@ -202,15 +202,16 @@ pub fn run(args: DbArgs, ctx: &Context) -> Result<()> {
 
 /// Database connection parameters shared by `query`, `backup`, and `restore`: either
 /// `env` (a remote dotenv-style file to read DB_* credentials from) or the explicit
-/// engine/host/port/database/user/password fields.
-struct ConnOpts<'a> {
-    env: Option<&'a str>,
-    engine: Option<&'a str>,
-    host: Option<&'a str>,
-    port: Option<u16>,
-    database: Option<&'a str>,
-    user: Option<&'a str>,
-    password: Option<&'a str>,
+/// engine/host/port/database/user/password fields. `pub(crate)` so `tooler play`'s
+/// `sync_db:` task type can reuse the same credential-resolution logic.
+pub(crate) struct ConnOpts<'a> {
+    pub(crate) env: Option<&'a str>,
+    pub(crate) engine: Option<&'a str>,
+    pub(crate) host: Option<&'a str>,
+    pub(crate) port: Option<u16>,
+    pub(crate) database: Option<&'a str>,
+    pub(crate) user: Option<&'a str>,
+    pub(crate) password: Option<&'a str>,
 }
 
 fn fail(json: bool, message: String) -> Result<()> {
@@ -221,7 +222,7 @@ fn fail(json: bool, message: String) -> Result<()> {
     bail!(message);
 }
 
-fn resolve_credentials(server: &Server, opts: &ConnOpts) -> Result<Credentials> {
+pub(crate) fn resolve_credentials(server: &Server, opts: &ConnOpts) -> Result<Credentials> {
     if let Some(path) = opts.env {
         return db::credentials_from_remote_env(server, path);
     }

@@ -122,6 +122,14 @@ struct Task {
     /// rather than silently not honoring it.
     #[serde(default)]
     timeout: Option<u64>,
+    /// Dump `from`'s database and restore it into `to`'s, both reached through the same
+    /// `server:` SSH profile. Dump bytes stay in memory the whole way — never written to
+    /// local disk.
+    sync_db: Option<DbSyncSpec>,
+    /// Rsync a directory from one path to another on the same `server:`. `from` gets a
+    /// trailing slash appended if missing, so it always copies contents, not the
+    /// directory itself (see `ensure_trailing_slash`).
+    sync_files: Option<SyncFilesSpec>,
 }
 
 /// One `loop:` item — a plain scalar (`{{item}}`) or a map (`{{item.<field>}}` per key).
@@ -160,6 +168,46 @@ struct FleetSpec {
 }
 
 #[derive(Debug, Deserialize)]
+struct DbSyncSpec {
+    /// Server profile to run mysqldump/pg_dump + mysql/psql through (both sides)
+    server: String,
+    from: DbSyncSide,
+    to: DbSyncSide,
+}
+
+/// One side of a `sync_db:` task — either `env:` (a remote dotenv-style file, e.g. a
+/// Laravel `.env`, to read DB_* credentials from) or the explicit fields. Mirrors
+/// `commands::db::ConnOpts`, which `resolve_db_sync_creds` delegates to.
+#[derive(Debug, Deserialize, Default)]
+struct DbSyncSide {
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncFilesSpec {
+    /// Server profile (see: tooler server list)
+    server: String,
+    from: String,
+    to: String,
+    /// Pass `--delete` to rsync, removing destination files no longer present in `from`
+    #[serde(default)]
+    delete: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct CheckPortSpec {
     host: String,
     port: u16,
@@ -188,6 +236,18 @@ fn default_env_target() -> String {
 /// `<project_root>/playbooks/<name>.yml` (then `.yaml`).
 fn is_literal_path(s: &str) -> bool {
     s.contains('/') || s.ends_with(".yml") || s.ends_with(".yaml")
+}
+
+/// Appends a trailing `/` to `path` if missing — rsync only copies a source directory's
+/// *contents* when the source path ends in `/`; without it, the directory itself gets
+/// nested one level deeper inside the destination. A well-known footgun `sync_files:`
+/// guards against automatically.
+fn ensure_trailing_slash(path: &str) -> String {
+    if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    }
 }
 
 fn resolve_playbook_file(file: &str, project_root: &Path) -> Result<PathBuf> {
@@ -1010,6 +1070,94 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.sync_db {
+        let server_name = render(&spec.server, vars);
+        let describe_side = |side: &DbSyncSide| -> String {
+            side.database
+                .as_deref()
+                .or(side.env.as_deref())
+                .map(|s| render(s, vars))
+                .unwrap_or_default()
+        };
+        let from_creds_preview = describe_side(&spec.from);
+        let to_creds_preview = describe_side(&spec.to);
+        if !env.quiet {
+            println!(
+                "  {} db sync {} → {} on {}",
+                "→".bold(),
+                from_creds_preview.dimmed(),
+                to_creds_preview.dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let from_creds = resolve_db_sync_creds(&server, &spec.from, vars)?;
+            let to_creds = resolve_db_sync_creds(&server, &spec.to, vars)?;
+            let dump_cmd = crate::db::dump_command(&from_creds, true);
+            let bytes = crate::db::ssh_exec_capture_bytes(&server, &dump_cmd)?;
+            let restore_cmd = crate::db::restore_command(&to_creds, true);
+            let (_, stderr, success) =
+                crate::db::ssh_exec_with_stdin(&server, &restore_cmd, &bytes)?;
+            if !success {
+                bail!("db sync failed: {}", stderr.trim());
+            }
+            if !env.quiet {
+                println!(
+                    "  {} synced {} bytes into {}",
+                    "✓ ok".green().bold(),
+                    bytes.len(),
+                    to_creds.database.cyan()
+                );
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), bytes.len().to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.sync_files {
+        let server_name = render(&spec.server, vars);
+        let from = ensure_trailing_slash(&render(&spec.from, vars));
+        let to = render(&spec.to, vars);
+        if !env.quiet {
+            println!(
+                "  {} rsync {} → {} on {}",
+                "→".bold(),
+                from.dimmed(),
+                to.dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let cmd = format!(
+                "rsync -a{} {} {}",
+                if spec.delete { " --delete" } else { "" },
+                crate::db::shell_quote(&from),
+                crate::db::shell_quote(&to),
+            );
+            let (stdout, stderr, success) = crate::db::ssh_exec_capture_lenient(&server, &cmd)?;
+            if success {
+                let out = stdout.trim();
+                if !env.quiet {
+                    if !out.is_empty() {
+                        println!("{out}");
+                    }
+                    println!("  {} synced", "✓ ok".green().bold());
+                }
+                if let Some(reg) = &task.register {
+                    vars.insert(reg.clone(), out.to_string());
+                }
+            } else {
+                let err = stderr.trim();
+                bail!("{}", if err.is_empty() { "rsync failed" } else { err });
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(include_file) = &task.include {
         let rendered = render(include_file, vars);
         let include_path = resolve_include_path(&rendered, env)?;
@@ -1069,9 +1217,38 @@ fn run_task_once(
 
     bail!(
         "task '{}' has no action (run, check_url, check_port, env_check, ssh, fleet, include, \
-         assert, block, debug)",
+         assert, block, debug, sync_db, sync_files)",
         task.name
     );
+}
+
+/// Builds `Credentials` for one side of a `sync_db:` task, rendering each field through
+/// `render()` first, then delegating to `commands::db::resolve_credentials` — the exact
+/// same engine/host/port/database/user/password resolution `tooler db backup`/`restore`
+/// already use, so `sync_db:` inherits the same validation and `--env`-file support.
+fn resolve_db_sync_creds(
+    server: &crate::config::Server,
+    side: &DbSyncSide,
+    vars: &HashMap<String, String>,
+) -> Result<crate::db::Credentials> {
+    let env = side.env.as_deref().map(|s| render(s, vars));
+    let engine = side.engine.as_deref().map(|s| render(s, vars));
+    let host = side.host.as_deref().map(|s| render(s, vars));
+    let database = side.database.as_deref().map(|s| render(s, vars));
+    let user = side.user.as_deref().map(|s| render(s, vars));
+    let password = side.password.as_deref().map(|s| render(s, vars));
+    crate::commands::db::resolve_credentials(
+        server,
+        &crate::commands::db::ConnOpts {
+            env: env.as_deref(),
+            engine: engine.as_deref(),
+            host: host.as_deref(),
+            port: side.port,
+            database: database.as_deref(),
+            user: user.as_deref(),
+            password: password.as_deref(),
+        },
+    )
 }
 
 /// Spawns `cmd`, optionally capturing stdout (draining it on a concurrent reader thread
@@ -1651,5 +1828,94 @@ mod tests {
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+    }
+
+    #[test]
+    fn ensure_trailing_slash_appends_when_missing_and_is_idempotent() {
+        assert_eq!(ensure_trailing_slash("/a/b"), "/a/b/");
+        assert_eq!(ensure_trailing_slash("/a/b/"), "/a/b/");
+    }
+
+    #[test]
+    fn db_sync_spec_deserializes_env_and_explicit_sides() {
+        let spec: DbSyncSpec = serde_yaml::from_str(
+            "server: serv00\n\
+             from:\n  env: backend_prod/.env\n\
+             to:\n  engine: mysql\n  host: localhost\n  database: dev_db\n  user: root\n",
+        )
+        .unwrap();
+        assert_eq!(spec.server, "serv00");
+        assert_eq!(spec.from.env.as_deref(), Some("backend_prod/.env"));
+        assert_eq!(spec.to.database.as_deref(), Some("dev_db"));
+        assert_eq!(spec.to.engine.as_deref(), Some("mysql"));
+    }
+
+    #[test]
+    fn sync_files_spec_deserializes() {
+        let spec: SyncFilesSpec = serde_yaml::from_str(
+            "server: serv00\nfrom: /a/prod/storage\nto: /a/dev/storage\ndelete: true\n",
+        )
+        .unwrap();
+        assert_eq!(spec.from, "/a/prod/storage");
+        assert!(spec.delete);
+    }
+
+    #[test]
+    fn sync_db_and_sync_files_support_register() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        // dry: true — only the upfront register-validation guard runs, no real SSH.
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+
+        let task = Task {
+            register: Some("x".to_string()),
+            sync_db: Some(DbSyncSpec {
+                server: "serv00".to_string(),
+                from: DbSyncSide::default(),
+                to: DbSyncSide::default(),
+            }),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+
+        let task = Task {
+            register: Some("x".to_string()),
+            sync_files: Some(SyncFilesSpec {
+                server: "serv00".to_string(),
+                from: "/a".to_string(),
+                to: "/b".to_string(),
+                delete: false,
+            }),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+    }
+
+    #[test]
+    fn sync_files_rejects_timeout() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            timeout: Some(5),
+            sync_files: Some(SyncFilesSpec {
+                server: "serv00".to_string(),
+                from: "/a".to_string(),
+                to: "/b".to_string(),
+                delete: false,
+            }),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
     }
 }

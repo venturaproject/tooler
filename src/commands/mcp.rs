@@ -309,6 +309,31 @@ struct HttpPostArgs {
     profile: Option<String>,
 }
 
+// ── jobs ──────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct JobsSearchArgs {
+    /// Role/keywords to search for (default: desarrollador — Spanish terms match Spain
+    /// listings much better than English ones)
+    what: Option<String>,
+    /// Location to search in (default: madrid)
+    r#where: Option<String>,
+    /// Adzuna country code, e.g. es, gb, us, de, fr (default: es)
+    country: Option<String>,
+    /// Sector/category tag, e.g. it-jobs, engineering-jobs — see tooler_jobs_categories
+    category: Option<String>,
+    /// Result page, 1-indexed
+    page: Option<u32>,
+    /// Results per page (Adzuna max: 50)
+    results: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct JobsCategoriesArgs {
+    /// Adzuna country code, e.g. es, gb, us, de, fr (default: es)
+    country: Option<String>,
+}
+
 // ── check ─────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
@@ -1097,6 +1122,45 @@ impl ToolerMcp {
         push_repeated(&mut argv, "--header", &args.headers);
         push_opt_num(&mut argv, "--timeout", args.timeout);
         push_opt(&mut argv, "--profile", &args.profile);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Search job listings via Adzuna (defaults: 'desarrollador' roles in \
+                        Madrid, Spain -- Spanish keywords match Spain listings much better \
+                        than English ones). Never accepts Adzuna credentials as a tool argument -- set \
+                        TOOLER_ADZUNA_APP_ID/TOOLER_ADZUNA_APP_KEY in the MCP server's own \
+                        environment, or run `tooler jobs configure` on the CLI to store them \
+                        in the OS keychain for the active profile (CLI-only, by design).",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_jobs_search(
+        &self,
+        Parameters(args): Parameters<JobsSearchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["jobs".to_string(), "search".to_string()];
+        push_opt(&mut argv, "--what", &args.what);
+        push_opt(&mut argv, "--where", &args.r#where);
+        push_opt(&mut argv, "--country", &args.country);
+        push_opt(&mut argv, "--category", &args.category);
+        push_opt_num(&mut argv, "--page", args.page);
+        push_opt_num(&mut argv, "--results", args.results);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "List valid Adzuna sector/category tags for a country (e.g. it-jobs, \
+                        engineering-jobs) -- use a returned tag as `category` in \
+                        tooler_jobs_search to filter by sector. Never accepts Adzuna \
+                        credentials as a tool argument -- see tooler_jobs_search.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_jobs_categories(
+        &self,
+        Parameters(args): Parameters<JobsCategoriesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["jobs".to_string(), "categories".to_string()];
+        push_opt(&mut argv, "--country", &args.country);
         self.exec_self(argv, &None).await
     }
 

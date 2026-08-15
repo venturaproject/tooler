@@ -168,7 +168,11 @@ pub fn dump_command(creds: &Credentials, gzip: bool) -> String {
             shell_quote(&creds.database),
         ),
         Engine::MySql => format!(
-            "MYSQL_PWD={} mysqldump --single-transaction --connect-timeout=10 -h {} -P {} -u {} {}",
+            // mysqldump has no --connect-timeout flag (unlike the `mysql` client used by
+            // restore_command below) — passing one makes it exit immediately with
+            // "unknown variable", which the `| gzip -c` pipe then silently turns into an
+            // empty-but-"successful" dump.
+            "MYSQL_PWD={} mysqldump --single-transaction -h {} -P {} -u {} {}",
             shell_quote(&creds.password),
             shell_quote(&creds.host),
             creds.port,

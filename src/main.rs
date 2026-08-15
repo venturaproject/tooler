@@ -33,6 +33,7 @@ fn main() -> Result<()> {
         Commands::Json(args) => commands::json::run(args, &ctx),
         Commands::Env(args) => commands::env::run(args, &ctx),
         Commands::Http(args) => commands::http::run(args, &ctx),
+        Commands::Jobs(args) => commands::jobs::run(args, &ctx),
         Commands::Check(args) => commands::check::run(args, &ctx),
         Commands::Run(args) => commands::run::run(args, &ctx),
         Commands::Play(args) => commands::play::run(args, &ctx),
