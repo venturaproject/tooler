@@ -28,6 +28,21 @@ pub enum JobsSubcommand {
         /// Sector/category tag (e.g. it-jobs, engineering-jobs) — see: tooler jobs categories
         #[arg(long)]
         category: Option<String>,
+        /// Exclude listings matching this keyword (e.g. --exclude java)
+        #[arg(long)]
+        exclude: Option<String>,
+        /// Minimum salary (annual, in the country's currency)
+        #[arg(long)]
+        salary_min: Option<u32>,
+        /// Only listings posted within this many days
+        #[arg(long)]
+        max_days_old: Option<u32>,
+        /// Sort order: date, relevance, or salary (default: relevance)
+        #[arg(long)]
+        sort_by: Option<String>,
+        /// Match --what against the job title only, not the full description (more precise)
+        #[arg(long)]
+        title_only: bool,
         /// Result page, 1-indexed
         #[arg(long, default_value_t = 1)]
         page: u32,
@@ -154,6 +169,11 @@ pub fn run(args: JobsArgs, ctx: &Context) -> Result<()> {
             r#where,
             country,
             category,
+            exclude,
+            salary_min,
+            max_days_old,
+            sort_by,
+            title_only,
             page,
             results,
             app_id,
@@ -161,14 +181,21 @@ pub fn run(args: JobsArgs, ctx: &Context) -> Result<()> {
         } => {
             let (app_id, app_key) = resolve_adzuna_creds(app_id, app_key, ctx)?;
             search(
-                &what,
-                &r#where,
-                &country,
-                category.as_deref(),
-                page,
-                results,
-                &app_id,
-                &app_key,
+                SearchParams {
+                    what: &what,
+                    r#where: &r#where,
+                    country: &country,
+                    category: category.as_deref(),
+                    exclude: exclude.as_deref(),
+                    salary_min,
+                    max_days_old,
+                    sort_by: sort_by.as_deref(),
+                    title_only,
+                    page,
+                    results,
+                    app_id: &app_id,
+                    app_key: &app_key,
+                },
                 ctx,
             )
         }
@@ -195,33 +222,67 @@ fn configure(app_id: &str, app_key: &str, ctx: &Context) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn search(
-    what: &str,
-    r#where: &str,
-    country: &str,
-    category: Option<&str>,
+struct SearchParams<'a> {
+    what: &'a str,
+    r#where: &'a str,
+    country: &'a str,
+    category: Option<&'a str>,
+    exclude: Option<&'a str>,
+    salary_min: Option<u32>,
+    max_days_old: Option<u32>,
+    sort_by: Option<&'a str>,
+    title_only: bool,
     page: u32,
     results: u32,
-    app_id: &str,
-    app_key: &str,
-    ctx: &Context,
-) -> Result<()> {
+    app_id: &'a str,
+    app_key: &'a str,
+}
+
+fn search(params: SearchParams, ctx: &Context) -> Result<()> {
+    let SearchParams {
+        what,
+        r#where,
+        country,
+        category,
+        exclude,
+        salary_min,
+        max_days_old,
+        sort_by,
+        title_only,
+        page,
+        results,
+        app_id,
+        app_key,
+    } = params;
+
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
     let url = format!("https://api.adzuna.com/v1/api/jobs/{country}/search/{page}");
 
+    let what_field = if title_only { "title_only" } else { "what" };
     let mut query = vec![
         ("app_id".to_string(), app_id.to_string()),
         ("app_key".to_string(), app_key.to_string()),
-        ("what".to_string(), what.to_string()),
+        (what_field.to_string(), what.to_string()),
         ("where".to_string(), r#where.to_string()),
         ("results_per_page".to_string(), results.to_string()),
         ("content-type".to_string(), "application/json".to_string()),
     ];
     if let Some(category) = category {
         query.push(("category".to_string(), category.to_string()));
+    }
+    if let Some(exclude) = exclude {
+        query.push(("what_exclude".to_string(), exclude.to_string()));
+    }
+    if let Some(salary_min) = salary_min {
+        query.push(("salary_min".to_string(), salary_min.to_string()));
+    }
+    if let Some(max_days_old) = max_days_old {
+        query.push(("max_days_old".to_string(), max_days_old.to_string()));
+    }
+    if let Some(sort_by) = sort_by {
+        query.push(("sort_by".to_string(), sort_by.to_string()));
     }
 
     let resp = client

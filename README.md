@@ -215,16 +215,20 @@ tooler jobs categories                                   # list valid --category
 tooler jobs search                                       # desarrollador jobs in Madrid (defaults)
 tooler jobs search --what "desarrollador java" --where barcelona
 tooler jobs search --category it-jobs --where madrid     # filter by sector, not just keyword
+tooler jobs search --salary-min 40000 --exclude java      # minimum salary, exclude a keyword
+tooler jobs search --max-days-old 3 --title-only           # posted in the last 3 days, precise title match
 tooler jobs search --what developer --country gb --where london --results 10
 ```
 
 | Command | Description |
 |---|---|
-| `search` | Search listings — `--what`, `--where`, `--country`, `--category`, `--page`, `--results` |
+| `search` | Search listings — `--what`, `--where`, `--country`, `--category`, `--exclude`, `--salary-min`, `--max-days-old`, `--sort-by`, `--title-only`, `--page`, `--results` |
 | `categories` | List valid `--category` tags for a country (`--country`) |
 | `configure` | Store `--app-id`/`--app-key` in the OS keychain for the active profile |
 
-`--category` filters by sector using Adzuna's own taxonomy (e.g. `it-jobs`, `engineering-jobs`) rather than relying on keyword matching alone — run `tooler jobs categories` to see the exact tags available for a country.
+`--category` filters by sector using Adzuna's own taxonomy (e.g. `it-jobs`, `engineering-jobs`) rather than relying on keyword matching alone — run `tooler jobs categories` to see the exact tags available for a country. `--title-only` matches `--what` against just the job title instead of the full description, for a more precise (if narrower) match.
+
+`--sort-by date` trades relevance for recency — Adzuna's own ranking, not `tooler`'s: combined with other filters it can surface listings that only loosely match `--what`, since it de-prioritizes the relevance signal that keyword matching relies on. Leave `--sort-by` unset (the default) when result relevance matters more than freshness.
 
 Credentials are resolved in this order: `--app-id`/`--app-key` flags → `TOOLER_ADZUNA_APP_ID`/`TOOLER_ADZUNA_APP_KEY` env vars → the OS keychain (set via `configure`). `tooler jobs configure` is CLI-only — it's deliberately not exposed as an MCP tool, since an agent storing a credential through a tool call would mean the credential passes through the LLM's context.
 

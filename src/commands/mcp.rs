@@ -322,6 +322,16 @@ struct JobsSearchArgs {
     country: Option<String>,
     /// Sector/category tag, e.g. it-jobs, engineering-jobs — see tooler_jobs_categories
     category: Option<String>,
+    /// Exclude listings matching this keyword (e.g. "java")
+    exclude: Option<String>,
+    /// Minimum salary (annual, in the country's currency)
+    salary_min: Option<u32>,
+    /// Only listings posted within this many days
+    max_days_old: Option<u32>,
+    /// Sort order: date, relevance, or salary (default: relevance)
+    sort_by: Option<String>,
+    /// Match `what` against the job title only, not the full description (more precise)
+    title_only: Option<bool>,
     /// Result page, 1-indexed
     page: Option<u32>,
     /// Results per page (Adzuna max: 50)
@@ -1143,6 +1153,11 @@ impl ToolerMcp {
         push_opt(&mut argv, "--where", &args.r#where);
         push_opt(&mut argv, "--country", &args.country);
         push_opt(&mut argv, "--category", &args.category);
+        push_opt(&mut argv, "--exclude", &args.exclude);
+        push_opt_num(&mut argv, "--salary-min", args.salary_min);
+        push_opt_num(&mut argv, "--max-days-old", args.max_days_old);
+        push_opt(&mut argv, "--sort-by", &args.sort_by);
+        push_flag(&mut argv, "--title-only", args.title_only.unwrap_or(false));
         push_opt_num(&mut argv, "--page", args.page);
         push_opt_num(&mut argv, "--results", args.results);
         self.exec_self(argv, &None).await
