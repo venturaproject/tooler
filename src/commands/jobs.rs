@@ -81,6 +81,19 @@ struct Listing {
     redirect_url: String,
 }
 
+impl Listing {
+    /// "Company · Location", or just "Location" when Adzuna didn't return a company name
+    /// (common for confidential/agency-posted listings) — avoids a dangling "· Location"
+    /// with a blank leading space.
+    fn company_location_line(&self) -> String {
+        if self.company.is_empty() {
+            self.location.clone()
+        } else {
+            format!("{} · {}", self.company, self.location)
+        }
+    }
+}
+
 fn company_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     #[derive(Deserialize)]
     struct Company {
@@ -257,10 +270,7 @@ fn search(
     println!("{}", "─".repeat(50).dimmed());
     for job in &listings {
         println!("{}", job.title.bold());
-        println!(
-            "  {}",
-            format!("{} · {}", job.company, job.location).green()
-        );
+        println!("  {}", job.company_location_line().green());
         if let (Some(min), Some(max)) = (job.salary_min, job.salary_max) {
             println!("  {}", format!("€{min:.0} – €{max:.0}").yellow());
         }
@@ -331,6 +341,12 @@ fn categories(country: &str, app_id: &str, app_key: &str, ctx: &Context) -> Resu
 mod tests {
     use super::*;
     use crate::config::Config;
+    use std::sync::Mutex;
+
+    /// The real macOS Keychain (unlike config files) isn't sandboxed per-test, and
+    /// concurrent access from multiple #[test] threads is flaky in practice even across
+    /// distinct accounts — serialize every test that touches it behind this lock.
+    static KEYCHAIN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_ctx(profile: &str) -> Context {
         Context {
@@ -341,10 +357,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_adzuna_creds_prefers_explicit_over_stored() {
-        let ctx = test_ctx("jobs_test_explicit");
-        let _ = secrets::set_secret(&ctx.profile, "adzuna_app_id", "stored-id");
-        let _ = secrets::set_secret(&ctx.profile, "adzuna_app_key", "stored-key");
+    fn resolve_adzuna_creds_prefers_explicit_then_falls_back_to_stored_secret() {
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let ctx = test_ctx("jobs_test_creds");
+        secrets::set_secret(&ctx.profile, "adzuna_app_id", "stored-id").unwrap();
+        secrets::set_secret(&ctx.profile, "adzuna_app_key", "stored-key").unwrap();
 
         let (id, key) = resolve_adzuna_creds(
             Some("explicit-id".to_string()),
@@ -355,19 +372,9 @@ mod tests {
         assert_eq!(id, "explicit-id");
         assert_eq!(key, "explicit-key");
 
-        let _ = secrets::delete_secret(&ctx.profile, "adzuna_app_id");
-        let _ = secrets::delete_secret(&ctx.profile, "adzuna_app_key");
-    }
-
-    #[test]
-    fn resolve_adzuna_creds_falls_back_to_stored_secret() {
-        let ctx = test_ctx("jobs_test_fallback");
-        secrets::set_secret(&ctx.profile, "adzuna_app_id", "kc-id").unwrap();
-        secrets::set_secret(&ctx.profile, "adzuna_app_key", "kc-key").unwrap();
-
         let (id, key) = resolve_adzuna_creds(None, None, &ctx).unwrap();
-        assert_eq!(id, "kc-id");
-        assert_eq!(key, "kc-key");
+        assert_eq!(id, "stored-id");
+        assert_eq!(key, "stored-key");
 
         secrets::delete_secret(&ctx.profile, "adzuna_app_id").unwrap();
         secrets::delete_secret(&ctx.profile, "adzuna_app_key").unwrap();
@@ -375,6 +382,7 @@ mod tests {
 
     #[test]
     fn resolve_adzuna_creds_errors_with_setup_hint_when_missing() {
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
         let ctx = test_ctx("jobs_test_missing");
         let err = resolve_adzuna_creds(None, None, &ctx).unwrap_err();
         assert!(err.to_string().contains("tooler jobs configure"));
@@ -394,6 +402,29 @@ mod tests {
         assert_eq!(listing.location, "Madrid");
         assert_eq!(listing.salary_min, None);
         assert_eq!(listing.salary_max, None);
+    }
+
+    #[test]
+    fn company_location_line_omits_separator_when_company_is_empty() {
+        let raw = serde_json::json!({
+            "title": "Desarrollador",
+            "location": {"display_name": "Madrid"},
+            "redirect_url": "https://example.com/job/3"
+        });
+        let listing: Listing = serde_json::from_value(raw).unwrap();
+        assert_eq!(listing.company_location_line(), "Madrid");
+    }
+
+    #[test]
+    fn company_location_line_joins_company_and_location_when_both_present() {
+        let raw = serde_json::json!({
+            "title": "Desarrollador",
+            "company": {"display_name": "Acme"},
+            "location": {"display_name": "Madrid"},
+            "redirect_url": "https://example.com/job/4"
+        });
+        let listing: Listing = serde_json::from_value(raw).unwrap();
+        assert_eq!(listing.company_location_line(), "Acme · Madrid");
     }
 
     #[test]
