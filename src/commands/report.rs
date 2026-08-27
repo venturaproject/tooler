@@ -37,12 +37,26 @@ pub enum ReportSubcommand {
         #[arg(short, long, default_value = "Tooler Report")]
         title: String,
     },
+    /// Generate a self-contained HTML report from one or more JSON sources
+    Html {
+        /// Named JSON input: NAME=PATH (repeatable, `-` for stdin). Omit to read one JSON
+        /// document from stdin.
+        #[arg(short = 'i', long = "in")]
+        input: Vec<String>,
+        /// Output .html path
+        #[arg(short, long)]
+        out: String,
+        /// Report title
+        #[arg(short, long, default_value = "Tooler Report")]
+        title: String,
+    },
 }
 
 #[derive(Clone, Copy)]
 enum Format {
     Pdf,
     Excel,
+    Html,
 }
 
 impl Format {
@@ -50,6 +64,7 @@ impl Format {
         match self {
             Format::Pdf => "pdf",
             Format::Excel => "excel",
+            Format::Html => "html",
         }
     }
 }
@@ -61,6 +76,9 @@ pub fn run(args: ReportArgs, ctx: &Context) -> Result<()> {
         }
         ReportSubcommand::Excel { input, out, title } => {
             generate(Format::Excel, &input, &out, &title, ctx)
+        }
+        ReportSubcommand::Html { input, out, title } => {
+            generate(Format::Html, &input, &out, &title, ctx)
         }
     }
 }
@@ -85,6 +103,7 @@ fn generate(format: Format, input: &[String], out: &str, title: &str, ctx: &Cont
     let bytes = match format {
         Format::Pdf => report::pdf::build(title, &sources),
         Format::Excel => report::excel::build(title, &sources),
+        Format::Html => report::html::build(title, &sources),
     };
     let bytes = match bytes {
         Ok(b) => b,

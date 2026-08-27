@@ -1494,10 +1494,36 @@ impl ToolerMcp {
     }
 
     #[tool(
+        description = "Generate a self-contained HTML report (summary fields, tables, and \
+                        inline SVG bar charts, no external assets) from one or more JSON \
+                        files, typically the --output json result of another tooler command",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_report_html(
+        &self,
+        Parameters(args): Parameters<ReportArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["report".to_string(), "html".to_string()];
+        push_repeated(&mut argv, "--in", &args.input);
+        argv.push("--out".to_string());
+        argv.push(args.out.clone());
+        if let Some(title) = &args.title {
+            argv.push("--title".to_string());
+            argv.push(title.clone());
+        }
+        self.exec_self(argv, &args.cwd).await
+    }
+
+    #[tool(
         description = "Run a read-only SQL query (SELECT/SHOW/EXPLAIN/WITH/DESCRIBE) against a \
                         remote database by running psql/mysql directly on a server profile over \
                         SSH, returning rows as JSON — feed the result straight into \
-                        tooler_report_pdf/excel. \
+                        tooler_report_pdf/excel/html. \
                         Prefer `env` (a remote dotenv-style file, e.g. Laravel .env) to supply \
                         DB_* credentials rather than passing them explicitly; a DB password can \
                         never be passed as a tool argument — set TOOLER_DB_PASSWORD in the \
@@ -1598,7 +1624,7 @@ impl ToolerMcp {
         description = "List pull requests (title, labels, author, dates) via the `gh` CLI, \
                         optionally filtered to a created-date range. Requires `gh` installed \
                         and authenticated in the environment the tooler MCP server runs in. \
-                        Feed the JSON result straight into tooler_report_pdf/excel.",
+                        Feed the JSON result straight into tooler_report_pdf/excel/html.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn tooler_gh_prs(

@@ -1,4 +1,5 @@
 pub mod excel;
+pub mod html;
 pub mod pdf;
 
 use anyhow::{Context, Result};

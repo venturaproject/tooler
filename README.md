@@ -754,13 +754,16 @@ tooler doctor --output json
 
 ### tooler report
 
-Generate a PDF or Excel report from the JSON output of any other tooler command (or any JSON file shaped as an object/array). Array-of-objects fields become tables automatically, and any table with a numeric column gets an embedded bar chart — no manual layout work.
+Generate a PDF, Excel, or HTML report from the JSON output of any other tooler command (or any JSON file shaped as an object/array). Array-of-objects fields become tables automatically, and any table with a numeric column gets an embedded bar chart — no manual layout work.
 
 ```sh
 tooler doctor --output json > doctor.json
 tooler report pdf -i doctor=doctor.json -o report.pdf --title "Health Check"
 tooler report excel -i doctor=doctor.json -o report.xlsx
+tooler report html -i doctor=doctor.json -o report.html
 ```
+
+`html` produces one self-contained file — inline CSS, an inline SVG bar chart, no external assets — viewable in any browser with no PDF/Excel tooling; useful for a quick look or emailing/attaching without extra software.
 
 Pass `--in name=path` more than once to add multiple sections (PDF) / sheets (Excel):
 
