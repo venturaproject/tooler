@@ -429,6 +429,10 @@ struct PlayMcpArgs {
     /// Print the companion .md notes (if any) and exit without running any tasks
     #[serde(default)]
     notes: bool,
+    /// Auto-confirm every confirm: task instead of prompting. A confirm: task always
+    /// fails fast (never blocks) without this, since this MCP tool runs non-interactively.
+    #[serde(default)]
+    yes: bool,
     cwd: Option<String>,
 }
 
@@ -1330,7 +1334,9 @@ impl ToolerMcp {
     }
 
     #[tool(
-        description = "Run a YAML playbook (tasks, vars, health checks) or generate a sample",
+        description = "Run a YAML playbook (tasks, vars, health checks) or generate a sample. \
+                        A confirm: task in the playbook never blocks this tool waiting on \
+                        stdin — it fails fast unless yes=true is passed",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1350,6 +1356,7 @@ impl ToolerMcp {
         push_repeated(&mut argv, "--var", &args.vars);
         push_opt(&mut argv, "--tags", &args.tags);
         push_flag(&mut argv, "--init", args.init);
+        push_flag(&mut argv, "--yes", args.yes);
         push_flag(&mut argv, "--notes", args.notes);
         self.exec_self(argv, &args.cwd).await
     }

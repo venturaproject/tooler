@@ -33,6 +33,12 @@ pub struct PlayArgs {
     /// Print the companion playbooks/<name>.md notes (if any) and exit without running
     #[arg(long)]
     pub notes: bool,
+
+    /// Auto-confirm every `confirm:` task instead of prompting. Required for `confirm:`
+    /// tasks when running non-interactively (e.g. `--output json`, or driven by an agent
+    /// over MCP) — otherwise those tasks fail fast rather than block on stdin.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
@@ -137,6 +143,11 @@ struct Task {
     /// don't see each other (`HashMap` iteration order isn't defined) — split into
     /// separate tasks if one fact needs to build on another.
     set_fact: Option<HashMap<String, String>>,
+    /// Pause for a human `y`/`N` confirmation before continuing; the rendered message is
+    /// the prompt. Never blocks when driven non-interactively (`--output json`, which is
+    /// also the MCP/agent path) unless `--yes` was passed — it fails fast instead, so an
+    /// agent-driven `tooler play` can't hang forever on stdin. See `RunEnv.auto_yes`.
+    confirm: Option<String>,
     /// Kill the task if it runs longer than this many seconds. Only supported on
     /// `run:` — there's no process handle to kill for `ssh:`/`fleet:` without changing
     /// the shared SSH helper they route through, so those reject `timeout:` upfront
@@ -452,6 +463,9 @@ struct RunEnv<'a> {
     project_root: PathBuf,
     dry: bool,
     quiet: bool,
+    /// From `--yes` — auto-confirms every `confirm:` task instead of prompting or (when
+    /// `quiet`) failing fast.
+    auto_yes: bool,
     ctx: &'a Context,
 }
 
@@ -512,6 +526,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         project_root,
         dry: args.dry,
         quiet: ctx.output == OutputFormat::Json,
+        auto_yes: args.yes,
         ctx,
     };
 
@@ -1029,10 +1044,11 @@ fn run_task_once(
             || task.block.is_some()
             || task.debug.is_some()
             || task.set_fact.is_some()
-            || task.wait_for.is_some())
+            || task.wait_for.is_some()
+            || task.confirm.is_some())
     {
         bail!(
-            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug/set_fact/wait_for tasks"
+            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug/set_fact/wait_for/confirm tasks"
         );
     }
 
@@ -1060,6 +1076,42 @@ fn run_task_once(
     if let Some(msg) = &task.debug {
         println!("  {} {}", "ℹ".cyan().bold(), render(msg, vars));
         return Ok(());
+    }
+
+    if let Some(msg) = &task.confirm {
+        let rendered = render(msg, vars);
+        if env.dry {
+            if !env.quiet {
+                println!(
+                    "  {} (dry run — would prompt: {rendered})",
+                    "?".cyan().bold()
+                );
+            }
+            return Ok(());
+        }
+        if env.auto_yes {
+            if !env.quiet {
+                println!("  {} {rendered} — confirmed via --yes", "?".cyan().bold());
+            }
+            return Ok(());
+        }
+        if env.quiet {
+            bail!(
+                "confirm: '{rendered}' requires --yes when running non-interactively \
+                 (--output json, or driven by an agent over MCP) — it never blocks on stdin"
+            );
+        }
+        print!("  {} {rendered} [y/N] ", "?".cyan().bold());
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("failed to read confirm: answer from stdin")?;
+        let answer = input.trim().to_lowercase();
+        if answer == "y" || answer == "yes" {
+            return Ok(());
+        }
+        bail!("aborted at confirm: '{rendered}'");
     }
 
     if let Some(facts) = &task.set_fact {
@@ -1496,6 +1548,7 @@ fn run_task_once(
                 project_root: env.project_root.clone(),
                 dry: env.dry,
                 quiet: env.quiet,
+                auto_yes: env.auto_yes,
                 ctx: env.ctx,
             };
             include_stack.push(include_path);
@@ -1516,7 +1569,7 @@ fn run_task_once(
 
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
-         env_check, ssh, fleet, include, assert, block, debug, set_fact, sync_db, \
+         env_check, ssh, fleet, include, assert, block, debug, confirm, set_fact, sync_db, \
          sync_files)",
         task.name
     );
@@ -2150,13 +2203,7 @@ mod tests {
             "default".to_string(),
             crate::config::Config::default(),
         );
-        let env = RunEnv {
-            playbook_dir: PathBuf::from("."),
-            project_root: PathBuf::from("."),
-            dry: true,
-            quiet: true,
-            ctx: &ctx,
-        };
+        let env = dry_env(&ctx);
         let mut vars = HashMap::new();
         let mut include_stack = Vec::new();
 
@@ -2184,13 +2231,7 @@ mod tests {
         );
         // dry: true — no real subprocess runs, so this only exercises the upfront
         // register-validation guard, not actual command execution.
-        let env = RunEnv {
-            playbook_dir: PathBuf::from("."),
-            project_root: PathBuf::from("."),
-            dry: true,
-            quiet: true,
-            ctx: &ctx,
-        };
+        let env = dry_env(&ctx);
         let mut vars = HashMap::new();
         let mut include_stack = Vec::new();
         let task = Task {
@@ -2207,6 +2248,7 @@ mod tests {
             project_root: PathBuf::from("."),
             dry: true,
             quiet: true,
+            auto_yes: false,
             ctx,
         }
     }
@@ -2486,6 +2528,85 @@ mod tests {
         };
         assert_eq!(m.get("name"), Some(&"a".to_string()));
         assert_eq!(m.get("port"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn confirm_dry_run_is_a_noop() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx); // dry: true
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            confirm: Some("proceed?".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+    }
+
+    #[test]
+    fn confirm_bails_when_quiet_and_not_auto_yes() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        // quiet: true (inherited from dry_env), dry: false — the non-interactive/agent
+        // path with no --yes must fail fast instead of blocking on stdin.
+        let env = RunEnv {
+            dry: false,
+            ..dry_env(&ctx)
+        };
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            confirm: Some("proceed?".to_string()),
+            ..Default::default()
+        };
+        let err = run_task_once(&task, &mut vars, &mut include_stack, &env).unwrap_err();
+        assert!(err.to_string().contains("--yes"), "error was: {err}");
+    }
+
+    #[test]
+    fn confirm_succeeds_with_auto_yes_without_prompting() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = RunEnv {
+            dry: false,
+            auto_yes: true,
+            ..dry_env(&ctx)
+        };
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            confirm: Some("proceed?".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+    }
+
+    #[test]
+    fn confirm_rejects_register() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            register: Some("x".to_string()),
+            confirm: Some("proceed?".to_string()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
     }
 
     #[test]

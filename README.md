@@ -357,6 +357,7 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `assert: "<condition>"` | Fail the task immediately (not skip) unless the condition holds |
 | `block: [...]` | Run a list of tasks as a unit, with `rescue:`/`always:` |
 | `debug: "<message>"` | Print a rendered message; no side effects |
+| `confirm: "<message>"` | Pause for a human y/N confirmation before continuing |
 | `set_fact: {name: "<expr>", ...}` | Compute/override one or more vars from rendered expressions; no side effects |
 | `sync_db: {server, from, to}` | Dump `from`'s database and restore it into `to`'s, both reached through the same server |
 | `sync_files: {server, from, to, delete}` | Rsync a directory from one path to another on the same server |
@@ -460,6 +461,24 @@ tasks:
 ```
 
 `wait_for:` polls exactly one of `check_url:`/`check_port:`/`ssh:` (same shapes as the standalone actions) every `interval:` seconds (default 2) until it succeeds or `timeout:` (default 60) elapses, then fails with a clear timeout message. It's the poll-until-ready counterpart to `retries:` — `retries:` re-runs a whole task after it *fails*; `wait_for:` is for "keep checking until this becomes true," so it only logs a start line and the final outcome, not one line per attempt. `register:` isn't supported on it (nothing to capture beyond pass/fail).
+
+```yaml
+tasks:
+  - name: About to drop and restore the production database
+    confirm: "This will overwrite prod_db on {{host}}. Continue?"
+
+  - name: Sync production DB into dev
+    sync_db:
+      server: "{{host}}"
+      from: {database: prod_db}
+      to: {database: dev_db}
+```
+
+```sh
+tooler play deploy.yml --yes    # auto-confirms every confirm: task, no prompting
+```
+
+`confirm:` pauses for a human `y`/`N` answer (case-insensitive, anything but `y`/`yes` aborts the playbook) before letting the rest of the tasks run — a gate in front of something destructive, like the `sync_db:` above. It never blocks forever waiting on input it can't get: in `--dry` it just prints what it *would* have prompted and continues; when running non-interactively (`--output json` — which is also how the `tooler_play` MCP tool runs, so an agent driving a playbook over MCP hits this path) it fails immediately with a clear error unless `--yes` was passed, rather than hanging. `--yes` auto-confirms every `confirm:` task in the run without prompting at all (also available as `yes: true` on the MCP tool). `register:` isn't supported on it.
 
 `ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed; `parallel: true` runs all targeted servers concurrently instead of one at a time (same flag as `tooler fleet exec/check --parallel`, see [`tooler fleet`](#tooler-fleet)). `ssh:`'s `server:` and `fleet:`'s `servers:`/`group:` are all rendered through `{{var}}` like any other field, so the target can be chosen at invocation time — `fleet: {group: "{{target}}"}` plus `tooler play deploy --var target=web-canary` — instead of hardcoded in the YAML.
 
