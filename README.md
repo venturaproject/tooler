@@ -338,7 +338,10 @@ tooler play playbook.yml                    # run all tasks
 tooler play playbook.yml --dry              # preview without executing
 tooler play playbook.yml --tags build,test  # run only tagged tasks
 tooler play playbook.yml --var host=prod.example.com   # override a variable
+tooler play playbook.yml --start-at-task "run tests"   # skip ahead, rerun after a fix
 ```
+
+`--start-at-task <name>` skips straight to the named **top-level** task, treating every earlier task as already done — not run, not counted, no output. It's a practical rerun-after-a-fix tool, not a full `--resume`: there's no persisted run state, so a task after the start point that reads `{{a_var}}` registered by a now-skipped earlier task sees it unresolved, same as any other unknown token. Has no effect inside `include:`/`block:` — it only ever applies to the outermost playbook's own task list.
 
 **Available task actions:**
 
@@ -519,6 +522,41 @@ error on `CREATE TABLE` — if `to:`'s database already has data and you need a 
 sync, add a preceding `ssh:`/`run:` task that drops and recreates the target schema.
 
 `include:` resolves a bare name against `playbooks/` (same lookup as the top-level command) or a path relative to *this playbook's own directory*; the included playbook shares the same live variables (so it can read what the parent has set/registered, and anything it registers is visible back in the parent afterward), runs its own tasks unfiltered by the parent's `--tags`, and counts as a single ok/failed task in the parent's recap — its own tasks aren't flattened into the parent's totals. Include cycles are rejected with a clear error rather than hanging.
+
+```yaml
+tasks:
+  - name: Deploy the API service
+    include:
+      file: deploy-one-service.yml
+      vars:
+        service: api
+
+  - name: Deploy the web service
+    include:
+      file: deploy-one-service.yml
+      vars:
+        service: web
+```
+
+`include: <name-or-path>` (the bare form above) and `include: {file: <name-or-path>, vars: {...}}` are both valid — the `vars:` form lets one shared sub-playbook be called multiple times with different inputs, like a parameterized function, instead of copy-pasting it per target. Each `vars:` value is rendered against the *caller's* vars before the sub-playbook starts, and every overridden key is restored to whatever it was right after the sub-playbook returns — so the two calls above don't leak `service: web` into whatever runs after them, even though both share the same live variable scope otherwise.
+
+**`vars_files:`** — a playbook-level list of external files (paths relative to the playbook's own directory), each a flat `key: value` YAML map, same shape as `vars:`:
+
+```yaml
+# defaults.yml
+host: staging.example.com
+port: "8080"
+```
+
+```yaml
+name: Deploy
+vars_files: [defaults.yml]
+vars:
+  port: "9090"   # inline vars: overrides a vars_files: value
+tasks: [...]
+```
+
+Useful for splitting environment-specific values (`defaults.yml`, `prod.yml`) out of the playbook itself instead of hardcoding them or passing every one as `--var`. Precedence, low to high: `vars_files:` entries (in listed order, a later file overrides an earlier one) → inline `vars:` → `--var` on the command line, which still overrides everything.
 
 **Per-task modifiers**, usable with any action above:
 

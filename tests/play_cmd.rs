@@ -816,3 +816,108 @@ fn sync_db_reports_a_structured_failure_against_an_unreachable_server() {
         .assert()
         .failure();
 }
+
+#[test]
+fn vars_files_merge_precedence_file_then_inline_then_cli_var() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("defaults.yml"), "a: file\nb: file\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: VarsFiles\n\
+         vars_files: [defaults.yml]\n\
+         vars:\n\
+         \x20\x20b: inline\n\
+         \x20\x20c: inline\n\
+         tasks:\n\
+         \x20\x20- name: vars_files-only key survives\n\
+         \x20\x20\x20\x20assert: \"{{a}} == file\"\n\
+         \x20\x20- name: inline overrides vars_files\n\
+         \x20\x20\x20\x20assert: \"{{b}} == inline\"\n\
+         \x20\x20- name: cli --var overrides inline\n\
+         \x20\x20\x20\x20assert: \"{{c}} == cli\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--var", "c=cli"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn start_at_task_skips_earlier_tasks() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: StartAt\n\
+         tasks:\n\
+         \x20\x20- name: first\n\
+         \x20\x20\x20\x20run: exit 1\n\
+         \x20\x20- name: second\n\
+         \x20\x20\x20\x20run: echo second-ran\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args([
+            "--output",
+            "json",
+            "play",
+            "playbook.yml",
+            "--start-at-task",
+            "second",
+        ])
+        .assert()
+        .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(value["tasks"][0]["name"], "second");
+}
+
+#[test]
+fn include_with_vars_overrides_and_restores_between_calls() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("sub.yml"),
+        "name: Sub\n\
+         tasks:\n\
+         \x20\x20- name: register the service seen inside\n\
+         \x20\x20\x20\x20run: echo \"{{service}}\"\n\
+         \x20\x20\x20\x20register: seen_service\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Parent\n\
+         vars:\n\
+         \x20\x20service: default-service\n\
+         tasks:\n\
+         \x20\x20- name: call sub for api\n\
+         \x20\x20\x20\x20include:\n\
+         \x20\x20\x20\x20\x20\x20file: sub.yml\n\
+         \x20\x20\x20\x20\x20\x20vars:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20service: api\n\
+         \x20\x20- name: override took effect for api\n\
+         \x20\x20\x20\x20assert: \"{{seen_service}} == api\"\n\
+         \x20\x20- name: restored after first include\n\
+         \x20\x20\x20\x20assert: \"{{service}} == default-service\"\n\
+         \x20\x20- name: call sub for web\n\
+         \x20\x20\x20\x20include:\n\
+         \x20\x20\x20\x20\x20\x20file: sub.yml\n\
+         \x20\x20\x20\x20\x20\x20vars:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20service: web\n\
+         \x20\x20- name: override took effect for web\n\
+         \x20\x20\x20\x20assert: \"{{seen_service}} == web\"\n\
+         \x20\x20- name: restored after second include\n\
+         \x20\x20\x20\x20assert: \"{{service}} == default-service\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["success"], true);
+}

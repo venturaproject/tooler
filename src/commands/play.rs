@@ -39,6 +39,14 @@ pub struct PlayArgs {
     /// over MCP) — otherwise those tasks fail fast rather than block on stdin.
     #[arg(long)]
     pub yes: bool,
+
+    /// Skip ahead to the named top-level task, treating every earlier task as already
+    /// done (not run, not counted). A practical rerun-after-a-fix tool, not a full
+    /// --resume: a later task reading a `{{registered_var}}` from a now-skipped earlier
+    /// task sees it unresolved, since no prior state is replayed. Top-level tasks only —
+    /// has no effect inside `include:`/`block:`.
+    #[arg(long = "start-at-task")]
+    pub start_at_task: Option<String>,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
@@ -48,6 +56,12 @@ struct Playbook {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    /// External var files (paths relative to this playbook's own directory), each a flat
+    /// `key: value` YAML map — same shape as `vars:`, no new format. Loaded in order
+    /// (a later file overrides an earlier one); `vars:` then overrides all of them; a CLI
+    /// `--var` overrides everything. See `run()`.
+    #[serde(default)]
+    vars_files: Vec<String>,
     #[serde(default)]
     vars: HashMap<String, String>,
     tasks: Vec<Task>,
@@ -121,8 +135,10 @@ struct Task {
     ssh: Option<SshSpec>,
     fleet: Option<FleetSpec>,
     /// Run another whole playbook (by bare playbooks/ name, or a path relative to this
-    /// playbook's own directory) as a single task. See `resolve_include_path`.
-    include: Option<String>,
+    /// playbook's own directory) as a single task — either bare (`include: sub.yml`) or
+    /// with per-call var overrides (`include: {file: sub.yml, vars: {...}}`). See
+    /// `IncludeSpec`, `resolve_include_path`.
+    include: Option<IncludeSpec>,
     /// Fails the task immediately (not skips) unless the condition (same syntax as
     /// `when:`) holds.
     assert: Option<String>,
@@ -230,6 +246,38 @@ fn resolve_loop_items(spec: &LoopSpec, vars: &HashMap<String, String>) -> Vec<Lo
                 .filter(|s| !s.is_empty())
                 .map(|s| LoopItem::Scalar(s.to_string()))
                 .collect()
+        }
+    }
+}
+
+/// `include:`'s two shapes — a bare playbook reference (existing, unchanged behavior) or
+/// a mapping with per-call `vars:` overrides. `serde` tries `Simple` first: a bare scalar
+/// (`include: sub.yml`) parses as `Simple`; a mapping (`include: {file: sub.yml, vars:
+/// {...}}`) parses as `WithVars`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IncludeSpec {
+    Simple(String),
+    WithVars {
+        file: String,
+        #[serde(default)]
+        vars: HashMap<String, String>,
+    },
+}
+
+impl IncludeSpec {
+    fn file(&self) -> &str {
+        match self {
+            IncludeSpec::Simple(f) => f,
+            IncludeSpec::WithVars { file, .. } => file,
+        }
+    }
+
+    fn vars(&self) -> &HashMap<String, String> {
+        static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+        match self {
+            IncludeSpec::Simple(_) => EMPTY.get_or_init(HashMap::new),
+            IncludeSpec::WithVars { vars, .. } => vars,
         }
     }
 }
@@ -466,7 +514,31 @@ struct RunEnv<'a> {
     /// From `--yes` — auto-confirms every `confirm:` task instead of prompting or (when
     /// `quiet`) failing fast.
     auto_yes: bool,
+    /// From `--start-at-task` — set only on the top-level run's own `RunEnv`, never
+    /// copied into an `include:`'s `sub_env`, so the skip only ever applies to the
+    /// outermost playbook's own task list (see `execute_playbook`).
+    start_at: Option<String>,
     ctx: &'a Context,
+}
+
+/// Merges a playbook's own `vars_files:` (in order — a later file overrides an earlier
+/// one) with its inline `vars:` (which wins over all of them) into one map — the
+/// playbook's own baseline vars, before any `--var`/include-time override is layered on
+/// top. `dir` is the directory `vars_files:` paths resolve relative to (the playbook's
+/// own directory, same as `run:`/`env_check:` paths). Used both for the top-level
+/// playbook in `run()` and for an `include:`d sub-playbook.
+fn load_playbook_vars(playbook: &Playbook, dir: &Path) -> Result<HashMap<String, String>> {
+    let mut merged: HashMap<String, String> = HashMap::new();
+    for vf in &playbook.vars_files {
+        let path = dir.join(vf);
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Cannot read vars_files entry: {}", path.display()))?;
+        let file_vars: HashMap<String, String> = serde_yaml::from_str(&content)
+            .with_context(|| format!("Invalid YAML in vars_files entry: {}", path.display()))?;
+        merged.extend(file_vars);
+    }
+    merged.extend(playbook.vars.clone());
+    Ok(merged)
 }
 
 pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
@@ -503,6 +575,9 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     let mut playbook: Playbook =
         serde_yaml::from_str(&content).with_context(|| format!("Invalid YAML in {file}"))?;
 
+    // vars_files: (in order) merged under inline vars:, before --var overrides both.
+    playbook.vars = load_playbook_vars(&playbook, &playbook_dir)?;
+
     // Merge CLI --var overrides into playbook vars
     for var in &args.vars {
         if let Some((k, v)) = var.split_once('=') {
@@ -527,6 +602,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         dry: args.dry,
         quiet: ctx.output == OutputFormat::Json,
         auto_yes: args.yes,
+        start_at: args.start_at_task.clone(),
         ctx,
     };
 
@@ -615,7 +691,7 @@ fn execute_playbook(
         }
     }
 
-    let tasks: Vec<&Task> = playbook
+    let mut tasks: Vec<&Task> = playbook
         .tasks
         .iter()
         .filter(|t| match tag_filter {
@@ -623,6 +699,26 @@ fn execute_playbook(
             Some(tags) => t.tags.iter().any(|tag| tags.contains(&tag.as_str())),
         })
         .collect();
+
+    // --start-at-task: only ever set on the top-level RunEnv (see RunEnv.start_at), so
+    // this only skips ahead in the outermost playbook's own task list.
+    if let Some(start) = &env.start_at {
+        let idx = tasks.iter().position(|t| &t.name == start).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no task named '{start}' (check `tooler play <file> --dry` for task names)"
+            )
+        })?;
+        if idx > 0 {
+            if !json {
+                println!(
+                    "  {}",
+                    format!("(starting at task '{start}' — {idx} earlier task(s) skipped)")
+                        .dimmed()
+                );
+            }
+            tasks.drain(..idx);
+        }
+    }
 
     let total = tasks.len();
     let mut ok = 0usize;
@@ -1509,8 +1605,8 @@ fn run_task_once(
         return Ok(());
     }
 
-    if let Some(include_file) = &task.include {
-        let rendered = render(include_file, vars);
+    if let Some(spec) = &task.include {
+        let rendered = render(spec.file(), vars);
         let include_path = resolve_include_path(&rendered, env)?;
         if include_stack.contains(&include_path) {
             let chain = include_stack
@@ -1536,19 +1632,43 @@ fn run_task_once(
             })?;
             let sub_playbook: Playbook = serde_yaml::from_str(&content)
                 .with_context(|| format!("Invalid YAML in {}", include_path.display()))?;
-            for (k, v) in &sub_playbook.vars {
+            let sub_playbook_dir = include_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+
+            // Render this include:'s vars: overrides against the *parent's* vars, before
+            // any mutation below, and remember each overridden key's prior value (or that
+            // it was absent) so it can be restored once the sub-playbook returns —
+            // otherwise calling the same include: repeatedly with different vars: (e.g.
+            // once per service in a per-service deploy) would leak the last call's values
+            // into sibling tasks afterward.
+            let rendered_overrides: Vec<(String, String)> = spec
+                .vars()
+                .iter()
+                .map(|(k, v)| (k.clone(), render(v, vars)))
+                .collect();
+            let saved: Vec<(String, Option<String>)> = rendered_overrides
+                .iter()
+                .map(|(k, _)| (k.clone(), vars.get(k).cloned()))
+                .collect();
+
+            let sub_own_vars = load_playbook_vars(&sub_playbook, &sub_playbook_dir)?;
+            for (k, v) in &sub_own_vars {
                 vars.entry(k.clone()).or_insert_with(|| v.clone());
             }
+            for (k, v) in &rendered_overrides {
+                vars.insert(k.clone(), v.clone());
+            }
+
             let sub_notes = read_notes(&include_path);
             let sub_env = RunEnv {
-                playbook_dir: include_path
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .to_path_buf(),
+                playbook_dir: sub_playbook_dir,
                 project_root: env.project_root.clone(),
                 dry: env.dry,
                 quiet: env.quiet,
                 auto_yes: env.auto_yes,
+                start_at: None,
                 ctx: env.ctx,
             };
             include_stack.push(include_path);
@@ -1562,6 +1682,20 @@ fn run_task_once(
                 &sub_env,
             );
             include_stack.pop();
+
+            // Restore each overridden key, regardless of outcome, so this include: call's
+            // overrides don't leak into sibling tasks that follow it.
+            for (k, prior) in saved {
+                match prior {
+                    Some(v) => {
+                        vars.insert(k, v);
+                    }
+                    None => {
+                        vars.remove(&k);
+                    }
+                }
+            }
+
             result?;
         }
         return Ok(());
@@ -2216,7 +2350,7 @@ mod tests {
 
         let task = Task {
             register: Some("x".to_string()),
-            include: Some("sub.yml".to_string()),
+            include: Some(IncludeSpec::Simple("sub.yml".to_string())),
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
@@ -2249,6 +2383,7 @@ mod tests {
             dry: true,
             quiet: true,
             auto_yes: false,
+            start_at: None,
             ctx,
         }
     }
@@ -2414,6 +2549,7 @@ mod tests {
         let playbook = Playbook {
             name: "t".to_string(),
             description: None,
+            vars_files: Vec::new(),
             vars: HashMap::new(),
             handlers: vec![],
             tasks: vec![Task {
@@ -2430,6 +2566,7 @@ mod tests {
         let playbook = Playbook {
             name: "t".to_string(),
             description: None,
+            vars_files: Vec::new(),
             vars: HashMap::new(),
             handlers: vec![Task {
                 name: "restart".to_string(),
@@ -2798,5 +2935,72 @@ mod tests {
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+    }
+
+    #[test]
+    fn include_spec_deserializes_both_shapes() {
+        let simple: IncludeSpec = serde_yaml::from_str("sub.yml").unwrap();
+        assert_eq!(simple.file(), "sub.yml");
+        assert!(simple.vars().is_empty());
+
+        let with_vars: IncludeSpec =
+            serde_yaml::from_str("file: sub.yml\nvars:\n  service: api\n").unwrap();
+        assert_eq!(with_vars.file(), "sub.yml");
+        assert_eq!(
+            with_vars.vars().get("service").map(String::as_str),
+            Some("api")
+        );
+    }
+
+    #[test]
+    fn load_playbook_vars_with_no_vars_files_passes_inline_vars_through() {
+        let playbook = Playbook {
+            name: "t".to_string(),
+            description: None,
+            vars_files: Vec::new(),
+            vars: vars(&[("host", "localhost")]),
+            handlers: vec![],
+            tasks: vec![],
+        };
+        let merged = load_playbook_vars(&playbook, Path::new(".")).unwrap();
+        assert_eq!(merged.get("host").map(String::as_str), Some("localhost"));
+    }
+
+    #[test]
+    fn start_at_task_rejects_an_unknown_task_name() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = RunEnv {
+            start_at: Some("nonexistent".to_string()),
+            ..dry_env(&ctx)
+        };
+        let playbook = Playbook {
+            name: "t".to_string(),
+            description: None,
+            vars_files: Vec::new(),
+            vars: HashMap::new(),
+            handlers: vec![],
+            tasks: vec![Task {
+                name: "only task".to_string(),
+                debug: Some("hi".to_string()),
+                ..Default::default()
+            }],
+        };
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let err = execute_playbook(
+            &playbook,
+            &None,
+            &None,
+            &mut vars,
+            &mut include_stack,
+            true,
+            &env,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("nonexistent"), "error was: {err}");
     }
 }
