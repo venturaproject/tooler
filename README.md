@@ -348,6 +348,7 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `check_url: <url>` | HTTP health check (expects 2xx) |
 | `check_port: {host, port}` | TCP connectivity check |
 | `http: {method, url, headers, body, timeout, ignore_status}` | Make an HTTP request |
+| `scrape: {url, headers, each, fields, timeout}` | Extract data from a page with CSS selectors |
 | `env_check: {reference, target}` | Verify .env has all keys from reference |
 | `ssh: {server, command, sudo}` | Run a command on one remote server profile over SSH |
 | `fleet: {servers/group/all, command, sudo, parallel}` | Run a command on multiple server profiles (same targeting as [`tooler fleet`](#tooler-fleet)) |
@@ -423,6 +424,25 @@ tasks:
 
 `http:` sends a request (`method:` defaults to `GET`) and, with `register: <name>`, captures two vars: `<name>` = the response body text, `<name>.status` = the status code as a string — so `{{deploy.status}}` and `{{deploy}}` both work off one `register:`. It fails the task on a non-2xx status unless `ignore_status: true` is set, in which case `when:`/`assert:` on `<name>.status` decides what happens instead. Pair it with the `| json:<path>` render filter (see **Templating** below) to pull a single field out of a JSON body — `{{deploy | json:id}}`, `{{deploy | json:items[0].name}}` — or with `set_fact:` to give that extracted value its own name for later tasks. `set_fact:` itself just renders each expression and stores the result — useful any time a var needs to be computed rather than passed in as-is; keys in one `set_fact:` block can't reference each other (split into separate tasks to chain).
 
+```yaml
+tasks:
+  - name: Scrape a page of listings into structured rows
+    scrape:
+      url: https://example.com/listings
+      each: .listing          # one item per element matching this selector
+      fields:
+        title: .title          # text content of .title within each .listing
+        link: a.title@href     # the href attribute instead of text
+    register: listings
+
+  - name: Loop over what was just scraped — no new syntax, just loop: {from: ...}
+    loop:
+      from: "{{listings}}"
+    debug: "{{item.title}} -> {{item.link}}"
+```
+
+`scrape:` GETs `url:`, parses the HTML, and pulls one object per `each:` match (or a single object for the whole page if `each:` is omitted) into `register:`'s var as a JSON array — each `fields:` entry is a CSS selector, optionally `"<selector>@<attr>"` to grab an attribute (e.g. `href`, `src`) instead of trimmed text content; a selector with no match just yields an empty string for that field rather than failing the task. It's a plain, well-behaved HTTP client (an explicit `tooler/<version>` User-Agent, no proxy rotation or bot-detection bypass) — same trust model as `check_url:`/`http:`: you supply the URL, `tooler` doesn't decide what's okay to scrape. Because the registered value is a JSON array, it plugs directly into `loop:`'s dynamic form (see below) with no extra glue.
+
 `ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed; `parallel: true` runs all targeted servers concurrently instead of one at a time (same flag as `tooler fleet exec/check --parallel`, see [`tooler fleet`](#tooler-fleet)). `ssh:`'s `server:` and `fleet:`'s `servers:`/`group:` are all rendered through `{{var}}` like any other field, so the target can be chosen at invocation time — `fleet: {group: "{{target}}"}` plus `tooler play deploy --var target=web-canary` — instead of hardcoded in the YAML.
 
 `sync_db:` and `sync_files:` align a dev environment with production **on the same
@@ -466,7 +486,7 @@ sync, add a preceding `ssh:`/`run:` task that drops and recreates the target sch
 **Per-task modifiers**, usable with any action above:
 
 - `when: "{{env}} == prod"` — skip the task unless the condition (evaluated once against the playbook's vars, after `{{var}}` substitution) holds. Supports `==`, `!=`, or a bare truthy check — not a full expression language.
-- `loop: [a, b, c]` — run the task once per item, with `{{item}}` available to the action (e.g. `run: systemctl restart {{item}}`). The first failing iteration fails the task; remaining items aren't attempted. Items can also be maps — `loop: [{name: a, port: "1"}, {name: b, port: "2"}]` exposes `{{item.name}}`/`{{item.port}}` per iteration instead of a single `{{item}}`.
+- `loop: [a, b, c]` — run the task once per item, with `{{item}}` available to the action (e.g. `run: systemctl restart {{item}}`). The first failing iteration fails the task; remaining items aren't attempted. Items can also be maps — `loop: [{name: a, port: "1"}, {name: b, port: "2"}]` exposes `{{item.name}}`/`{{item.port}}` per iteration instead of a single `{{item}}`. `loop: {from: "{{var}}"}` is the dynamic form — resolved at run time instead of fixed in the YAML: if the rendered var parses as a JSON array (typically a `register:`ed `scrape:`/`http:` result), each element becomes an item (objects → `{{item.<field>}}`, same as a static map list); otherwise the rendered text is split on `split:` (default `"\n"`) into scalar items. This is what makes `scrape:`'s output directly loopable with no extra step.
 - `register: <name>` — capture the task's output into a variable, usable by any later task via `{{name}}`. Supported on `run:`/`ssh:`/`fleet:` only (an upfront error otherwise). `run:` normally streams its subprocess's output live; it only switches to capturing (needed to register it) when `register:` is actually set on that task, so every other `run:` task is unaffected. Inside a `loop:`, only the last iteration's value persists.
 - `retries: N` / `delay: S` — retry a failing task up to N extra times, waiting `delay` seconds (default 1) between attempts, before giving up. Applies per `loop:` iteration if combined with `loop:`; ignored entirely in `--dry`.
 - `notify: [handler, ...]` / `changed_when: "<condition>"` — trigger one or more `handlers:` (a playbook-level list of tasks, matched by name) when this task succeeds. Each notified handler runs **at most once**, after every regular task has succeeded, deduplicated across however many tasks notified it. Without `changed_when:`, a successful task always counts as "changed"; with it, only when the condition holds (typically checking a `register:`ed value). Notifying a handler name with no matching `handlers:` entry is rejected upfront, before any task runs — not silently ignored.

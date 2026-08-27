@@ -66,9 +66,11 @@ struct Task {
     /// Run this task once per item. A scalar item is available as `{{item}}`; a map
     /// item exposes `{{item.<field>}}` per key (bare `{{item}}` stays literal for a map
     /// item). The first failing iteration fails the task (and, unless `ignore_errors`,
-    /// the whole playbook) — remaining items are not attempted.
+    /// the whole playbook) — remaining items are not attempted. Either a static YAML list
+    /// (`loop: [a, b, c]`) or a dynamic source resolved at runtime from a var (typically a
+    /// `register:`ed `http:`/`scrape:` result) — see `LoopSpec`.
     #[serde(default, rename = "loop")]
-    loop_items: Option<Vec<LoopItem>>,
+    loop_spec: Option<LoopSpec>,
     /// Capture this task's output into a variable, usable by later tasks via
     /// `{{name}}`. Supported on run/ssh/fleet only (see `run_task_once`). Inside a
     /// `loop:`, only the last iteration's value persists.
@@ -102,6 +104,10 @@ struct Task {
     /// `HttpSpec`; combine with the `| json:<path>` render filter to pull a field out of
     /// a JSON response, e.g. `{{resp | json:data.id}}`.
     http: Option<HttpSpec>,
+    /// Scrape a page with CSS selectors. `register:` (if set) captures a JSON array of
+    /// `fields` objects, one per `each:` match — directly loopable via a dynamic
+    /// `loop: {from: "{{reg}}"}`. See `ScrapeSpec`.
+    scrape: Option<ScrapeSpec>,
     env_check: Option<EnvCheckSpec>,
     ssh: Option<SshSpec>,
     fleet: Option<FleetSpec>,
@@ -150,6 +156,68 @@ struct Task {
 enum LoopItem {
     Scalar(String),
     Map(HashMap<String, String>),
+}
+
+/// `loop:`'s two shapes — a static YAML list (unchanged, existing behavior) or a dynamic
+/// source resolved at task-run time from a rendered var. `serde`'s untagged matching tries
+/// `Static` first; a YAML sequence (`loop: [a, b, c]`) parses as `Static`, and a mapping
+/// with a `from:` key (`loop: {from: "{{items}}"}`) parses as `Dynamic`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LoopSpec {
+    Static(Vec<LoopItem>),
+    Dynamic {
+        /// Rendered once per task run. If the result parses as a JSON array, each element
+        /// becomes a loop item (an object -> `LoopItem::Map` with stringified fields, any
+        /// other JSON value -> `LoopItem::Scalar`); otherwise the rendered string is split
+        /// on `split` (default `"\n"`) into scalar items, trimming empty lines. This makes
+        /// a `register:`ed `scrape:`/`http:` result directly loopable with no new syntax.
+        from: String,
+        #[serde(default)]
+        split: Option<String>,
+    },
+}
+
+/// Resolves a `LoopSpec` into the `Vec<LoopItem>` `run_task` actually iterates —
+/// `Static` is used as-is; `Dynamic` renders `from` against `vars` and either parses it as
+/// a JSON array or falls back to a plain-text split. See `LoopSpec::Dynamic`'s doc comment
+/// for the exact rules.
+fn resolve_loop_items(spec: &LoopSpec, vars: &HashMap<String, String>) -> Vec<LoopItem> {
+    match spec {
+        LoopSpec::Static(items) => items.clone(),
+        LoopSpec::Dynamic { from, split } => {
+            let rendered = render(from, vars);
+            if let Ok(serde_json::Value::Array(elements)) =
+                serde_json::from_str::<serde_json::Value>(&rendered)
+            {
+                return elements
+                    .into_iter()
+                    .map(|el| match el {
+                        serde_json::Value::Object(map) => LoopItem::Map(
+                            map.into_iter()
+                                .map(|(k, v)| {
+                                    let s = match v {
+                                        serde_json::Value::String(s) => s,
+                                        other => other.to_string(),
+                                    };
+                                    (k, s)
+                                })
+                                .collect(),
+                        ),
+                        serde_json::Value::String(s) => LoopItem::Scalar(s),
+                        other => LoopItem::Scalar(other.to_string()),
+                    })
+                    .collect();
+            }
+            let sep = split.as_deref().unwrap_or("\n");
+            rendered
+                .split(sep)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| LoopItem::Scalar(s.to_string()))
+                .collect()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +317,21 @@ struct HttpSpec {
     /// `<reg>.status` decide instead. Default false, matching check_url:'s fail-fast.
     #[serde(default)]
     ignore_status: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScrapeSpec {
+    url: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default = "default_timeout")]
+    timeout: u64,
+    /// CSS selector for each "row"; omit to scrape the whole page as a single item.
+    #[serde(default)]
+    each: Option<String>,
+    /// field name -> CSS selector, optionally `"<selector>@<attr>"` to grab an attribute
+    /// (e.g. `href`, `src`) instead of trimmed text content.
+    fields: HashMap<String, String>,
 }
 
 fn default_timeout() -> u64 {
@@ -737,10 +820,11 @@ fn run_task(
     include_stack: &mut Vec<PathBuf>,
     env: &RunEnv,
 ) -> Result<()> {
-    let Some(items) = &task.loop_items else {
+    let Some(spec) = &task.loop_spec else {
         return run_task_once_with_retries(task, vars, include_stack, env);
     };
-    for item in items {
+    let items = resolve_loop_items(spec, vars);
+    for item in &items {
         let mut loop_vars = vars.clone();
         match item {
             LoopItem::Scalar(s) => {
@@ -1038,6 +1122,30 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.scrape {
+        let url = render(&spec.url, vars);
+        if !env.quiet {
+            println!("  {} {}", "→".bold(), url.dimmed());
+        }
+        if !env.dry {
+            let items = scrape(spec, &url, vars)?;
+            if !env.quiet {
+                println!(
+                    "  {} scraped {} item(s)",
+                    "✓ ok".green().bold(),
+                    items.len()
+                );
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    reg.clone(),
+                    serde_json::to_string(&items).unwrap_or_default(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.env_check {
         let reference = env.playbook_dir.join(render(&spec.reference, vars));
         let target = env.playbook_dir.join(render(&spec.target, vars));
@@ -1292,8 +1400,8 @@ fn run_task_once(
     }
 
     bail!(
-        "task '{}' has no action (run, check_url, check_port, http, env_check, ssh, fleet, \
-         include, assert, block, debug, set_fact, sync_db, sync_files)",
+        "task '{}' has no action (run, check_url, check_port, http, scrape, env_check, ssh, \
+         fleet, include, assert, block, debug, set_fact, sync_db, sync_files)",
         task.name
     );
 }
@@ -1426,6 +1534,87 @@ fn http_request(
         bail!("HTTP {}: {snippet}", status.as_u16());
     }
     Ok((body, status.as_u16()))
+}
+
+/// Executes a `scrape:` task: GETs `scrape_spec.url`, parses the HTML, and extracts one
+/// `serde_json::Map` per `each:` match (or a single implicit whole-document match if
+/// `each:` is absent). Each `fields:` entry is a CSS selector, optionally suffixed with
+/// `@<attr>` (see `parse_field_selector`) to grab an attribute instead of trimmed text
+/// content; a selector with no match in a given scope yields an empty string rather than
+/// failing the task. Same client-builder pattern as `check_url`/`http_request`, with an
+/// explicit User-Agent — a well-behaved client, not an evasive one: same trust model as
+/// `check_url`/`http:` already have, the user supplies the URL, `tooler` doesn't target
+/// sites, rotate proxies, or bypass bot detection.
+fn scrape(
+    scrape_spec: &ScrapeSpec,
+    url: &str,
+    vars: &HashMap<String, String>,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(scrape_spec.timeout))
+        .user_agent(format!("tooler/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let mut req = client.get(url);
+    for (k, v) in &scrape_spec.headers {
+        req = req.header(render(k, vars), render(v, vars));
+    }
+    let resp = req
+        .send()
+        .with_context(|| format!("scrape request failed: {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("HTTP {} scraping {url}", status.as_u16());
+    }
+    let body = resp.text().context("scrape response was not valid text")?;
+    let document = scraper::Html::parse_document(&body);
+
+    let field_selectors: Vec<(String, scraper::Selector, Option<String>)> = scrape_spec
+        .fields
+        .iter()
+        .map(|(name, field_spec)| {
+            let (css, attr) = parse_field_selector(field_spec);
+            let selector = scraper::Selector::parse(css).map_err(|e| {
+                anyhow::anyhow!("invalid CSS selector '{css}' for field '{name}': {e:?}")
+            })?;
+            Ok((name.clone(), selector, attr.map(str::to_string)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let extract = |scope: scraper::ElementRef<'_>| -> serde_json::Map<String, serde_json::Value> {
+        let mut obj = serde_json::Map::new();
+        for (name, selector, attr) in &field_selectors {
+            let value = scope
+                .select(selector)
+                .next()
+                .map(|el| match attr {
+                    Some(a) => el.value().attr(a).unwrap_or_default().to_string(),
+                    None => el.text().collect::<String>().trim().to_string(),
+                })
+                .unwrap_or_default();
+            obj.insert(name.clone(), serde_json::Value::String(value));
+        }
+        obj
+    };
+
+    match &scrape_spec.each {
+        Some(each) => {
+            let row_selector = scraper::Selector::parse(each)
+                .map_err(|e| anyhow::anyhow!("invalid CSS selector '{each}' for each: {e:?}"))?;
+            Ok(document.select(&row_selector).map(extract).collect())
+        }
+        None => Ok(vec![extract(document.root_element())]),
+    }
+}
+
+/// Splits a `fields:` value like `"a.title@href"` into a CSS selector and an optional
+/// attribute name — `"a.title"` alone means "trimmed text content". Splits on the last
+/// `@`, so a plain selector with no `@` (or an empty piece on either side) is left
+/// untouched with no attribute.
+fn parse_field_selector(spec: &str) -> (&str, Option<&str>) {
+    match spec.rsplit_once('@') {
+        Some((css, attr)) if !css.is_empty() && !attr.is_empty() => (css, Some(attr)),
+        _ => (spec, None),
+    }
 }
 
 fn check_port(host: &str, port: u16, timeout_secs: u64, quiet: bool) -> Result<()> {
@@ -2095,6 +2284,74 @@ mod tests {
             }],
         };
         assert!(validate_handlers(&playbook).is_ok());
+    }
+
+    #[test]
+    fn parse_field_selector_splits_on_last_at() {
+        assert_eq!(parse_field_selector("a.title"), ("a.title", None));
+        assert_eq!(
+            parse_field_selector("a.title@href"),
+            ("a.title", Some("href"))
+        );
+        // No plain-CSS attribute selector like `[data-x]` starts or ends with '@', so an
+        // empty side just falls back to "no attribute" rather than misparsing.
+        assert_eq!(parse_field_selector("@href"), ("@href", None));
+        assert_eq!(parse_field_selector("a.title@"), ("a.title@", None));
+    }
+
+    #[test]
+    fn resolve_loop_items_dynamic_parses_json_array_of_objects() {
+        let v = vars(&[(
+            "jobs",
+            r#"[{"title":"Dev","company":"Acme"},{"title":"Lead","company":"Beta"}]"#,
+        )]);
+        let spec = LoopSpec::Dynamic {
+            from: "{{jobs}}".to_string(),
+            split: None,
+        };
+        let items = resolve_loop_items(&spec, &v);
+        assert_eq!(items.len(), 2);
+        let LoopItem::Map(m) = &items[0] else {
+            panic!("expected a map item");
+        };
+        assert_eq!(m.get("title"), Some(&"Dev".to_string()));
+        assert_eq!(m.get("company"), Some(&"Acme".to_string()));
+    }
+
+    #[test]
+    fn resolve_loop_items_dynamic_falls_back_to_text_split() {
+        let v = vars(&[("names", "alice\nbob\n\ncarol")]);
+        let spec = LoopSpec::Dynamic {
+            from: "{{names}}".to_string(),
+            split: None,
+        };
+        let items = resolve_loop_items(&spec, &v);
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], LoopItem::Scalar(s) if s == "alice"));
+        assert!(matches!(&items[2], LoopItem::Scalar(s) if s == "carol"));
+    }
+
+    #[test]
+    fn resolve_loop_items_dynamic_respects_custom_split() {
+        let v = vars(&[("names", "alice,bob,carol")]);
+        let spec = LoopSpec::Dynamic {
+            from: "{{names}}".to_string(),
+            split: Some(",".to_string()),
+        };
+        let items = resolve_loop_items(&spec, &v);
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[1], LoopItem::Scalar(s) if s == "bob"));
+    }
+
+    #[test]
+    fn scrape_spec_deserializes() {
+        let spec: ScrapeSpec = serde_yaml::from_str(
+            "url: https://example.com\neach: .row\nfields:\n  title: .title\n  link: a@href\n",
+        )
+        .unwrap();
+        assert_eq!(spec.url, "https://example.com");
+        assert_eq!(spec.each.as_deref(), Some(".row"));
+        assert_eq!(spec.fields.get("link").map(String::as_str), Some("a@href"));
     }
 
     #[test]
