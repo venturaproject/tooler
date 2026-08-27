@@ -347,6 +347,7 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `run: <cmd>` | Execute a shell command |
 | `check_url: <url>` | HTTP health check (expects 2xx) |
 | `check_port: {host, port}` | TCP connectivity check |
+| `http: {method, url, headers, body, timeout, ignore_status}` | Make an HTTP request |
 | `env_check: {reference, target}` | Verify .env has all keys from reference |
 | `ssh: {server, command, sudo}` | Run a command on one remote server profile over SSH |
 | `fleet: {servers/group/all, command, sudo, parallel}` | Run a command on multiple server profiles (same targeting as [`tooler fleet`](#tooler-fleet)) |
@@ -354,6 +355,7 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `assert: "<condition>"` | Fail the task immediately (not skip) unless the condition holds |
 | `block: [...]` | Run a list of tasks as a unit, with `rescue:`/`always:` |
 | `debug: "<message>"` | Print a rendered message; no side effects |
+| `set_fact: {name: "<expr>", ...}` | Compute/override one or more vars from rendered expressions; no side effects |
 | `sync_db: {server, from, to}` | Dump `from`'s database and restore it into `to`'s, both reached through the same server |
 | `sync_files: {server, from, to, delete}` | Rsync a directory from one path to another on the same server |
 
@@ -393,6 +395,33 @@ tasks:
 ```
 
 `block:`/`rescue:`/`always:` run in that order — `rescue:` only if `block:` failed (and, if it succeeds, the block is considered recovered), `always:` unconditionally afterward regardless of outcome (and a failure there fails the block even after a successful rescue). Like `include:`, a `block:` counts as a single ok/failed task in the parent's recap — its own tasks print for visibility but aren't flattened into the parent's totals. Nested tasks get the full `when:`/`loop:`/`retries:`/`register:` support, and can themselves contain another `block:`.
+
+```yaml
+tasks:
+  - name: Create a deploy in the tracker
+    http:
+      method: POST
+      url: https://api.example.com/deploys
+      headers:
+        Authorization: "Bearer {{secret.tracker.token}}"
+      body: '{"env":"{{env}}"}'
+    register: deploy
+
+  - name: Pull the new deploy id out of the JSON response
+    set_fact:
+      deploy_id: "{{deploy | json:id}}"
+
+  - name: Fail loudly if the tracker didn't accept it
+    assert: "{{deploy.status}} == 201"
+
+  - name: Poll a flaky status endpoint without failing the task on a 404 yet
+    http:
+      url: https://api.example.com/deploys/{{deploy_id}}
+      ignore_status: true
+    register: status_check
+```
+
+`http:` sends a request (`method:` defaults to `GET`) and, with `register: <name>`, captures two vars: `<name>` = the response body text, `<name>.status` = the status code as a string — so `{{deploy.status}}` and `{{deploy}}` both work off one `register:`. It fails the task on a non-2xx status unless `ignore_status: true` is set, in which case `when:`/`assert:` on `<name>.status` decides what happens instead. Pair it with the `| json:<path>` render filter (see **Templating** below) to pull a single field out of a JSON body — `{{deploy | json:id}}`, `{{deploy | json:items[0].name}}` — or with `set_fact:` to give that extracted value its own name for later tasks. `set_fact:` itself just renders each expression and stores the result — useful any time a var needs to be computed rather than passed in as-is; keys in one `set_fact:` block can't reference each other (split into separate tasks to chain).
 
 `ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed; `parallel: true` runs all targeted servers concurrently instead of one at a time (same flag as `tooler fleet exec/check --parallel`, see [`tooler fleet`](#tooler-fleet)). `ssh:`'s `server:` and `fleet:`'s `servers:`/`group:` are all rendered through `{{var}}` like any other field, so the target can be chosen at invocation time — `fleet: {group: "{{target}}"}` plus `tooler play deploy --var target=web-canary` — instead of hardcoded in the YAML.
 
@@ -478,7 +507,7 @@ tasks:
     timeout: 300
 ```
 
-**Templating** — `{{...}}` inside any string field resolves, in order: a playbook/`--var` variable, then `env.<NAME>` (the process environment, e.g. `{{env.HOME}}`), then `secret.<profile>.<key>` (the OS keychain, the same store `tooler config set profile.<name>.token` and OAuth2 profiles already use — e.g. `{{secret.exact.token}}`). Anything that doesn't resolve is left exactly as written, so a missing var/secret never crashes a playbook, it just doesn't get substituted. **Security note**: a rendered secret ends up in a `run:` task's shell command line, which — like any subprocess argv — is visible to other local processes via `ps`/`/proc` while it runs; `ssh:`/`fleet:` carry the same exposure over SSH, no different from how `sudo:` already works today.
+**Templating** — `{{...}}` inside any string field resolves, in order: a playbook/`--var` variable, then `env.<NAME>` (the process environment, e.g. `{{env.HOME}}`), then `secret.<profile>.<key>` (the OS keychain, the same store `tooler config set profile.<name>.token` and OAuth2 profiles already use — e.g. `{{secret.exact.token}}`). Anything that doesn't resolve is left exactly as written, so a missing var/secret never crashes a playbook, it just doesn't get substituted. `{{token | json:path.to.field}}` applies a filter after resolving `token`: parses its value as JSON and walks a dot-separated path (`data.id`, `items[0].name`, `[2]`) into it — a string leaf renders raw, anything else (number/bool/object/array/null) renders as JSON text. Invalid JSON or a path that doesn't match leaves the whole `{{...}}` literal, same as any other unresolved token — it never fails the render. **Security note**: a rendered secret ends up in a `run:` task's shell command line, which — like any subprocess argv — is visible to other local processes via `ps`/`/proc` while it runs; `ssh:`/`fleet:` carry the same exposure over SSH, no different from how `sudo:` already works today. What gets **printed** to the console for `run:`/`ssh:`/`fleet:`/`sync_files:` is separately masked — a `{{secret.*}}` token always shows as `***` in the echoed command line, even though the real, unmasked value is what actually runs; `debug:` is the one exception, since printing is its entire purpose.
 
 Commands and file paths in tasks always resolve **relative to the playbook file's directory**, not where you run `tooler play` from.
 

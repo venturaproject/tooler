@@ -96,6 +96,12 @@ struct Task {
     run: Option<String>,
     check_url: Option<String>,
     check_port: Option<CheckPortSpec>,
+    /// Make an HTTP request. `register:` (if set) captures two vars: `<reg>` = the
+    /// response body text, `<reg>.status` = the status code as a string — the same
+    /// dotted-key convention `loop:`'s map items already use for `item.<field>`. See
+    /// `HttpSpec`; combine with the `| json:<path>` render filter to pull a field out of
+    /// a JSON response, e.g. `{{resp | json:data.id}}`.
+    http: Option<HttpSpec>,
     env_check: Option<EnvCheckSpec>,
     ssh: Option<SshSpec>,
     fleet: Option<FleetSpec>,
@@ -116,6 +122,12 @@ struct Task {
     always: Option<Vec<Task>>,
     /// Print a rendered message; no side effects.
     debug: Option<String>,
+    /// Compute/override vars from rendered expressions (supports the `| json:<path>`
+    /// filter — see `render()`). Side-effect-only, like `debug:` — runs even in `--dry`,
+    /// since setting a var has no external effect. Keys within one `set_fact:` block
+    /// don't see each other (`HashMap` iteration order isn't defined) — split into
+    /// separate tasks if one fact needs to build on another.
+    set_fact: Option<HashMap<String, String>>,
     /// Kill the task if it runs longer than this many seconds. Only supported on
     /// `run:` — there's no process handle to kill for `ssh:`/`fleet:` without changing
     /// the shared SSH helper they route through, so those reject `timeout:` upfront
@@ -222,11 +234,31 @@ struct EnvCheckSpec {
     target: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct HttpSpec {
+    #[serde(default = "default_http_method")]
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default = "default_timeout")]
+    timeout: u64,
+    /// Don't fail the task on a non-2xx status — let when:/assert: on the registered
+    /// `<reg>.status` decide instead. Default false, matching check_url:'s fail-fast.
+    #[serde(default)]
+    ignore_status: bool,
+}
+
 fn default_timeout() -> u64 {
     5
 }
 fn default_env_target() -> String {
     ".env".to_string()
+}
+fn default_http_method() -> String {
+    "GET".to_string()
 }
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
@@ -882,10 +914,11 @@ fn run_task_once(
             || task.include.is_some()
             || task.assert.is_some()
             || task.block.is_some()
-            || task.debug.is_some())
+            || task.debug.is_some()
+            || task.set_fact.is_some())
     {
         bail!(
-            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug tasks"
+            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug/set_fact tasks"
         );
     }
 
@@ -895,6 +928,17 @@ fn run_task_once(
 
     if let Some(msg) = &task.debug {
         println!("  {} {}", "ℹ".cyan().bold(), render(msg, vars));
+        return Ok(());
+    }
+
+    if let Some(facts) = &task.set_fact {
+        for (k, v) in facts {
+            let rendered = render(v, vars);
+            if !env.quiet {
+                println!("  {} {} = {}", "ƒ".cyan().bold(), k, rendered.dimmed());
+            }
+            vars.insert(k.clone(), rendered);
+        }
         return Ok(());
     }
 
@@ -970,6 +1014,26 @@ fn run_task_once(
         }
         if !env.dry {
             check_port(&host, spec.port, spec.timeout, env.quiet)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.http {
+        let url = render(&spec.url, vars);
+        if !env.quiet {
+            println!(
+                "  {} {} {}",
+                spec.method.to_uppercase().bold(),
+                "→".bold(),
+                url.dimmed()
+            );
+        }
+        if !env.dry {
+            let (body, status) = http_request(spec, &url, vars)?;
+            if let Some(reg) = &task.register {
+                vars.insert(format!("{reg}.status"), status.to_string());
+                vars.insert(reg.clone(), body);
+            }
         }
         return Ok(());
     }
@@ -1228,8 +1292,8 @@ fn run_task_once(
     }
 
     bail!(
-        "task '{}' has no action (run, check_url, check_port, env_check, ssh, fleet, include, \
-         assert, block, debug, sync_db, sync_files)",
+        "task '{}' has no action (run, check_url, check_port, http, env_check, ssh, fleet, \
+         include, assert, block, debug, set_fact, sync_db, sync_files)",
         task.name
     );
 }
@@ -1328,6 +1392,42 @@ fn check_url(url: &str, quiet: bool) -> Result<()> {
     }
 }
 
+/// Executes an `http:` task's request: renders headers/body against `vars`, sends, and
+/// returns the response's (body text, status code) — mirrors `check_url`'s
+/// client-builder pattern. Bails on a network error, or (unless `spec.ignore_status`) a
+/// non-2xx status, with the response body (truncated) in the error message.
+fn http_request(
+    spec: &HttpSpec,
+    url: &str,
+    vars: &HashMap<String, String>,
+) -> Result<(String, u16)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(spec.timeout))
+        .build()?;
+    let method = reqwest::Method::from_bytes(spec.method.to_uppercase().as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid http method: {}", spec.method))?;
+    let mut req = client.request(method, url);
+    for (k, v) in &spec.headers {
+        req = req.header(render(k, vars), render(v, vars));
+    }
+    if let Some(body) = &spec.body {
+        req = req.body(render(body, vars));
+    }
+    let resp = req
+        .send()
+        .with_context(|| format!("http request failed: {url}"))?;
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    if !spec.ignore_status && !status.is_success() {
+        let snippet: String = body.chars().take(300).collect();
+        if snippet.trim().is_empty() {
+            bail!("HTTP {}", status.as_u16());
+        }
+        bail!("HTTP {}: {snippet}", status.as_u16());
+    }
+    Ok((body, status.as_u16()))
+}
+
 fn check_port(host: &str, port: u16, timeout_secs: u64, quiet: bool) -> Result<()> {
     use std::net::ToSocketAddrs;
     let addr = format!("{host}:{port}");
@@ -1402,9 +1502,13 @@ fn resolve_token(token: &str, vars: &HashMap<String, String>) -> Option<String> 
 }
 
 /// Single-pass `{{token}}` substitution shared by `render()` and `render_for_display()` —
-/// the scan is identical, only how a resolved token is turned into a replacement string
-/// differs (real value vs. masked). Unresolvable tokens are left exactly as written, same
-/// as the old known-vars-only replace loop this superseded.
+/// the scan is identical, only how a resolved *token* (post `split_filter`) is turned into
+/// a replacement string differs (real value vs. masked). A trailing `| json:<path>` filter
+/// (see `split_filter`/`apply_json_filter`) is applied uniformly regardless of `resolve`,
+/// so `render_for_display` masks-then-would-filter too, but the mask token `***` never
+/// parses as JSON, so a masked secret piped through `| json:...` just stays unresolved —
+/// never leaks. Unresolvable tokens (unknown name, bad filter) are left exactly as
+/// written, same as the old known-vars-only replace loop this superseded.
 fn render_with(s: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -1416,12 +1520,79 @@ fn render_with(s: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
             rest = after;
             continue;
         };
-        let token = after[..end].trim();
-        out.push_str(&resolve(token).unwrap_or_else(|| format!("{{{{{token}}}}}")));
+        let inner = after[..end].trim();
+        let (token, filter) = split_filter(inner);
+        let resolved = resolve(token).and_then(|v| match filter {
+            Some(path) => apply_json_filter(&v, path),
+            None => Some(v),
+        });
+        out.push_str(&resolved.unwrap_or_else(|| format!("{{{{{inner}}}}}")));
         rest = &after[end + 2..];
     }
     out.push_str(rest);
     out
+}
+
+/// Splits a `{{...}}` token's trimmed inner text on an optional trailing `| json:<path>`
+/// filter — e.g. `"resp | json:data.id"` -> `("resp", Some("data.id"))`. Only the `json:`
+/// filter is recognized; anything else after a `|` is left as part of the token name (so a
+/// stray `|` doesn't silently vanish) and will simply fail to resolve like any unknown
+/// token.
+fn split_filter(inner: &str) -> (&str, Option<&str>) {
+    if let Some((token, filter)) = inner.split_once('|') {
+        let filter = filter.trim();
+        if let Some(path) = filter.strip_prefix("json:") {
+            return (token.trim(), Some(path.trim()));
+        }
+    }
+    (inner, None)
+}
+
+/// Applies a `json:<path>` filter to `value` (parsed as JSON), walking dot-separated
+/// `path` segments, each optionally suffixed with one or more `[N]` array indices (e.g.
+/// `data.items[0].title`, `[2]`). A string leaf renders raw (unquoted); any other JSON
+/// value (number/bool/object/array/null) renders via its JSON text form. Returns `None`
+/// on invalid JSON or a path that doesn't match — `render_with` then leaves the whole
+/// `{{...}}` token literal, same as any other unresolvable token.
+fn apply_json_filter(value: &str, path: &str) -> Option<String> {
+    let root: serde_json::Value = serde_json::from_str(value).ok()?;
+    let mut cur = &root;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            continue;
+        }
+        let (field, indices) = parse_path_segment(segment);
+        if !field.is_empty() {
+            cur = cur.get(field)?;
+        }
+        for idx in indices {
+            cur = cur.get(idx)?;
+        }
+    }
+    Some(match cur {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    })
+}
+
+/// Splits one `.`-separated path segment like `items[0]` or `[2]` into an optional field
+/// name and zero or more array indices, so `data.items[0][1]` chains cleanly.
+fn parse_path_segment(segment: &str) -> (&str, Vec<usize>) {
+    let bracket = segment.find('[');
+    let field = &segment[..bracket.unwrap_or(segment.len())];
+    let mut rest = bracket.map(|b| &segment[b..]).unwrap_or("");
+    let mut indices = Vec::new();
+    while let Some(stripped) = rest.strip_prefix('[') {
+        let Some(close) = stripped.find(']') else {
+            break;
+        };
+        if let Ok(idx) = stripped[..close].parse::<usize>() {
+            indices.push(idx);
+        }
+        rest = &stripped[close + 1..];
+    }
+    (field, indices)
 }
 
 /// Resolves and substitutes every `{{token}}` in `s` for real — see `resolve_token` for
@@ -1782,6 +1953,101 @@ mod tests {
         );
         // Plain vars are unaffected by render_for_display.
         assert_eq!(render_for_display("hello {{name}}", &v), "hello world");
+    }
+
+    #[test]
+    fn json_filter_extracts_object_field_and_array_index() {
+        let v = vars(&[("resp", r#"{"data":{"id":42,"items":["a","b","c"]}}"#)]);
+        assert_eq!(render("{{resp | json:data.id}}", &v), "42");
+        assert_eq!(render("{{resp | json:data.items[1]}}", &v), "b");
+    }
+
+    #[test]
+    fn json_filter_stays_literal_on_bad_json_or_missing_path() {
+        let v = vars(&[("resp", "not json")]);
+        assert_eq!(
+            render("{{resp | json:data.id}}", &v),
+            "{{resp | json:data.id}}"
+        );
+        let v = vars(&[("resp", r#"{"data":{}}"#)]);
+        assert_eq!(
+            render("{{resp | json:data.missing}}", &v),
+            "{{resp | json:data.missing}}"
+        );
+    }
+
+    #[test]
+    fn json_filter_on_a_masked_secret_never_resolves() {
+        // render_for_display masks {{secret.*}} to "***", which isn't valid JSON — a
+        // `| json:` filter piped onto it must stay unresolved, never leak partial data.
+        let v = vars(&[]);
+        assert_eq!(
+            render_for_display("{{secret.p.k | json:token}}", &v),
+            "{{secret.p.k | json:token}}"
+        );
+    }
+
+    #[test]
+    fn http_spec_deserializes_with_defaults() {
+        let spec: HttpSpec = serde_yaml::from_str("url: https://example.com\n").unwrap();
+        assert_eq!(spec.method, "GET");
+        assert_eq!(spec.timeout, 5);
+        assert!(!spec.ignore_status);
+        assert!(spec.headers.is_empty());
+    }
+
+    #[test]
+    fn http_spec_deserializes_full_fields() {
+        let spec: HttpSpec = serde_yaml::from_str(
+            "method: POST\nurl: https://example.com\nheaders:\n  X-Test: \"1\"\nbody: '{}'\ntimeout: 10\nignore_status: true\n",
+        )
+        .unwrap();
+        assert_eq!(spec.method, "POST");
+        assert_eq!(spec.headers.get("X-Test").map(String::as_str), Some("1"));
+        assert_eq!(spec.body.as_deref(), Some("{}"));
+        assert_eq!(spec.timeout, 10);
+        assert!(spec.ignore_status);
+    }
+
+    #[test]
+    fn set_fact_stores_rendered_values_into_vars() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = vars(&[("name", "world")]);
+        let mut include_stack = Vec::new();
+        let mut facts = HashMap::new();
+        facts.insert("greeting".to_string(), "hello {{name}}".to_string());
+        let task = Task {
+            set_fact: Some(facts),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+        assert_eq!(
+            vars.get("greeting").map(String::as_str),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn set_fact_rejects_register() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            register: Some("x".to_string()),
+            set_fact: Some(HashMap::new()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
     }
 
     #[test]
