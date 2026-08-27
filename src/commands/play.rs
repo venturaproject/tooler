@@ -919,7 +919,11 @@ fn run_task_once(
     if let Some(cmd) = &task.run {
         let rendered_cmd = render(cmd, vars);
         if !env.quiet {
-            println!("  {} {}", "$".bold().green(), rendered_cmd.dimmed());
+            println!(
+                "  {} {}",
+                "$".bold().green(),
+                render_for_display(cmd, vars).dimmed()
+            );
         }
         if !env.dry {
             let start = Instant::now();
@@ -996,10 +1000,14 @@ fn run_task_once(
         let cmd = render(&spec.command, vars);
         let full_cmd = crate::commands::fleet::exec_command(&cmd, spec.sudo);
         if !env.quiet {
+            let display_cmd = crate::commands::fleet::exec_command(
+                &render_for_display(&spec.command, vars),
+                spec.sudo,
+            );
             println!(
                 "  {} {} {} {}",
                 "→".bold(),
-                full_cmd.dimmed(),
+                display_cmd.dimmed(),
                 "on".dimmed(),
                 server_name.dimmed()
             );
@@ -1036,7 +1044,11 @@ fn run_task_once(
         let servers = spec.servers.as_deref().map(|s| render(s, vars));
         let group = spec.group.as_deref().map(|s| render(s, vars));
         if !env.quiet {
-            println!("  {} {}", "→".bold(), command.dimmed());
+            println!(
+                "  {} {}",
+                "→".bold(),
+                render_for_display(&spec.command, vars).dimmed()
+            );
         }
         if !env.dry {
             let results = crate::commands::fleet::run_on_targets(
@@ -1125,8 +1137,8 @@ fn run_task_once(
             println!(
                 "  {} rsync {} → {} on {}",
                 "→".bold(),
-                from.dimmed(),
-                to.dimmed(),
+                ensure_trailing_slash(&render_for_display(&spec.from, vars)).dimmed(),
+                render_for_display(&spec.to, vars).dimmed(),
                 server_name.dimmed()
             );
         }
@@ -1389,10 +1401,11 @@ fn resolve_token(token: &str, vars: &HashMap<String, String>) -> Option<String> 
     None
 }
 
-/// Single-pass `{{token}}` substitution — see `resolve_token` for resolution order.
-/// Unresolvable tokens are left exactly as written, same as the old known-vars-only
-/// replace loop this superseded.
-fn render(s: &str, vars: &HashMap<String, String>) -> String {
+/// Single-pass `{{token}}` substitution shared by `render()` and `render_for_display()` —
+/// the scan is identical, only how a resolved token is turned into a replacement string
+/// differs (real value vs. masked). Unresolvable tokens are left exactly as written, same
+/// as the old known-vars-only replace loop this superseded.
+fn render_with(s: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(start) = rest.find("{{") {
@@ -1404,11 +1417,35 @@ fn render(s: &str, vars: &HashMap<String, String>) -> String {
             continue;
         };
         let token = after[..end].trim();
-        out.push_str(&resolve_token(token, vars).unwrap_or_else(|| format!("{{{{{token}}}}}")));
+        out.push_str(&resolve(token).unwrap_or_else(|| format!("{{{{{token}}}}}")));
         rest = &after[end + 2..];
     }
     out.push_str(rest);
     out
+}
+
+/// Resolves and substitutes every `{{token}}` in `s` for real — see `resolve_token` for
+/// resolution order. This is the value actually used to run a command / build a request;
+/// for a copy meant only to be printed, use `render_for_display` instead so a secret isn't
+/// echoed in cleartext.
+fn render(s: &str, vars: &HashMap<String, String>) -> String {
+    render_with(s, |t| resolve_token(t, vars))
+}
+
+/// Same substitution as `render()`, except a `{{secret.<profile>.<key>}}` token resolves to
+/// the literal `***` instead of its real value. Used only for lines that get `println!`'d
+/// (echoing a `run:`/`ssh:`/`fleet:`/`sync_files:` command) — never for the string actually
+/// executed, which must stay `render()`'s real, unmasked output. `debug:` is a deliberate
+/// exception and stays on plain `render()`: printing *is* its entire purpose, so masking it
+/// would defeat the point of the action.
+fn render_for_display(s: &str, vars: &HashMap<String, String>) -> String {
+    render_with(s, |t| {
+        if t.starts_with("secret.") {
+            Some("***".to_string())
+        } else {
+            resolve_token(t, vars)
+        }
+    })
 }
 
 fn print_recap(ok: usize, failed: usize, skipped: usize) {
@@ -1726,6 +1763,25 @@ mod tests {
     fn render_still_substitutes_known_vars() {
         let v = vars(&[("name", "world")]);
         assert_eq!(render("hello {{name}}", &v), "hello world");
+    }
+
+    #[test]
+    fn render_for_display_masks_secret_tokens_but_not_others() {
+        let v = vars(&[("name", "world"), ("env.PATH_LIKE", "unused")]);
+        // A secret token is masked for display...
+        assert_eq!(
+            render_for_display("token={{secret.myprofile.api_key}}", &v),
+            "token=***"
+        );
+        // ...but the real render() still substitutes it for actual execution.
+        // (secret.myprofile.api_key isn't stored, so it stays literal here — this
+        // just confirms render_for_display's masking is independent of resolve_token.)
+        assert_eq!(
+            render("token={{secret.myprofile.api_key}}", &v),
+            "token={{secret.myprofile.api_key}}"
+        );
+        // Plain vars are unaffected by render_for_display.
+        assert_eq!(render_for_display("hello {{name}}", &v), "hello world");
     }
 
     #[test]
