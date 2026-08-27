@@ -108,6 +108,9 @@ struct Task {
     /// `fields` objects, one per `each:` match — directly loopable via a dynamic
     /// `loop: {from: "{{reg}}"}`. See `ScrapeSpec`.
     scrape: Option<ScrapeSpec>,
+    /// Poll a check until it succeeds or times out — see `WaitForSpec`. Exactly one of
+    /// `check_url`/`check_port`/`ssh` must be set within it (validated upfront).
+    wait_for: Option<WaitForSpec>,
     env_check: Option<EnvCheckSpec>,
     ssh: Option<SshSpec>,
     fleet: Option<FleetSpec>,
@@ -317,6 +320,32 @@ struct HttpSpec {
     /// `<reg>.status` decide instead. Default false, matching check_url:'s fail-fast.
     #[serde(default)]
     ignore_status: bool,
+}
+
+/// Poll one of `check_url`/`check_port`/`ssh` (exactly one — validated upfront in
+/// `run_task_once`) every `interval` seconds until it succeeds or `timeout` elapses.
+/// Distinct from `retries:`, which retries a whole task on *failure*; `wait_for:` is for
+/// "keep checking until this becomes true" (e.g. wait for a service to come back up after
+/// a restart), so it doesn't log every attempt the way `retries:` does.
+#[derive(Debug, Deserialize, Default)]
+struct WaitForSpec {
+    #[serde(default)]
+    check_url: Option<String>,
+    #[serde(default)]
+    check_port: Option<CheckPortSpec>,
+    #[serde(default)]
+    ssh: Option<SshSpec>,
+    #[serde(default = "default_wait_interval")]
+    interval: u64,
+    #[serde(default = "default_wait_timeout")]
+    timeout: u64,
+}
+
+fn default_wait_interval() -> u64 {
+    2
+}
+fn default_wait_timeout() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize)]
@@ -999,15 +1028,33 @@ fn run_task_once(
             || task.assert.is_some()
             || task.block.is_some()
             || task.debug.is_some()
-            || task.set_fact.is_some())
+            || task.set_fact.is_some()
+            || task.wait_for.is_some())
     {
         bail!(
-            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug/set_fact tasks"
+            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug/set_fact/wait_for tasks"
         );
     }
 
     if task.timeout.is_some() && task.run.is_none() {
         bail!("timeout: is only supported on run: tasks");
+    }
+
+    if let Some(spec) = &task.wait_for {
+        let set_count = [
+            spec.check_url.is_some(),
+            spec.check_port.is_some(),
+            spec.ssh.is_some(),
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
+        if set_count != 1 {
+            bail!(
+                "wait_for: needs exactly one of check_url/check_port/ssh, task '{}' has {set_count}",
+                task.name
+            );
+        }
     }
 
     if let Some(msg) = &task.debug {
@@ -1141,6 +1188,74 @@ fn run_task_once(
                     reg.clone(),
                     serde_json::to_string(&items).unwrap_or_default(),
                 );
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.wait_for {
+        // Exactly one of these is Some — enforced upfront above.
+        let describe = if let Some(url) = &spec.check_url {
+            format!("{} to respond", render(url, vars))
+        } else if let Some(port_spec) = &spec.check_port {
+            format!(
+                "{}:{} to accept connections",
+                render(&port_spec.host, vars),
+                port_spec.port
+            )
+        } else {
+            let ssh_spec = spec.ssh.as_ref().expect("validated: exactly one check set");
+            format!(
+                "'{}' to succeed on {}",
+                render(&ssh_spec.command, vars),
+                render(&ssh_spec.server, vars)
+            )
+        };
+        if !env.quiet {
+            println!(
+                "  {} waiting for {describe} (up to {}s)...",
+                "→".bold(),
+                spec.timeout
+            );
+        }
+        if !env.dry {
+            let deadline = Instant::now() + Duration::from_secs(spec.timeout);
+            loop {
+                let attempt_ok = if let Some(url) = &spec.check_url {
+                    check_url(&render(url, vars), true).is_ok()
+                } else if let Some(port_spec) = &spec.check_port {
+                    check_port(
+                        &render(&port_spec.host, vars),
+                        port_spec.port,
+                        port_spec.timeout,
+                        true,
+                    )
+                    .is_ok()
+                } else {
+                    let ssh_spec = spec.ssh.as_ref().expect("validated: exactly one check set");
+                    let server_name = render(&ssh_spec.server, vars);
+                    let full_cmd = crate::commands::fleet::exec_command(
+                        &render(&ssh_spec.command, vars),
+                        ssh_spec.sudo,
+                    );
+                    crate::commands::ssh::resolve_server(env.ctx, &server_name)
+                        .ok()
+                        .and_then(|server| {
+                            crate::db::ssh_exec_capture_lenient(&server, &full_cmd).ok()
+                        })
+                        .map(|(_, _, success)| success)
+                        .unwrap_or(false)
+                };
+                if attempt_ok {
+                    if !env.quiet {
+                        println!("  {} {describe}", "✓ ok".green().bold());
+                    }
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!("timed out after {}s waiting for {describe}", spec.timeout);
+                }
+                std::thread::sleep(Duration::from_secs(spec.interval));
             }
         }
         return Ok(());
@@ -1400,8 +1515,9 @@ fn run_task_once(
     }
 
     bail!(
-        "task '{}' has no action (run, check_url, check_port, http, scrape, env_check, ssh, \
-         fleet, include, assert, block, debug, set_fact, sync_db, sync_files)",
+        "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
+         env_check, ssh, fleet, include, assert, block, debug, set_fact, sync_db, \
+         sync_files)",
         task.name
     );
 }
@@ -2370,6 +2486,71 @@ mod tests {
         };
         assert_eq!(m.get("name"), Some(&"a".to_string()));
         assert_eq!(m.get("port"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn wait_for_requires_exactly_one_check() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+
+        // Zero checks set.
+        let task = Task {
+            wait_for: Some(WaitForSpec::default()),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+
+        // Exactly one — accepted (dry: true, so no real polling happens).
+        let task = Task {
+            wait_for: Some(WaitForSpec {
+                check_url: Some("http://example.com".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+
+        // Two checks set at once.
+        let task = Task {
+            wait_for: Some(WaitForSpec {
+                check_url: Some("http://example.com".to_string()),
+                check_port: Some(CheckPortSpec {
+                    host: "example.com".to_string(),
+                    port: 80,
+                    timeout: 5,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+    }
+
+    #[test]
+    fn wait_for_rejects_register() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            register: Some("x".to_string()),
+            wait_for: Some(WaitForSpec {
+                check_url: Some("http://example.com".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
     }
 
     #[test]

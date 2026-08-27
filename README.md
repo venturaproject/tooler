@@ -349,6 +349,7 @@ tooler play playbook.yml --var host=prod.example.com   # override a variable
 | `check_port: {host, port}` | TCP connectivity check |
 | `http: {method, url, headers, body, timeout, ignore_status}` | Make an HTTP request |
 | `scrape: {url, headers, each, fields, timeout}` | Extract data from a page with CSS selectors |
+| `wait_for: {check_url/check_port/ssh, interval, timeout}` | Poll a check until it succeeds or times out |
 | `env_check: {reference, target}` | Verify .env has all keys from reference |
 | `ssh: {server, command, sudo}` | Run a command on one remote server profile over SSH |
 | `fleet: {servers/group/all, command, sudo, parallel}` | Run a command on multiple server profiles (same targeting as [`tooler fleet`](#tooler-fleet)) |
@@ -442,6 +443,23 @@ tasks:
 ```
 
 `scrape:` GETs `url:`, parses the HTML, and pulls one object per `each:` match (or a single object for the whole page if `each:` is omitted) into `register:`'s var as a JSON array — each `fields:` entry is a CSS selector, optionally `"<selector>@<attr>"` to grab an attribute (e.g. `href`, `src`) instead of trimmed text content; a selector with no match just yields an empty string for that field rather than failing the task. It's a plain, well-behaved HTTP client (an explicit `tooler/<version>` User-Agent, no proxy rotation or bot-detection bypass) — same trust model as `check_url:`/`http:`: you supply the URL, `tooler` doesn't decide what's okay to scrape. Because the registered value is a JSON array, it plugs directly into `loop:`'s dynamic form (see below) with no extra glue.
+
+```yaml
+tasks:
+  - name: Restart the app
+    ssh:
+      server: web1
+      command: systemctl restart myapp
+      sudo: true
+
+  - name: Wait for it to actually come back up before moving on
+    wait_for:
+      check_url: http://{{host}}/health
+      interval: 2
+      timeout: 60
+```
+
+`wait_for:` polls exactly one of `check_url:`/`check_port:`/`ssh:` (same shapes as the standalone actions) every `interval:` seconds (default 2) until it succeeds or `timeout:` (default 60) elapses, then fails with a clear timeout message. It's the poll-until-ready counterpart to `retries:` — `retries:` re-runs a whole task after it *fails*; `wait_for:` is for "keep checking until this becomes true," so it only logs a start line and the final outcome, not one line per attempt. `register:` isn't supported on it (nothing to capture beyond pass/fail).
 
 `ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed; `parallel: true` runs all targeted servers concurrently instead of one at a time (same flag as `tooler fleet exec/check --parallel`, see [`tooler fleet`](#tooler-fleet)). `ssh:`'s `server:` and `fleet:`'s `servers:`/`group:` are all rendered through `{{var}}` like any other field, so the target can be chosen at invocation time — `fleet: {group: "{{target}}"}` plus `tooler play deploy --var target=web-canary` — instead of hardcoded in the YAML.
 
