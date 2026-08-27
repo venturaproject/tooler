@@ -1,4 +1,4 @@
-use crate::{context::Context, output::OutputFormat, project};
+use crate::{context::Context, output::OutputFormat, project, report};
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use colored::Colorize;
@@ -131,6 +131,9 @@ struct Task {
     /// Poll a check until it succeeds or times out — see `WaitForSpec`. Exactly one of
     /// `check_url`/`check_port`/`ssh` must be set within it (validated upfront).
     wait_for: Option<WaitForSpec>,
+    /// Generate a PDF/Excel/HTML report from inline data — see `ReportSpec`. `register:`
+    /// (if set) captures the output file's byte size, same convention as `sync_db:`.
+    report: Option<ReportSpec>,
     env_check: Option<EnvCheckSpec>,
     ssh: Option<SshSpec>,
     fleet: Option<FleetSpec>,
@@ -420,6 +423,30 @@ struct ScrapeSpec {
     /// field name -> CSS selector, optionally `"<selector>@<attr>"` to grab an attribute
     /// (e.g. `href`, `src`) instead of trimmed text content.
     fields: HashMap<String, String>,
+}
+
+/// Generate a PDF/Excel/HTML report — the same engine `tooler report pdf/excel/html`
+/// uses (`report::{pdf,excel,html}::build`), but fed inline data instead of file paths,
+/// so a `register:`ed `http:`/`scrape:` result can go straight into a report with no
+/// temp-file round-trip.
+#[derive(Debug, Deserialize)]
+struct ReportSpec {
+    /// "html", "pdf", or "excel"
+    format: String,
+    #[serde(default = "default_report_title")]
+    title: String,
+    /// name -> a rendered value (typically `"{{a_registered_var}}"`). Parsed as JSON if
+    /// possible; a value that isn't valid JSON is wrapped as a plain JSON string instead
+    /// of failing the task, matching the DSL's general tolerance for opaque var content
+    /// elsewhere (e.g. a missing `scrape:` field becomes `""`, not an error).
+    sources: HashMap<String, String>,
+    /// Output path, relative to the playbook's own directory (same rule as `run:`'s
+    /// working directory / `env_check:`'s paths).
+    out: String,
+}
+
+fn default_report_title() -> String {
+    "Tooler Report".to_string()
 }
 
 fn default_timeout() -> u64 {
@@ -1409,6 +1436,62 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.report {
+        let format = spec.format.to_lowercase();
+        if !matches!(format.as_str(), "html" | "pdf" | "excel") {
+            bail!(
+                "report: format must be one of html/pdf/excel, task '{}' has '{}'",
+                task.name,
+                spec.format
+            );
+        }
+        let title = render(&spec.title, vars);
+        let out_path = env.playbook_dir.join(render(&spec.out, vars));
+        if !env.quiet {
+            println!(
+                "  {} report format={format} out={}",
+                "→".bold(),
+                out_path.display()
+            );
+        }
+        if !env.dry {
+            let sources: Vec<report::Source> = spec
+                .sources
+                .iter()
+                .map(|(name, raw)| {
+                    let rendered = render(raw, vars);
+                    let value = serde_json::from_str(&rendered)
+                        .unwrap_or(serde_json::Value::String(rendered));
+                    report::Source {
+                        name: name.clone(),
+                        value,
+                    }
+                })
+                .collect();
+            let bytes = match format.as_str() {
+                "html" => report::html::build(&title, &sources),
+                "pdf" => report::pdf::build(&title, &sources),
+                "excel" => report::excel::build(&title, &sources),
+                _ => unreachable!("validated above"),
+            }
+            .with_context(|| format!("building {format} report"))?;
+            std::fs::write(&out_path, &bytes)
+                .with_context(|| format!("writing report: {}", out_path.display()))?;
+            if !env.quiet {
+                println!(
+                    "  {} {} bytes -> {}",
+                    "✓ ok".green().bold(),
+                    bytes.len(),
+                    out_path.display()
+                );
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), bytes.len().to_string());
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.env_check {
         let reference = env.playbook_dir.join(render(&spec.reference, vars));
         let target = env.playbook_dir.join(render(&spec.target, vars));
@@ -1703,8 +1786,8 @@ fn run_task_once(
 
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
-         env_check, ssh, fleet, include, assert, block, debug, confirm, set_fact, sync_db, \
-         sync_files)",
+         report, env_check, ssh, fleet, include, assert, block, debug, confirm, set_fact, \
+         sync_db, sync_files)",
         task.name
     );
 }
@@ -2744,6 +2827,69 @@ mod tests {
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+    }
+
+    #[test]
+    fn report_spec_deserializes_with_default_title() {
+        let spec: ReportSpec = serde_yaml::from_str(
+            "format: html\nsources:\n  data: \"{{resp}}\"\nout: report.html\n",
+        )
+        .unwrap();
+        assert_eq!(spec.format, "html");
+        assert_eq!(spec.title, "Tooler Report");
+        assert_eq!(
+            spec.sources.get("data").map(String::as_str),
+            Some("{{resp}}")
+        );
+        assert_eq!(spec.out, "report.html");
+    }
+
+    #[test]
+    fn report_rejects_an_unknown_format() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            report: Some(ReportSpec {
+                format: "csv".to_string(),
+                title: default_report_title(),
+                sources: HashMap::new(),
+                out: "out.csv".to_string(),
+            }),
+            ..Default::default()
+        };
+        let err = run_task_once(&task, &mut vars, &mut include_stack, &env).unwrap_err();
+        assert!(
+            err.to_string().contains("html/pdf/excel"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn report_accepts_a_known_format_case_insensitively() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx); // dry: true — validates format without writing a file
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            report: Some(ReportSpec {
+                format: "HTML".to_string(),
+                title: default_report_title(),
+                sources: HashMap::new(),
+                out: "out.html".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
     }
 
     #[test]

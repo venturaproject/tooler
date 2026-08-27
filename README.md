@@ -353,6 +353,7 @@ tooler play playbook.yml --start-at-task "run tests"   # skip ahead, rerun after
 | `http: {method, url, headers, body, timeout, ignore_status}` | Make an HTTP request |
 | `scrape: {url, headers, each, fields, timeout}` | Extract data from a page with CSS selectors |
 | `wait_for: {check_url/check_port/ssh, interval, timeout}` | Poll a check until it succeeds or times out |
+| `report: {format, title, sources, out}` | Generate a PDF/Excel/HTML report from inline data |
 | `env_check: {reference, target}` | Verify .env has all keys from reference |
 | `ssh: {server, command, sudo}` | Run a command on one remote server profile over SSH |
 | `fleet: {servers/group/all, command, sudo, parallel}` | Run a command on multiple server profiles (same targeting as [`tooler fleet`](#tooler-fleet)) |
@@ -464,6 +465,28 @@ tasks:
 ```
 
 `wait_for:` polls exactly one of `check_url:`/`check_port:`/`ssh:` (same shapes as the standalone actions) every `interval:` seconds (default 2) until it succeeds or `timeout:` (default 60) elapses, then fails with a clear timeout message. It's the poll-until-ready counterpart to `retries:` — `retries:` re-runs a whole task after it *fails*; `wait_for:` is for "keep checking until this becomes true," so it only logs a start line and the final outcome, not one line per attempt. `register:` isn't supported on it (nothing to capture beyond pass/fail).
+
+```yaml
+tasks:
+  - name: Scrape the job listings
+    scrape:
+      url: https://example.com/jobs
+      each: .listing
+      fields:
+        title: .title
+        company: .company
+    register: listings
+
+  - name: Turn them straight into a report — no temp file
+    report:
+      format: html          # or pdf / excel
+      title: "Job listings"
+      sources:
+        listings: "{{listings}}"
+      out: report.html
+```
+
+`report:` is the same engine [`tooler report pdf`/`excel`/`html`](#tooler-report) uses (`report::extract` turns each source's array-of-objects fields into tables, with an auto bar chart for any numeric column), just fed inline data instead of file paths — so a `register:`ed `http:`/`scrape:` result goes straight into a report, in the same playbook, with no round-trip through a temp JSON file. Each `sources:` value is rendered and parsed as JSON; a value that isn't valid JSON is wrapped as a plain JSON string instead of failing the task (matches the DSL's general tolerance for opaque var content elsewhere). `out:` resolves relative to the playbook's own directory, same as `run:`/`env_check:` paths. `register:` (if set) captures the output file's byte size, same convention as `sync_db:`.
 
 ```yaml
 tasks:

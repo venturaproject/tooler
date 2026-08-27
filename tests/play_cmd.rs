@@ -921,3 +921,36 @@ fn include_with_vars_overrides_and_restores_between_calls() {
     let value = last_line_json(&out);
     assert_eq!(value["success"], true);
 }
+
+#[test]
+fn report_task_writes_a_report_from_inline_data_no_temp_file() {
+    // set_fact: seeds a JSON-looking var directly (no scrape:/http: needed) — this test
+    // exercises report:'s own Source-building/file-writing path, not the network.
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ReportTask\n\
+         tasks:\n\
+         \x20\x20- name: seed data\n\
+         \x20\x20\x20\x20set_fact:\n\
+         \x20\x20\x20\x20\x20\x20data: '[{\"name\": \"a\", \"count\": 3}, {\"name\": \"b\", \"count\": 7}]'\n\
+         \x20\x20- name: build html report\n\
+         \x20\x20\x20\x20report:\n\
+         \x20\x20\x20\x20\x20\x20format: html\n\
+         \x20\x20\x20\x20\x20\x20sources:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20items: \"{{data}}\"\n\
+         \x20\x20\x20\x20\x20\x20out: out.html\n\
+         \x20\x20\x20\x20register: report_size\n\
+         \x20\x20- name: report size is a positive number\n\
+         \x20\x20\x20\x20assert: \"{{report_size}} != 0\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+
+    let report_path = dir.path().join("out.html");
+    assert!(report_path.exists());
+    let content = std::fs::read_to_string(&report_path).unwrap();
+    assert!(content.starts_with("<!doctype html>"));
+    assert!(content.contains("<th>name</th>"));
+}
