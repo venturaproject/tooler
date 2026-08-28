@@ -1121,3 +1121,85 @@ fn resume_and_start_at_task_are_mutually_exclusive() {
         "stderr was: {err}"
     );
 }
+
+#[test]
+fn repl_executes_lines_tracks_vars_and_saves_a_session() {
+    let (mut cmd, dir) = tooler();
+    let out = stdout_of(
+        cmd.args(["play", "--repl"])
+            .write_stdin(
+                "run: echo hi\n\
+                 set_fact: {x: \"1\"}\n\
+                 .vars\n\
+                 .save session.yml\n\
+                 .exit\n",
+            )
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("x = 1"), "stdout was: {out}");
+    assert!(out.contains("saved 2 task(s)"), "stdout was: {out}");
+
+    let saved = std::fs::read_to_string(dir.path().join("session.yml")).unwrap();
+    assert!(saved.contains("name: REPL session"));
+    assert!(saved.contains("run: echo hi"));
+    assert!(saved.contains("x: '1'") || saved.contains("x: \"1\""));
+}
+
+#[test]
+fn repl_survives_an_invalid_line_and_keeps_taking_input() {
+    let (mut cmd, _dir) = tooler();
+    let out = stdout_of(
+        cmd.args(["play", "--repl"])
+            .write_stdin(
+                "this is not: valid: yaml: at all\n\
+                 run: echo still-alive\n\
+                 .exit\n",
+            )
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("invalid YAML"), "stdout was: {out}");
+    assert!(out.contains("still-alive"), "stdout was: {out}");
+}
+
+#[test]
+fn repl_save_excludes_a_hard_failure_but_keeps_an_ignored_one() {
+    let (mut cmd, dir) = tooler();
+    cmd.args(["play", "--repl"])
+        .write_stdin(
+            "run: echo kept\n\
+             notanaction: oops\n\
+             {run: \"exit 1\", ignore_errors: true}\n\
+             .save session.yml\n\
+             .exit\n",
+        )
+        .assert()
+        .success();
+
+    let saved = std::fs::read_to_string(dir.path().join("session.yml")).unwrap();
+    assert!(saved.contains("echo kept"));
+    assert!(saved.contains("ignore_errors: true"));
+    assert!(!saved.contains("notanaction"));
+}
+
+#[test]
+fn repl_saved_session_is_a_real_playbook_that_tooler_play_can_run() {
+    let dir = tempdir().unwrap();
+    tooler_in(dir.path())
+        .args(["play", "--repl"])
+        .write_stdin("run: echo roundtrip\n.save out.yml\n.exit\n")
+        .assert()
+        .success();
+
+    let saved_path = dir.path().join("out.yml");
+    assert!(saved_path.exists());
+
+    let out = stdout_of(
+        tooler_in(dir.path())
+            .args(["play", "out.yml"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("roundtrip"), "stdout was: {out}");
+}

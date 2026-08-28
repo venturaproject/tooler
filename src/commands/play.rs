@@ -57,6 +57,15 @@ pub struct PlayArgs {
     /// with `--start-at-task`.
     #[arg(long)]
     pub resume: bool,
+
+    /// Start an interactive console: type one task action at a time (`run: echo hi`, or
+    /// `{http: {url: "..."}, register: x}` for multiple keys on one line) and see it
+    /// execute immediately against a `vars` map that persists for the session. `.help`
+    /// lists meta-commands (`.vars`, `.save <file>`, `.clear`, `.exit`). FILE, if given,
+    /// only seeds initial vars from that playbook's `vars_files:`/`vars:` — its `tasks:`
+    /// are never run.
+    #[arg(long)]
+    pub repl: bool,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
@@ -642,6 +651,19 @@ fn load_playbook_vars(playbook: &Playbook, dir: &Path) -> Result<HashMap<String,
     Ok(merged)
 }
 
+/// Applies `--var key=value` CLI overrides (repeatable) on top of `vars`, in order —
+/// shared by a normal run, a `--resume`d run, and `--repl`.
+fn apply_var_overrides(vars: &mut HashMap<String, String>, raw: &[String]) -> Result<()> {
+    for var in raw {
+        if let Some((k, v)) = var.split_once('=') {
+            vars.insert(k.trim().to_string(), v.trim().to_string());
+        } else {
+            bail!("--var must be in key=value format, got: '{var}'");
+        }
+    }
+    Ok(())
+}
+
 pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     let (_, project_root) = project::load()?;
     let playbooks_dir = project_root.join("playbooks");
@@ -655,6 +677,33 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
             playbooks_dir.join(format!("{name}.yml"))
         };
         return write_sample(&path, ctx);
+    }
+
+    if args.repl {
+        let (mut vars, playbook_dir) = match args.file.as_deref() {
+            Some(file) => {
+                let file_path = resolve_playbook_file(file, &project_root)?;
+                let dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                let content = std::fs::read_to_string(&file_path)
+                    .with_context(|| format!("Cannot read playbook: {file}"))?;
+                let playbook: Playbook = serde_yaml::from_str(&content)
+                    .with_context(|| format!("Invalid YAML in {file}"))?;
+                (load_playbook_vars(&playbook, &dir)?, dir)
+            }
+            None => (HashMap::new(), PathBuf::from(".")),
+        };
+        apply_var_overrides(&mut vars, &args.vars)?;
+        let env = RunEnv {
+            playbook_dir,
+            project_root,
+            dry: args.dry,
+            quiet: false,
+            auto_yes: false,
+            start_at: None,
+            state_path: None,
+            ctx,
+        };
+        return run_repl(vars, env);
     }
 
     let Some(file) = args.file.as_deref() else {
@@ -722,13 +771,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     // --var overrides apply on top either way — on a fresh run as always, and on a
     // resumed run so a bad value can be fixed before retrying (the whole point of
     // resuming rather than restarting from scratch).
-    for var in &args.vars {
-        if let Some((k, v)) = var.split_once('=') {
-            vars.insert(k.trim().to_string(), v.trim().to_string());
-        } else {
-            bail!("--var must be in key=value format, got: '{var}'");
-        }
-    }
+    apply_var_overrides(&mut vars, &args.vars)?;
 
     let tag_filter: Option<Vec<&str>> = args
         .tags
@@ -756,6 +799,184 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         true,
         &env,
     )
+}
+
+// ── REPL ──────────────────────────────────────────────────────────────────────
+
+/// Inserts `name: "<name>"` into `value` (must already be a `Mapping`) if it doesn't
+/// already have a `name` key — the synthetic name every `--repl` line gets so it can
+/// deserialize into `Task` (whose `name` field is required) without the user typing one.
+fn merge_repl_name(value: &mut serde_yaml::Value, name: &str) {
+    if let serde_yaml::Value::Mapping(map) = value {
+        let key = serde_yaml::Value::String("name".to_string());
+        if !map.contains_key(&key) {
+            map.insert(key, serde_yaml::Value::String(name.to_string()));
+        }
+    }
+}
+
+fn print_repl_help() {
+    println!("  Type one task action per line, e.g.:");
+    println!("    run: echo hi");
+    println!("    {{http: {{url: \"https://example.com\"}}, register: resp}}");
+    println!("    {{set_fact: {{x: \"1\"}}}}");
+    println!("  Any field a real playbook task supports works here too (when:, loop:,");
+    println!("  register:, retries:, ignore_errors:, ...).");
+    println!("  Commands:");
+    println!("    .vars          show every current var");
+    println!("    .clear         empty all vars");
+    println!("    .save <path>   write this session as a playbook (relative to playbook dir)");
+    println!("    .exit / .quit  end the session (Ctrl+D also works)");
+}
+
+fn print_repl_vars(vars: &HashMap<String, String>) {
+    if vars.is_empty() {
+        println!("  (no vars yet)");
+        return;
+    }
+    let mut keys: Vec<&String> = vars.keys().collect();
+    keys.sort();
+    for k in keys {
+        println!("  {} = {}", k.cyan(), vars[k].dimmed());
+    }
+}
+
+/// Writes the accumulated session (the original parsed `Value`s, never round-tripped
+/// through `Task` — so this needs no `Serialize` impl anywhere in this file) as a real
+/// playbook file, resolved relative to `playbook_dir` like every other path in this file.
+fn save_repl_session(session: &[serde_yaml::Value], playbook_dir: &Path, arg: &str) -> Result<()> {
+    let out_path = playbook_dir.join(arg);
+    let mut mapping = serde_yaml::Mapping::new();
+    mapping.insert(
+        serde_yaml::Value::String("name".to_string()),
+        serde_yaml::Value::String("REPL session".to_string()),
+    );
+    mapping.insert(
+        serde_yaml::Value::String("tasks".to_string()),
+        serde_yaml::Value::Sequence(session.to_vec()),
+    );
+    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
+        .context("serializing REPL session")?;
+    std::fs::write(&out_path, yaml).with_context(|| format!("writing {}", out_path.display()))?;
+    println!(
+        "  saved {} task(s) to {}",
+        session.len(),
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// The `--repl` loop: reads one line at a time (a task action, minus `name:` — see
+/// `PlayArgs.repl`'s doc comment for the two accepted shapes), executes it immediately
+/// against `vars`/`env` via the exact same `run_task` a real playbook run uses, and keeps
+/// going even after a failing line — unlike a batch `tooler play` run, one bad REPL line
+/// must not end the session. `.help` lists the meta-commands.
+fn run_repl(mut vars: HashMap<String, String>, env: RunEnv) -> Result<()> {
+    println!(
+        "{}",
+        "tooler play --repl — type a task action, or .help for commands. Ctrl+D / .exit to quit."
+            .dimmed()
+    );
+
+    let mut include_stack: Vec<PathBuf> = Vec::new();
+    let mut session: Vec<serde_yaml::Value> = Vec::new();
+    let mut counter = 0usize;
+
+    loop {
+        print!("tooler-repl> ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        let mut line = String::new();
+        let bytes = std::io::stdin()
+            .read_line(&mut line)
+            .context("failed to read from stdin")?;
+        if bytes == 0 {
+            println!();
+            break; // EOF (Ctrl+D)
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix('.') {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let cmd = parts.next().unwrap_or("");
+            let arg = parts.next().map(str::trim).unwrap_or("");
+            match cmd {
+                "exit" | "quit" => break,
+                "help" => print_repl_help(),
+                "vars" => print_repl_vars(&vars),
+                "clear" => {
+                    vars.clear();
+                    println!("  vars cleared");
+                }
+                "save" if arg.is_empty() => println!("  usage: .save <path>"),
+                "save" => save_repl_session(&session, &env.playbook_dir, arg)?,
+                other => println!("  unknown command: .{other} (try .help)"),
+            }
+            continue;
+        }
+
+        let mut value: serde_yaml::Value = match serde_yaml::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("  invalid YAML: {e}");
+                continue;
+            }
+        };
+        if !value.is_mapping() {
+            println!(
+                "  expected a task action, e.g. `run: echo hi` or \
+                 `{{http: {{url: \"...\"}}, register: x}}` — .help for more"
+            );
+            continue;
+        }
+        counter += 1;
+        merge_repl_name(&mut value, &format!("repl-{counter}"));
+
+        let task: Task = match serde_yaml::from_value(value.clone()) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("  invalid task: {e}");
+                continue;
+            }
+        };
+
+        // execute_playbook normally evaluates when: one level up, before calling
+        // run_task — replicated here since the REPL calls run_task directly.
+        if let Some(w) = &task.when
+            && !eval_when(w, &vars)
+        {
+            println!("  (skipped — when: {w} was false)");
+            session.push(value);
+            continue;
+        }
+
+        // Only recorded into the .save-able session on success (or an explicitly
+        // ignore_errors:'d failure) — a hard failure is very often a typo/mistake being
+        // actively debugged, and .save shouldn't bake a task that's known to fail straight
+        // back into a "clean" playbook file.
+        match run_task(&task, &mut vars, &mut include_stack, &env) {
+            Ok(()) => {
+                session.push(value);
+                if let Some(reg) = &task.register {
+                    let val = vars.get(reg).map(String::as_str).unwrap_or("");
+                    println!("  {} = {}", reg.cyan(), val.dimmed());
+                }
+            }
+            Err(e) => {
+                if task.ignore_errors {
+                    session.push(value);
+                    println!("  {} failed (ignored): {e}", "!".yellow().bold());
+                } else {
+                    println!("  {} {e}", "✗".red().bold());
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── Runner ────────────────────────────────────────────────────────────────────
@@ -3036,6 +3257,22 @@ mod tests {
             err.to_string().contains("max_parallel:"),
             "error was: {err}"
         );
+    }
+
+    #[test]
+    fn merge_repl_name_adds_a_name_when_absent() {
+        let mut value: serde_yaml::Value = serde_yaml::from_str("run: echo hi").unwrap();
+        merge_repl_name(&mut value, "repl-1");
+        assert_eq!(value["name"].as_str(), Some("repl-1"));
+        assert_eq!(value["run"].as_str(), Some("echo hi"));
+    }
+
+    #[test]
+    fn merge_repl_name_leaves_an_explicit_name_alone() {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str("name: my task\nrun: echo hi\n").unwrap();
+        merge_repl_name(&mut value, "repl-1");
+        assert_eq!(value["name"].as_str(), Some("my task"));
     }
 
     #[test]

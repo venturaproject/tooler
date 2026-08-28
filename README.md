@@ -346,6 +346,33 @@ tooler play playbook.yml --resume --var host=fixed.example.com  # resume after a
 
 **`--resume`** is the real thing: every top-level run writes a checkpoint (`<file>.state.json`, a sibling of the playbook file) after each task's non-fatal outcome, capturing the *entire* vars map at that point — deleted automatically once the playbook fully succeeds. `tooler play playbook.yml --resume` restores those vars exactly as they were after the last completed task, continues with the task right after it, and errors clearly if no checkpoint exists. `--var` overrides still apply on top of the restored vars, so a bad value can be fixed before retrying — the whole point of resuming rather than restarting from scratch. **Security note**: since the checkpoint holds the *entire* vars snapshot, it can contain values resolved from `{{secret.*}}` (e.g. via `set_fact:`) — the file is written with `0600` permissions on Unix, but treat it like any other local credential material (gitignore `*.state.json`) rather than relying on that alone.
 
+**`--repl`** starts an interactive console over the same task-action engine — type one task at a time and see it execute immediately against a `vars` map that persists for the whole session, instead of writing a whole YAML file up front:
+
+```sh
+tooler play --repl                 # fresh session, empty vars
+tooler play playbook.yml --repl    # seeds vars from playbook.yml's vars_files:/vars: — its tasks: are never run
+```
+
+```
+tooler play --repl — type a task action, or .help for commands. Ctrl+D / .exit to quit.
+tooler-repl> run: echo hi
+  $ echo hi
+hi
+  ✓ ok (0.0s)
+tooler-repl> {http: {url: "https://api.example.com/status"}, register: resp}
+  GET → https://api.example.com/status
+  resp = {"ok":true}
+tooler-repl> {set_fact: {status: "{{resp | json:ok}}"}}
+tooler-repl> .vars
+  resp = {"ok":true}
+  status = true
+tooler-repl> .save check.yml
+  saved 3 task(s) to check.yml
+tooler-repl> .exit
+```
+
+Each line is the *body* of a task — everything a YAML task has except `name:`, which the REPL fills in for you (`repl-1`, `repl-2`, ...). A bare `key: value` line works for a single-key action (`run: echo hi`); wrap the whole line in `{...}` (flow-style YAML) to add `register:`/`when:`/`ignore_errors:`/etc. on the same line — no new syntax, this is just YAML. Any field a real playbook task supports works here too, including `loop:`/`max_parallel:`/`block:`/`include:`. A failing line (a typo, a bad URL) prints the error and **keeps the session going** — unlike a batch `tooler play` run, one bad line doesn't end it. Meta-commands: `.vars` (show every current var, unmasked — same tradeoff `debug:` already makes), `.clear` (empty all vars), `.save <path>` (write the session so far as a real playbook, resolved relative to the playbook's directory — only lines that actually succeeded, or explicitly failed with `ignore_errors: true`, are included; a hard failure you were debugging isn't baked back into the "clean" file), `.help`, and `.exit`/`.quit` (Ctrl+D also works). Like `confirm:`, this is an inherently interactive tool — not wired into the `tooler_play` MCP tool.
+
 **Available task actions:**
 
 | Action | Description |
