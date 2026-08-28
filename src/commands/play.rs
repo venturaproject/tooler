@@ -1225,12 +1225,7 @@ fn execute_playbook(
             Err(e) => {
                 if task.ignore_errors {
                     if !json {
-                        println!(
-                            "  {} {} — {}",
-                            "!".yellow().bold(),
-                            "failed (ignored):".yellow(),
-                            e
-                        );
+                        println!("  {} failed (ignored): {e}", "!".yellow().bold());
                     }
                     skipped += 1;
                     outcomes.push(TaskOutcome {
