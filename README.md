@@ -339,9 +339,12 @@ tooler play playbook.yml --dry              # preview without executing
 tooler play playbook.yml --tags build,test  # run only tagged tasks
 tooler play playbook.yml --var host=prod.example.com   # override a variable
 tooler play playbook.yml --start-at-task "run tests"   # skip ahead, rerun after a fix
+tooler play playbook.yml --resume --var host=fixed.example.com  # resume after a failure
 ```
 
-`--start-at-task <name>` skips straight to the named **top-level** task, treating every earlier task as already done — not run, not counted, no output. It's a practical rerun-after-a-fix tool, not a full `--resume`: there's no persisted run state, so a task after the start point that reads `{{a_var}}` registered by a now-skipped earlier task sees it unresolved, same as any other unknown token. Has no effect inside `include:`/`block:` — it only ever applies to the outermost playbook's own task list.
+`--start-at-task <name>` skips straight to the named **top-level** task, treating every earlier task as already done — not run, not counted, no output. It's a practical rerun-after-a-fix tool, not a full `--resume`: there's no persisted run state, so a task after the start point that reads `{{a_var}}` registered by a now-skipped earlier task sees it unresolved, same as any other unknown token. Has no effect inside `include:`/`block:` — it only ever applies to the outermost playbook's own task list. Mutually exclusive with `--resume`.
+
+**`--resume`** is the real thing: every top-level run writes a checkpoint (`<file>.state.json`, a sibling of the playbook file) after each task's non-fatal outcome, capturing the *entire* vars map at that point — deleted automatically once the playbook fully succeeds. `tooler play playbook.yml --resume` restores those vars exactly as they were after the last completed task, continues with the task right after it, and errors clearly if no checkpoint exists. `--var` overrides still apply on top of the restored vars, so a bad value can be fixed before retrying — the whole point of resuming rather than restarting from scratch. **Security note**: since the checkpoint holds the *entire* vars snapshot, it can contain values resolved from `{{secret.*}}` (e.g. via `set_fact:`) — the file is written with `0600` permissions on Unix, but treat it like any other local credential material (gitignore `*.state.json`) rather than relying on that alone.
 
 **Available task actions:**
 
@@ -365,6 +368,8 @@ tooler play playbook.yml --start-at-task "run tests"   # skip ahead, rerun after
 | `set_fact: {name: "<expr>", ...}` | Compute/override one or more vars from rendered expressions; no side effects |
 | `sync_db: {server, from, to}` | Dump `from`'s database and restore it into `to`'s, both reached through the same server |
 | `sync_files: {server, from, to, delete}` | Rsync a directory from one path to another on the same server |
+| `write_file: {path, content, append}` | Write (or append) rendered text to a local file |
+| `db_query: {server, sql, env/engine/host/port/database/user/password, max_rows}` | Run a read-only SQL query over SSH and capture the rows |
 
 ```yaml
 tasks:
@@ -490,6 +495,32 @@ tasks:
 
 ```yaml
 tasks:
+  - name: Query recent signups
+    db_query:
+      server: prod
+      env: backend/.env
+      sql: "SELECT id, email FROM users WHERE created_at > NOW() - INTERVAL 1 DAY"
+    register: signups
+
+  - name: Turn them into a report — same no-temp-file pattern as scrape:/http:
+    report:
+      format: html
+      sources:
+        signups: "{{signups}}"
+      out: signups.html
+
+  - name: Also keep the raw rows on disk
+    write_file:
+      path: signups.json
+      content: "{{signups}}\n"
+```
+
+`db_query:` runs a read-only query (SELECT/SHOW/EXPLAIN/WITH/DESCRIBE only — the same enforcement `tooler db query` uses) over SSH and, with `register:`, captures the rows as a JSON array — same convention as `scrape:`, so it plugs directly into `loop: {from: "{{reg}}"}` or `report:` with no temp file. Credentials resolve exactly like `sync_db:`'s `from:`/`to:` sides: either `env: <remote .env path>` or explicit `engine:`/`host:`/`port:`/`database:`/`user:`/`password:` fields. `max_rows:` caps the result (default 1000, same as `tooler db query --max-rows`).
+
+`write_file:` renders `content:` and writes it to `path:` (resolved relative to the playbook's own directory, parent directories created as needed) — `report:`'s counterpart for arbitrary text instead of structured data: a generated config, a `.env`, a one-line summary. `append: true` appends instead of overwriting. Unlike `run:`, only the destination path and byte count are ever printed — never the content — since it may itself resolve `{{secret.*}}` tokens. `register:` (if set) captures the byte count written.
+
+```yaml
+tasks:
   - name: About to drop and restore the production database
     confirm: "This will overwrite prod_db on {{host}}. Continue?"
 
@@ -584,7 +615,7 @@ Useful for splitting environment-specific values (`defaults.yml`, `prod.yml`) ou
 **Per-task modifiers**, usable with any action above:
 
 - `when: "{{env}} == prod"` — skip the task unless the condition (evaluated once against the playbook's vars, after `{{var}}` substitution) holds. Supports `==`, `!=`, or a bare truthy check — not a full expression language.
-- `loop: [a, b, c]` — run the task once per item, with `{{item}}` available to the action (e.g. `run: systemctl restart {{item}}`). The first failing iteration fails the task; remaining items aren't attempted. Items can also be maps — `loop: [{name: a, port: "1"}, {name: b, port: "2"}]` exposes `{{item.name}}`/`{{item.port}}` per iteration instead of a single `{{item}}`. `loop: {from: "{{var}}"}` is the dynamic form — resolved at run time instead of fixed in the YAML: if the rendered var parses as a JSON array (typically a `register:`ed `scrape:`/`http:` result), each element becomes an item (objects → `{{item.<field>}}`, same as a static map list); otherwise the rendered text is split on `split:` (default `"\n"`) into scalar items. This is what makes `scrape:`'s output directly loopable with no extra step.
+- `loop: [a, b, c]` — run the task once per item, with `{{item}}` available to the action (e.g. `run: systemctl restart {{item}}`). The first failing iteration fails the task; remaining items aren't attempted. Items can also be maps — `loop: [{name: a, port: "1"}, {name: b, port: "2"}]` exposes `{{item.name}}`/`{{item.port}}` per iteration instead of a single `{{item}}`. `loop: {from: "{{var}}"}` is the dynamic form — resolved at run time instead of fixed in the YAML: if the rendered var parses as a JSON array (typically a `register:`ed `scrape:`/`http:` result), each element becomes an item (objects → `{{item.<field>}}`, same as a static map list); otherwise the rendered text is split on `split:` (default `"\n"`) into scalar items. This is what makes `scrape:`'s output directly loopable with no extra step. `max_parallel: N` (only valid combined with `loop:`) runs items concurrently in chunks of N instead of strictly one at a time — same `std::thread::scope` fan-out `fleet:`'s `parallel: true` uses, useful for a `loop:` over many URLs/servers/rows. `register:` still captures the *last item in original order*, deterministic despite the concurrent scheduling; a failing chunk's other already-started items still finish before the task is reported failed.
 - `register: <name>` — capture the task's output into a variable, usable by any later task via `{{name}}`. Supported on `run:`/`ssh:`/`fleet:` only (an upfront error otherwise). `run:` normally streams its subprocess's output live; it only switches to capturing (needed to register it) when `register:` is actually set on that task, so every other `run:` task is unaffected. Inside a `loop:`, only the last iteration's value persists.
 - `retries: N` / `delay: S` — retry a failing task up to N extra times, waiting `delay` seconds (default 1) between attempts, before giving up. Applies per `loop:` iteration if combined with `loop:`; ignored entirely in `--dry`.
 - `notify: [handler, ...]` / `changed_when: "<condition>"` — trigger one or more `handlers:` (a playbook-level list of tasks, matched by name) when this task succeeds. Each notified handler runs **at most once**, after every regular task has succeeded, deduplicated across however many tasks notified it. Without `changed_when:`, a successful task always counts as "changed"; with it, only when the condition holds (typically checking a `register:`ed value). Notifying a handler name with no matching `handlers:` entry is rejected upfront, before any task runs — not silently ignored.

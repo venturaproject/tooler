@@ -44,9 +44,19 @@ pub struct PlayArgs {
     /// done (not run, not counted). A practical rerun-after-a-fix tool, not a full
     /// --resume: a later task reading a `{{registered_var}}` from a now-skipped earlier
     /// task sees it unresolved, since no prior state is replayed. Top-level tasks only —
-    /// has no effect inside `include:`/`block:`.
+    /// has no effect inside `include:`/`block:`. Mutually exclusive with `--resume`, which
+    /// covers this case with real state.
     #[arg(long = "start-at-task")]
     pub start_at_task: Option<String>,
+
+    /// Resume from the checkpoint left by a previous failed run of this same playbook
+    /// file (`<file>.state.json`, written after every top-level task and deleted on full
+    /// success — see `PlayCheckpoint`). Restores the vars exactly as they were after the
+    /// last completed task, then still applies any `--var` overrides on top, and continues
+    /// with the task right after it. Errors if no checkpoint exists. Mutually exclusive
+    /// with `--start-at-task`.
+    #[arg(long)]
+    pub resume: bool,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
@@ -181,6 +191,22 @@ struct Task {
     /// trailing slash appended if missing, so it always copies contents, not the
     /// directory itself (see `ensure_trailing_slash`).
     sync_files: Option<SyncFilesSpec>,
+    /// Write rendered `content` to a local file at `path` (relative to this playbook's
+    /// own directory). Only the destination path and byte count are ever printed — never
+    /// the content — since `content` may itself resolve `{{secret.*}}` tokens (e.g.
+    /// writing a `.env` file). `register:` (if set) captures the byte count written. See
+    /// `WriteFileSpec`.
+    write_file: Option<WriteFileSpec>,
+    /// Run a read-only SQL query against a database over SSH and capture the rows.
+    /// `register:` (if set) captures a JSON array of row objects, same convention as
+    /// `scrape:` — directly chainable into `loop: {from: "{{reg}}"}` or `report:`. See
+    /// `DbQuerySpec`.
+    db_query: Option<DbQuerySpec>,
+    /// Cap concurrent `loop:` iterations to N at a time (processed in chunks of N) instead
+    /// of the default strictly-sequential execution. Only valid combined with `loop:`. See
+    /// `run_loop_parallel`.
+    #[serde(default)]
+    max_parallel: Option<usize>,
 }
 
 /// One `loop:` item — a plain scalar (`{{item}}`) or a map (`{{item.<field>}}` per key).
@@ -449,6 +475,49 @@ fn default_report_title() -> String {
     "Tooler Report".to_string()
 }
 
+/// `write_file:` — writes rendered `content` to `path` (relative to the playbook's own
+/// directory), creating parent directories as needed.
+#[derive(Debug, Deserialize)]
+struct WriteFileSpec {
+    path: String,
+    content: String,
+    /// Append instead of overwrite.
+    #[serde(default)]
+    append: bool,
+}
+
+/// `db_query:` — mirrors `commands::db::DbSubcommand::Query`'s fields exactly, so the
+/// mental model transfers 1:1 from the standalone `tooler db query` command.
+#[derive(Debug, Deserialize)]
+struct DbQuerySpec {
+    /// Server profile to run the query through (see: tooler server list)
+    server: String,
+    /// SQL query (SELECT/SHOW/EXPLAIN/WITH/DESCRIBE only — enforced by `db::run_query`)
+    sql: String,
+    /// Remote path to a dotenv-style file (e.g. Laravel .env) to read DB_* credentials
+    /// from, instead of the explicit fields below.
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default = "default_db_max_rows")]
+    max_rows: usize,
+}
+
+fn default_db_max_rows() -> usize {
+    1000
+}
+
 fn default_timeout() -> u64 {
     5
 }
@@ -543,8 +612,13 @@ struct RunEnv<'a> {
     auto_yes: bool,
     /// From `--start-at-task` — set only on the top-level run's own `RunEnv`, never
     /// copied into an `include:`'s `sub_env`, so the skip only ever applies to the
-    /// outermost playbook's own task list (see `execute_playbook`).
+    /// outermost playbook's own task list (see `execute_playbook`). `--resume` also goes
+    /// through this same field — `run()` resolves it to a concrete task name upfront.
     start_at: Option<String>,
+    /// Where to write/read this playbook's `--resume` checkpoint (`<file>.state.json`).
+    /// `Some(...)` only on the top-level run's own `RunEnv`, `None` for `include:`'s
+    /// `sub_env` — checkpointing, like `start_at`, is a top-level-only concept.
+    state_path: Option<PathBuf>,
     ctx: &'a Context,
 }
 
@@ -587,6 +661,10 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         return list_playbooks(&playbooks_dir, ctx);
     };
 
+    if args.resume && args.start_at_task.is_some() {
+        bail!("--resume and --start-at-task are mutually exclusive");
+    }
+
     let file_path = resolve_playbook_file(file, &project_root)?;
 
     if args.notes {
@@ -595,22 +673,58 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     let notes = read_notes(&file_path);
 
     let playbook_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let state_path = state_path_for(&file_path);
 
     let content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Cannot read playbook: {file}"))?;
 
-    let mut playbook: Playbook =
+    let playbook: Playbook =
         serde_yaml::from_str(&content).with_context(|| format!("Invalid YAML in {file}"))?;
 
-    // vars_files: (in order) merged under inline vars:, before --var overrides both.
-    playbook.vars = load_playbook_vars(&playbook, &playbook_dir)?;
+    // Not resuming: the usual fresh baseline — vars_files: (in order) merged under inline
+    // vars:. Resuming: the checkpoint's vars *entirely* replace this baseline (it already
+    // reflects vars_files:/vars: from the original run) — see `PlayCheckpoint`. Also
+    // resolves the effective --start-at-task: the task right after the checkpoint's last
+    // completed one, fed into the existing skip-ahead mechanism unchanged.
+    let (mut vars, start_at_task) = if args.resume {
+        if !state_path.exists() {
+            bail!(
+                "no checkpoint found at {} — nothing to resume; run without --resume",
+                state_path.display()
+            );
+        }
+        let checkpoint = load_checkpoint(&state_path)?;
+        let idx = playbook
+            .tasks
+            .iter()
+            .position(|t| t.name == checkpoint.last_completed_task)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "checkpoint's last completed task '{}' no longer exists in this playbook",
+                    checkpoint.last_completed_task
+                )
+            })?;
+        let next = playbook.tasks.get(idx + 1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "nothing left to resume — '{file}' already completed all tasks per the \
+                 checkpoint; delete {} to start over",
+                state_path.display()
+            )
+        })?;
+        (checkpoint.vars, Some(next.name.clone()))
+    } else {
+        (
+            load_playbook_vars(&playbook, &playbook_dir)?,
+            args.start_at_task.clone(),
+        )
+    };
 
-    // Merge CLI --var overrides into playbook vars
+    // --var overrides apply on top either way — on a fresh run as always, and on a
+    // resumed run so a bad value can be fixed before retrying (the whole point of
+    // resuming rather than restarting from scratch).
     for var in &args.vars {
         if let Some((k, v)) = var.split_once('=') {
-            playbook
-                .vars
-                .insert(k.trim().to_string(), v.trim().to_string());
+            vars.insert(k.trim().to_string(), v.trim().to_string());
         } else {
             bail!("--var must be in key=value format, got: '{var}'");
         }
@@ -621,7 +735,6 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         .as_deref()
         .map(|t| t.split(',').map(str::trim).collect());
 
-    let mut vars = playbook.vars.clone();
     let mut include_stack: Vec<PathBuf> = vec![file_path];
     let env = RunEnv {
         playbook_dir,
@@ -629,7 +742,8 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         dry: args.dry,
         quiet: ctx.output == OutputFormat::Json,
         auto_yes: args.yes,
-        start_at: args.start_at_task.clone(),
+        start_at: start_at_task,
+        state_path: Some(state_path),
         ctx,
     };
 
@@ -651,6 +765,75 @@ struct TaskOutcome {
     name: String,
     status: &'static str,
     error: Option<String>,
+}
+
+/// `--resume`'s on-disk checkpoint — a sibling of the playbook file (`<file>.state.json`,
+/// see `state_path_for`), written after every top-level task's non-fatal outcome and
+/// deleted on full success. `vars` is the *entire* vars map at that point, which can
+/// include values resolved from `{{secret.*}}` (e.g. via `set_fact:`) — see
+/// `write_checkpoint`'s 0600-permission handling.
+#[derive(Debug, Serialize, Deserialize)]
+struct PlayCheckpoint {
+    playbook: String,
+    last_completed_task: String,
+    vars: HashMap<String, String>,
+    updated_at: String,
+}
+
+/// The `--resume` checkpoint path for a given playbook file: the file's own path with
+/// `.state.json` appended (e.g. `playbooks/deploy.yml` -> `playbooks/deploy.yml.state.json`).
+fn state_path_for(file_path: &Path) -> PathBuf {
+    let mut s = file_path.as_os_str().to_os_string();
+    s.push(".state.json");
+    PathBuf::from(s)
+}
+
+fn load_checkpoint(path: &Path) -> Result<PlayCheckpoint> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading checkpoint {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("invalid checkpoint at {}", path.display()))
+}
+
+/// Best-effort: snapshots `vars` to `env.state_path` (a no-op if unset, i.e. not the
+/// top-level run) so a later `--resume` can pick up right after `last_completed_task`. A
+/// write failure prints a dimmed warning (if not quiet) but never fails the task — a
+/// checkpoint hiccup must never sink an otherwise-successful run. On Unix the file is
+/// chmod'd 0600 right after writing: `vars` can hold values resolved from `{{secret.*}}`,
+/// making this a file worth protecting the same way any other local credential material
+/// is (see the `--resume` README section for the full caveat).
+fn write_checkpoint(
+    env: &RunEnv,
+    playbook_name: &str,
+    last_completed_task: &str,
+    vars: &HashMap<String, String>,
+) {
+    let Some(path) = &env.state_path else {
+        return;
+    };
+    let checkpoint = PlayCheckpoint {
+        playbook: playbook_name.to_string(),
+        last_completed_task: last_completed_task.to_string(),
+        vars: vars.clone(),
+        updated_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    };
+    let result = serde_json::to_string_pretty(&checkpoint)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| {
+            std::fs::write(path, json)
+                .with_context(|| format!("writing checkpoint {}", path.display()))
+        });
+    if let Err(e) = result {
+        if !env.quiet {
+            println!("  {}", format!("(checkpoint not saved: {e})").dimmed());
+        }
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 /// Rejects a `notify:` name with no matching `playbook.handlers` entry upfront, rather
@@ -777,6 +960,9 @@ fn execute_playbook(
                 status: "skipped",
                 error: None,
             });
+            if is_top_level && !env.dry {
+                write_checkpoint(env, &playbook.name, &task.name, vars);
+            }
             continue;
         }
 
@@ -872,6 +1058,13 @@ fn execute_playbook(
                 }
             }
         }
+
+        // Reached for every non-fatal outcome above (dry-skip, real success, ignored
+        // failure) — a hard failure already returned/exited inside the match. Never
+        // checkpoints in --dry, since dry mode does no real work to resume from.
+        if is_top_level && !env.dry {
+            write_checkpoint(env, &playbook.name, &task.name, vars);
+        }
     }
 
     // Reached only if every regular task above succeeded (or was skipped/ignored) —
@@ -939,6 +1132,17 @@ fn execute_playbook(
         }
     }
 
+    // A fully-completed playbook has nothing left to resume — best-effort, never fails
+    // the run over a stray delete error. Never touches the checkpoint in --dry: a dry
+    // run does no real work, so it must not discard a real checkpoint from an earlier
+    // failed run just because a preview happened to "succeed" afterward.
+    if is_top_level
+        && !env.dry
+        && let Some(path) = &env.state_path
+    {
+        let _ = std::fs::remove_file(path);
+    }
+
     if json {
         println!(
             "{}",
@@ -987,39 +1191,116 @@ fn run_task(
     include_stack: &mut Vec<PathBuf>,
     env: &RunEnv,
 ) -> Result<()> {
+    if task.max_parallel.is_some() && task.loop_spec.is_none() {
+        bail!("max_parallel: is only supported combined with loop:");
+    }
     let Some(spec) = &task.loop_spec else {
         return run_task_once_with_retries(task, vars, include_stack, env);
     };
     let items = resolve_loop_items(spec, vars);
+
+    if let Some(chunk_size) = task.max_parallel.filter(|&n| n > 1) {
+        return run_loop_parallel(
+            task,
+            &items,
+            chunk_size,
+            vars,
+            include_stack.as_slice(),
+            env,
+        );
+    }
+
     for item in &items {
         let mut loop_vars = vars.clone();
-        match item {
-            LoopItem::Scalar(s) => {
-                loop_vars.insert("item".to_string(), s.clone());
-                if !env.quiet {
-                    println!("  {} item={}", "→".dimmed(), s.dimmed());
-                }
-            }
-            LoopItem::Map(m) => {
-                for (k, v) in m {
-                    loop_vars.insert(format!("item.{k}"), v.clone());
-                }
-                if !env.quiet {
-                    let joined = m
-                        .iter()
-                        .map(|(k, v)| format!("item.{k}={v}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    println!("  {} {joined}", "→".dimmed());
-                }
-            }
-        }
+        apply_loop_item(item, &mut loop_vars, env.quiet);
         run_task_once_with_retries(task, &mut loop_vars, include_stack, env)?;
         if let Some(reg) = &task.register
             && let Some(val) = loop_vars.get(reg)
         {
             vars.insert(reg.clone(), val.clone());
         }
+    }
+    Ok(())
+}
+
+/// Inserts one `loop:` item's `{{item}}`/`{{item.<field>}}` var(s) into `loop_vars` and
+/// echoes the `→ item=...` line — the per-iteration setup shared by both the sequential
+/// and the parallel (`max_parallel:`) `loop:` paths.
+fn apply_loop_item(item: &LoopItem, loop_vars: &mut HashMap<String, String>, quiet: bool) {
+    match item {
+        LoopItem::Scalar(s) => {
+            loop_vars.insert("item".to_string(), s.clone());
+            if !quiet {
+                println!("  {} item={}", "→".dimmed(), s.dimmed());
+            }
+        }
+        LoopItem::Map(m) => {
+            for (k, v) in m {
+                loop_vars.insert(format!("item.{k}"), v.clone());
+            }
+            if !quiet {
+                let joined = m
+                    .iter()
+                    .map(|(k, v)| format!("item.{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  {} {joined}", "→".dimmed());
+            }
+        }
+    }
+}
+
+/// Runs `items` in chunks of `chunk_size`, all items within a chunk concurrently (one
+/// thread each, via `std::thread::scope` — the same primitive `fleet::run_on_targets`'s
+/// `parallel: true` branch uses), the next chunk only starting once the current one fully
+/// joins. Each thread gets its own cloned `vars`/`include_stack` — a parallel loop item is
+/// its own independent branch, so it doesn't need (and, for `include:`'s cycle detection,
+/// shouldn't share) the others' mutable state.
+///
+/// Results are consumed in **original item order**, not completion order, so the
+/// `register:`-captures-the-last-iteration's-value rule stays deterministic despite
+/// concurrent execution, and the *first* error in original order fails the task — matching
+/// the sequential loop's "first failing iteration fails the task" contract as closely as
+/// concurrency allows. One narrowing of that guarantee: within a chunk that contains a
+/// failing item, that chunk's other already-started items still run to completion (they
+/// can't be cancelled mid-flight) even though the task as a whole is reported failed.
+fn run_loop_parallel(
+    task: &Task,
+    items: &[LoopItem],
+    chunk_size: usize,
+    vars: &mut HashMap<String, String>,
+    include_stack: &[PathBuf],
+    env: &RunEnv,
+) -> Result<()> {
+    let mut last_registered: Option<String> = None;
+    for chunk in items.chunks(chunk_size) {
+        let results: Vec<Result<Option<String>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|item| {
+                    let mut loop_vars = vars.clone();
+                    let mut stack = include_stack.to_vec();
+                    apply_loop_item(item, &mut loop_vars, env.quiet);
+                    scope.spawn(move || {
+                        run_task_once_with_retries(task, &mut loop_vars, &mut stack, env)?;
+                        Ok(task
+                            .register
+                            .as_ref()
+                            .and_then(|r| loop_vars.get(r).cloned()))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for r in results {
+            let val = r?;
+            if val.is_some() {
+                last_registered = val;
+            }
+        }
+    }
+    if let (Some(reg), Some(val)) = (&task.register, last_registered) {
+        vars.insert(reg.clone(), val);
     }
     Ok(())
 }
@@ -1492,6 +1773,55 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.write_file {
+        let out_path = env.playbook_dir.join(render(&spec.path, vars));
+        if !env.quiet {
+            println!(
+                "  {} {}",
+                if spec.append {
+                    "→ append".bold()
+                } else {
+                    "→ write".bold()
+                },
+                out_path.display().to_string().dimmed()
+            );
+        }
+        if !env.dry {
+            let content = render(&spec.content, vars);
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("creating parent directory for {}", out_path.display())
+                })?;
+            }
+            let bytes_written = content.len();
+            if spec.append {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&out_path)
+                    .with_context(|| format!("opening {} for append", out_path.display()))?;
+                f.write_all(content.as_bytes())
+                    .with_context(|| format!("appending to {}", out_path.display()))?;
+            } else {
+                std::fs::write(&out_path, &content)
+                    .with_context(|| format!("writing {}", out_path.display()))?;
+            }
+            if !env.quiet {
+                println!(
+                    "  {} {} bytes -> {}",
+                    "✓ ok".green().bold(),
+                    bytes_written,
+                    out_path.display()
+                );
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), bytes_written.to_string());
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.env_check {
         let reference = env.playbook_dir.join(render(&spec.reference, vars));
         let target = env.playbook_dir.join(render(&spec.target, vars));
@@ -1688,6 +2018,49 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.db_query {
+        let server_name = render(&spec.server, vars);
+        let sql = render(&spec.sql, vars);
+        if !env.quiet {
+            println!(
+                "  {} {} on {}",
+                "→".bold(),
+                render_for_display(&spec.sql, vars).dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let creds = resolve_conn_creds(
+                &server,
+                spec.env.as_deref(),
+                spec.engine.as_deref(),
+                spec.host.as_deref(),
+                spec.port,
+                spec.database.as_deref(),
+                spec.user.as_deref(),
+                spec.password.as_deref(),
+                vars,
+            )?;
+            let (rows, truncated) = crate::db::run_query(&server, &creds, &sql, spec.max_rows)?;
+            if !env.quiet {
+                println!(
+                    "  {} {} row(s){}",
+                    "✓ ok".green().bold(),
+                    rows.len(),
+                    if truncated { " (truncated)" } else { "" }
+                );
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    reg.clone(),
+                    serde_json::to_string(&rows).unwrap_or_default(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.include {
         let rendered = render(spec.file(), vars);
         let include_path = resolve_include_path(&rendered, env)?;
@@ -1752,6 +2125,7 @@ fn run_task_once(
                 quiet: env.quiet,
                 auto_yes: env.auto_yes,
                 start_at: None,
+                state_path: None,
                 ctx: env.ctx,
             };
             include_stack.push(include_path);
@@ -1787,7 +2161,7 @@ fn run_task_once(
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
          report, env_check, ssh, fleet, include, assert, block, debug, confirm, set_fact, \
-         sync_db, sync_files)",
+         sync_db, sync_files, write_file, db_query)",
         task.name
     );
 }
@@ -1801,19 +2175,49 @@ fn resolve_db_sync_creds(
     side: &DbSyncSide,
     vars: &HashMap<String, String>,
 ) -> Result<crate::db::Credentials> {
-    let env = side.env.as_deref().map(|s| render(s, vars));
-    let engine = side.engine.as_deref().map(|s| render(s, vars));
-    let host = side.host.as_deref().map(|s| render(s, vars));
-    let database = side.database.as_deref().map(|s| render(s, vars));
-    let user = side.user.as_deref().map(|s| render(s, vars));
-    let password = side.password.as_deref().map(|s| render(s, vars));
+    resolve_conn_creds(
+        server,
+        side.env.as_deref(),
+        side.engine.as_deref(),
+        side.host.as_deref(),
+        side.port,
+        side.database.as_deref(),
+        side.user.as_deref(),
+        side.password.as_deref(),
+        vars,
+    )
+}
+
+/// Renders each (possibly-`{{var}}`-templated) connection field against `vars` and
+/// delegates to `commands::db::resolve_credentials` — the exact engine/host/port/
+/// database/user/password resolution `tooler db backup`/`restore`/`query` already use, so
+/// both `sync_db:` (via `resolve_db_sync_creds`) and `db_query:` inherit the same
+/// validation and `--env`-file support from one place.
+#[allow(clippy::too_many_arguments)]
+fn resolve_conn_creds(
+    server: &crate::config::Server,
+    env: Option<&str>,
+    engine: Option<&str>,
+    host: Option<&str>,
+    port: Option<u16>,
+    database: Option<&str>,
+    user: Option<&str>,
+    password: Option<&str>,
+    vars: &HashMap<String, String>,
+) -> Result<crate::db::Credentials> {
+    let env = env.map(|s| render(s, vars));
+    let engine = engine.map(|s| render(s, vars));
+    let host = host.map(|s| render(s, vars));
+    let database = database.map(|s| render(s, vars));
+    let user = user.map(|s| render(s, vars));
+    let password = password.map(|s| render(s, vars));
     crate::commands::db::resolve_credentials(
         server,
         &crate::commands::db::ConnOpts {
             env: env.as_deref(),
             engine: engine.as_deref(),
             host: host.as_deref(),
-            port: side.port,
+            port,
             database: database.as_deref(),
             user: user.as_deref(),
             password: password.as_deref(),
@@ -2467,6 +2871,7 @@ mod tests {
             quiet: true,
             auto_yes: false,
             start_at: None,
+            state_path: None,
             ctx,
         }
     }
@@ -2572,6 +2977,65 @@ mod tests {
         assert_eq!(spec.body.as_deref(), Some("{}"));
         assert_eq!(spec.timeout, 10);
         assert!(spec.ignore_status);
+    }
+
+    #[test]
+    fn write_file_spec_deserializes_with_default_append() {
+        let spec: WriteFileSpec = serde_yaml::from_str("path: out.txt\ncontent: hello\n").unwrap();
+        assert_eq!(spec.path, "out.txt");
+        assert_eq!(spec.content, "hello");
+        assert!(!spec.append);
+    }
+
+    #[test]
+    fn write_file_spec_deserializes_with_append() {
+        let spec: WriteFileSpec =
+            serde_yaml::from_str("path: out.txt\ncontent: hello\nappend: true\n").unwrap();
+        assert!(spec.append);
+    }
+
+    #[test]
+    fn db_query_spec_deserializes_with_default_max_rows() {
+        let spec: DbQuerySpec =
+            serde_yaml::from_str("server: db1\nsql: SELECT 1\nenv: /var/www/.env\n").unwrap();
+        assert_eq!(spec.server, "db1");
+        assert_eq!(spec.sql, "SELECT 1");
+        assert_eq!(spec.env.as_deref(), Some("/var/www/.env"));
+        assert_eq!(spec.max_rows, 1000);
+    }
+
+    #[test]
+    fn db_query_spec_deserializes_explicit_fields_and_max_rows() {
+        let spec: DbQuerySpec = serde_yaml::from_str(
+            "server: db1\nsql: SELECT 1\nengine: mysql\nhost: 127.0.0.1\nport: 3306\n\
+             database: app\nuser: root\npassword: secret\nmax_rows: 50\n",
+        )
+        .unwrap();
+        assert_eq!(spec.engine.as_deref(), Some("mysql"));
+        assert_eq!(spec.port, Some(3306));
+        assert_eq!(spec.max_rows, 50);
+    }
+
+    #[test]
+    fn max_parallel_without_loop_is_rejected() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let env = dry_env(&ctx);
+        let mut vars = HashMap::new();
+        let mut include_stack = Vec::new();
+        let task = Task {
+            debug: Some("hi".to_string()),
+            max_parallel: Some(4),
+            ..Default::default()
+        };
+        let err = run_task(&task, &mut vars, &mut include_stack, &env).unwrap_err();
+        assert!(
+            err.to_string().contains("max_parallel:"),
+            "error was: {err}"
+        );
     }
 
     #[test]

@@ -954,3 +954,170 @@ fn report_task_writes_a_report_from_inline_data_no_temp_file() {
     assert!(content.starts_with("<!doctype html>"));
     assert!(content.contains("<th>name</th>"));
 }
+
+fn stderr_of(assert: assert_cmd::assert::Assert) -> String {
+    String::from_utf8_lossy(&assert.get_output().stderr).to_string()
+}
+
+#[test]
+fn write_file_task_writes_rendered_content_and_appends() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: WriteFile\n\
+         vars:\n\
+         \x20\x20who: world\n\
+         tasks:\n\
+         \x20\x20- name: write initial content\n\
+         \x20\x20\x20\x20write_file:\n\
+         \x20\x20\x20\x20\x20\x20path: out.txt\n\
+         \x20\x20\x20\x20\x20\x20content: |\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20hello {{who}}\n\
+         \x20\x20\x20\x20register: bytes_written\n\
+         \x20\x20- name: bytes captured\n\
+         \x20\x20\x20\x20assert: \"{{bytes_written}} != 0\"\n\
+         \x20\x20- name: append a line\n\
+         \x20\x20\x20\x20write_file:\n\
+         \x20\x20\x20\x20\x20\x20path: out.txt\n\
+         \x20\x20\x20\x20\x20\x20content: \"goodbye\\n\"\n\
+         \x20\x20\x20\x20\x20\x20append: true\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+
+    let content = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
+    assert_eq!(content, "hello world\ngoodbye\n");
+}
+
+#[test]
+fn max_parallel_loop_runs_all_items_and_keeps_last_registered_value_deterministic() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ParallelLoop\n\
+         tasks:\n\
+         \x20\x20- name: fan out writes\n\
+         \x20\x20\x20\x20loop: [a, b, c, d]\n\
+         \x20\x20\x20\x20max_parallel: 2\n\
+         \x20\x20\x20\x20write_file:\n\
+         \x20\x20\x20\x20\x20\x20path: out.txt\n\
+         \x20\x20\x20\x20\x20\x20content: \"{{item}}\\n\"\n\
+         \x20\x20\x20\x20\x20\x20append: true\n\
+         \x20\x20- name: all four items ran\n\
+         \x20\x20\x20\x20run: test $(wc -l < out.txt) -eq 4\n\
+         \x20\x20- name: fan out with register\n\
+         \x20\x20\x20\x20loop: [a, b, c, d]\n\
+         \x20\x20\x20\x20max_parallel: 2\n\
+         \x20\x20\x20\x20run: echo {{item}}\n\
+         \x20\x20\x20\x20register: last\n\
+         \x20\x20- name: last item wins despite concurrency\n\
+         \x20\x20\x20\x20assert: \"{{last}} == d\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn resume_restores_vars_and_continues_after_the_last_completed_task() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ResumeTest\n\
+         vars:\n\
+         \x20\x20fail_flag: \"yes\"\n\
+         tasks:\n\
+         \x20\x20- name: seed\n\
+         \x20\x20\x20\x20set_fact:\n\
+         \x20\x20\x20\x20\x20\x20x: \"1\"\n\
+         \x20\x20- name: gate\n\
+         \x20\x20\x20\x20assert: \"{{fail_flag}} != yes\"\n\
+         \x20\x20- name: finish\n\
+         \x20\x20\x20\x20set_fact:\n\
+         \x20\x20\x20\x20\x20\x20done: \"true\"\n",
+    )
+    .unwrap();
+
+    // First run fails at "gate" (fail_flag defaults to "yes").
+    let out = stdout_of(
+        tooler_in(dir.path())
+            .args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .failure(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["success"], false);
+
+    let state_path = dir.path().join("playbook.yml.state.json");
+    assert!(state_path.exists(), "checkpoint should be left behind");
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(checkpoint["last_completed_task"], "seed");
+    assert_eq!(checkpoint["vars"]["x"], "1");
+
+    // Resume, fixing fail_flag via --var — should continue right after "seed" and succeed.
+    let out = stdout_of(
+        tooler_in(dir.path())
+            .args([
+                "--output",
+                "json",
+                "play",
+                "playbook.yml",
+                "--resume",
+                "--var",
+                "fail_flag=no",
+            ])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["success"], true);
+    let tasks = value["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0]["name"], "gate");
+    assert_eq!(tasks[1]["name"], "finish");
+
+    // A fully-completed playbook has nothing left to resume.
+    assert!(!state_path.exists());
+}
+
+#[test]
+fn resume_without_a_checkpoint_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: NoCheckpoint\ntasks:\n  - name: t1\n    debug: hi\n",
+    )
+    .unwrap();
+
+    let err = stderr_of(
+        cmd.args(["play", "playbook.yml", "--resume"])
+            .assert()
+            .failure(),
+    );
+    assert!(
+        err.to_lowercase().contains("no checkpoint found"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn resume_and_start_at_task_are_mutually_exclusive() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Conflict\ntasks:\n  - name: t1\n    debug: hi\n",
+    )
+    .unwrap();
+
+    let err = stderr_of(
+        cmd.args(["play", "playbook.yml", "--resume", "--start-at-task", "t1"])
+            .assert()
+            .failure(),
+    );
+    assert!(
+        err.to_lowercase().contains("mutually exclusive"),
+        "stderr was: {err}"
+    );
+}
