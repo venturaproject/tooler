@@ -24,6 +24,7 @@
   - [tooler doctor](#tooler-doctor)
   - [tooler report](#tooler-report)
   - [tooler db](#tooler-db)
+  - [tooler mail](#tooler-mail)
   - [tooler gh](#tooler-gh)
   - [tooler systemd](#tooler-systemd)
   - [tooler cron](#tooler-cron)
@@ -373,6 +374,8 @@ tooler-repl> .exit
 
 Each line is the *body* of a task — everything a YAML task has except `name:`, which the REPL fills in for you (`repl-1`, `repl-2`, ...). A bare `key: value` line works for a single-key action (`run: echo hi`); wrap the whole line in `{...}` (flow-style YAML) to add `register:`/`when:`/`ignore_errors:`/etc. on the same line — no new syntax, this is just YAML. Any field a real playbook task supports works here too, including `loop:`/`max_parallel:`/`block:`/`include:`. A failing line (a typo, a bad URL) prints the error and **keeps the session going** — unlike a batch `tooler play` run, one bad line doesn't end it. Meta-commands: `.vars` (show every current var, unmasked — same tradeoff `debug:` already makes), `.clear` (empty all vars), `.save <path>` (write the session so far as a real playbook, resolved relative to the playbook's directory — only lines that actually succeeded, or explicitly failed with `ignore_errors: true`, are included; a hard failure you were debugging isn't baked back into the "clean" file), `.help`, and `.exit`/`.quit` (Ctrl+D also works). Like `confirm:`, this is an inherently interactive tool — not wired into the `tooler_play` MCP tool.
 
+The line editor (`rustyline`) gives you ↑/↓ history — both within the session and persisted across sessions in `~/.tooler/repl_history` — and Tab-completion of action names (`run: `, `http: `, ...) and meta-commands (`.vars`, `.save `, ...) against the start of the line. It degrades to plain, unedited line reads when stdin isn't a real terminal (piped/scripted input, e.g. `.write_stdin` in a test), so a non-interactive `--repl` session keeps working exactly as before.
+
 **Available task actions:**
 
 | Action | Description |
@@ -542,9 +545,22 @@ tasks:
       content: "{{signups}}\n"
 ```
 
-`db_query:` runs a read-only query (SELECT/SHOW/EXPLAIN/WITH/DESCRIBE only — the same enforcement `tooler db query` uses) over SSH and, with `register:`, captures the rows as a JSON array — same convention as `scrape:`, so it plugs directly into `loop: {from: "{{reg}}"}` or `report:` with no temp file. Credentials resolve exactly like `sync_db:`'s `from:`/`to:` sides: either `env: <remote .env path>` or explicit `engine:`/`host:`/`port:`/`database:`/`user:`/`password:` fields. `max_rows:` caps the result (default 1000, same as `tooler db query --max-rows`).
+`db_query:` runs a read-only query (SELECT/SHOW/EXPLAIN/WITH/DESCRIBE only — the same enforcement `tooler db query` uses, which also rejects MySQL's `SELECT ... INTO OUTFILE`/`INTO DUMPFILE`, since those still start with `SELECT` but write a file on the database server) over SSH and, with `register:`, captures the rows as a JSON array — same convention as `scrape:`, so it plugs directly into `loop: {from: "{{reg}}"}` or `report:` with no temp file. Credentials resolve exactly like `sync_db:`'s `from:`/`to:` sides: either `env: <remote .env path>` or explicit `engine:`/`host:`/`port:`/`database:`/`user:`/`password:` fields. `max_rows:` caps the result (default 1000, same as `tooler db query --max-rows`).
 
 `write_file:` renders `content:` and writes it to `path:` (resolved relative to the playbook's own directory, parent directories created as needed) — `report:`'s counterpart for arbitrary text instead of structured data: a generated config, a `.env`, a one-line summary. `append: true` appends instead of overwriting. Unlike `run:`, only the destination path and byte count are ever printed — never the content — since it may itself resolve `{{secret.*}}` tokens. `register:` (if set) captures the byte count written.
+
+`mail:` sends an email over SMTP — see [`tooler mail`](#tooler-mail) for the underlying config/keychain setup. `server:` names a `config.mail.<name>` profile, or set `host:`/`port:`/`user:`/`password:` inline; every field renders through `{{var}}`/`{{secret.*}}` like any other task. `register:` (if set) captures `"true"`.
+
+```yaml
+tasks:
+  - name: notify ops on deploy failure
+    when: "{{deploy_status}} == failed"
+    mail:
+      server: notify
+      to: "ops@example.com"
+      subject: "Deploy failed: {{env}}"
+      body: "{{deploy_log}}"
+```
 
 ```yaml
 tasks:
@@ -686,6 +702,10 @@ tasks:
 **Templating** — `{{...}}` inside any string field resolves, in order: a playbook/`--var` variable, then `env.<NAME>` (the process environment, e.g. `{{env.HOME}}`), then `secret.<profile>.<key>` (the OS keychain, the same store `tooler config set profile.<name>.token` and OAuth2 profiles already use — e.g. `{{secret.exact.token}}`). Anything that doesn't resolve is left exactly as written, so a missing var/secret never crashes a playbook, it just doesn't get substituted. `{{token | json:path.to.field}}` applies a filter after resolving `token`: parses its value as JSON and walks a dot-separated path (`data.id`, `items[0].name`, `[2]`) into it — a string leaf renders raw, anything else (number/bool/object/array/null) renders as JSON text. Invalid JSON or a path that doesn't match leaves the whole `{{...}}` literal, same as any other unresolved token — it never fails the render. **Security note**: a rendered secret ends up in a `run:` task's shell command line, which — like any subprocess argv — is visible to other local processes via `ps`/`/proc` while it runs; `ssh:`/`fleet:` carry the same exposure over SSH, no different from how `sudo:` already works today. What gets **printed** to the console for `run:`/`ssh:`/`fleet:`/`sync_files:` is separately masked — a `{{secret.*}}` token always shows as `***` in the echoed command line, even though the real, unmasked value is what actually runs; `debug:` is the one exception, since printing is its entire purpose.
 
 Commands and file paths in tasks always resolve **relative to the playbook file's directory**, not where you run `tooler play` from.
+
+**Trust model** — `run:`/`ssh:`/`fleet:` render `{{var}}` straight into a shell command line with no escaping, by design: that's what makes `run:` a general-purpose "run a shell command" primitive rather than a fixed-argument one, the same tradeoff Ansible's own `shell:` module makes. That's fine when a var comes from `--var`/`vars:`/`{{secret.*}}` (values *you* control), but if a var's value instead came from `http:`/`scrape:`/`db_query:` against **untrusted** data — a third-party API response, a scraped page, rows an attacker could influence — treat feeding it straight into a later `run:`/`ssh:` task the same way you'd treat `eval`-ing untrusted input in any other language: quote it yourself (e.g. wrap in `'{{var}}'` and validate its shape first with `assert:`) or avoid piping it into a shell task at all. `write_file:`'s `path:` is confined to the playbook's own directory (an absolute path or a `..` that nets outside it is rejected) precisely because *its* one job is "write somewhere predictable" — `run:`/`ssh:` make no such promise, since restricting them would defeat their purpose.
+
+Every SSH/SCP connection (server profiles, `ssh:`/`fleet:`/`sync_db:`/`sync_files:`/`db_query:`, and every other command that reaches a server) uses `StrictHostKeyChecking=accept-new`: unattended automation can't prompt "accept this host key?", so a never-before-seen host is accepted and pinned to `~/.ssh/known_hosts` automatically — but unlike disabling host key checking outright, a host whose *previously pinned* key has since changed is still refused, which is the actual MITM signal that matters.
 
 #### The `playbooks/` directory
 
@@ -877,7 +897,7 @@ tooler db query myserver "SELECT * FROM orders LIMIT 20" \
   --password "$TOOLER_DB_PASSWORD"
 ```
 
-Only `SELECT` / `SHOW` / `EXPLAIN` / `WITH` / `DESCRIBE` are accepted — `tooler db query` refuses anything else (including multiple statements), since results are meant for reporting, not for driving writes against a production database.
+Only `SELECT` / `SHOW` / `EXPLAIN` / `WITH` / `DESCRIBE` are accepted — `tooler db query` refuses anything else (including multiple statements), since results are meant for reporting, not for driving writes against a production database. It also rejects MySQL's `SELECT ... INTO OUTFILE`/`INTO DUMPFILE` specifically: both still start with `SELECT` (so they'd otherwise pass the check above) but write an arbitrary file on the database server if the connecting user has the `FILE` privilege.
 
 `backup`/`restore` dump and restore whole databases the same way, over the same SSH connection — no local `psql`/`mysql` install needed either, since the remote host runs the compression/decompression too:
 
@@ -898,6 +918,40 @@ tooler db query myserver "SELECT role, COUNT(*) AS n FROM users GROUP BY role" \
 tooler report pdf -i usuarios=users.json -i roles=roles.json \
   -o report.pdf --title "Users & Roles"
 ```
+
+---
+
+### tooler mail
+
+Send an email over SMTP — via `lettre`, using `rustls` for TLS (no OpenSSL/`native-tls`
+dependency, same choice `tooler http` already makes). Set up a reusable profile once:
+
+```sh
+tooler config set mail.notify.host mail16.serv00.com
+tooler config set mail.notify.port 587
+tooler config set mail.notify.user notification@example.com
+tooler config set mail.notify.password 'the-mailbox-password'   # stored in the OS keychain, never in config.toml
+```
+
+then send through it:
+
+```sh
+tooler mail send --server notify --to ops@example.com \
+  --subject "Deploy finished" --body "All green."
+```
+
+`--server` resolves `host`/`port`/`user` from `config.toml` (`tooler config show`) and the
+password from the OS keychain — the same keychain `tooler config`'s `profile.<name>.token`
+already uses, just namespaced under `mail:<name>`. Every field can also be set inline
+instead of (or on top of) a profile — `--host`/`--port`/`--user`/`--password` (or
+`TOOLER_MAIL_PASSWORD` in the environment) — for one-off sends without touching config.
+TLS mode is inferred from the port (587 → STARTTLS, 465 → implicit TLS) unless overridden
+with `--tls starttls|tls|none`. `--to`/`--cc`/`--bcc` each accept a comma-separated list;
+`--body-file` reads the message body from a local file instead of `--body`.
+
+The `tooler_mail_send` MCP tool only accepts `server` (never raw host/user/password) — a
+mail password can never be passed as a tool argument, same rule `tooler_db_query` already
+enforces for DB passwords.
 
 ---
 

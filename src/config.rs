@@ -13,6 +13,8 @@ pub struct Config {
     pub server: HashMap<String, Server>,
     #[serde(default)]
     pub group: HashMap<String, Group>,
+    #[serde(default)]
+    pub mail: HashMap<String, MailServer>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -66,12 +68,16 @@ impl Server {
         }
     }
 
-    /// Flags for `ssh` invocations: strict host key checking disabled,
-    /// batch mode (never prompt), plus `-i`/`-p` if a key/port is configured.
+    /// Flags for `ssh` invocations: unknown host keys are accepted and pinned
+    /// automatically (`accept-new`) rather than prompted for -- required for
+    /// non-interactive automation, same as disabling host key checking entirely, but
+    /// unlike `StrictHostKeyChecking=no` this still refuses a host whose *known* key has
+    /// since changed, the classic MITM signal. Plus batch mode (never prompt for
+    /// anything else) and `-i`/`-p` if a key/port is configured.
     pub fn ssh_args(&self) -> Vec<String> {
         let mut args = vec![
             "-o".into(),
-            "StrictHostKeyChecking=no".into(),
+            "StrictHostKeyChecking=accept-new".into(),
             "-o".into(),
             "BatchMode=yes".into(),
         ];
@@ -94,7 +100,10 @@ impl Server {
     /// [`Server::ssh_args`], but `scp` uses `-P` for the port (not `-p`) and
     /// has no batch-mode flag.
     pub fn scp_args(&self) -> Vec<String> {
-        let mut args = vec!["-o".to_string(), "StrictHostKeyChecking=no".to_string()];
+        let mut args = vec![
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
         if let Some(key) = &self.key {
             args.push("-i".into());
             args.push(
@@ -109,6 +118,20 @@ impl Server {
         }
         args
     }
+}
+
+/// A configured SMTP profile for `tooler mail send` / the `mail:` playbook task action.
+/// Its password is never stored here — it lives in the OS keychain via `secrets.rs`,
+/// namespaced as `mail:<name>`, same treatment as `Profile`'s token/client_secret.
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct MailServer {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    /// `From:` address. Defaults to `user` if absent.
+    pub from: Option<String>,
+    /// "starttls" | "tls" | "none". `None` -> inferred from `port` (465 -> tls, else starttls).
+    pub tls: Option<String>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -171,4 +194,33 @@ pub fn save(config: &Config) -> Result<()> {
     }
     std::fs::write(&path, toml::to_string_pretty(config)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_args_pins_new_host_keys_instead_of_disabling_checking() {
+        let server = Server::default();
+        let args = server.ssh_args();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-o", "StrictHostKeyChecking=accept-new"]),
+            "ssh_args should accept-new, not disable host key checking: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains("StrictHostKeyChecking=no")));
+    }
+
+    #[test]
+    fn scp_args_pins_new_host_keys_instead_of_disabling_checking() {
+        let server = Server::default();
+        let args = server.scp_args();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-o", "StrictHostKeyChecking=accept-new"]),
+            "scp_args should accept-new, not disable host key checking: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains("StrictHostKeyChecking=no")));
+    }
 }

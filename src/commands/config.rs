@@ -15,13 +15,14 @@ pub enum ConfigSubcommand {
     Show,
     /// Get a value by key (e.g. default.output, profile.staging.base_url, profile.staging.token,
     /// profile.staging.token_url, profile.staging.client_id, profile.staging.client_secret,
-    /// profile.staging.refresh_token)
+    /// profile.staging.refresh_token, mail.notify.host, mail.notify.password)
     Get { key: String },
-    /// Set a value by key (e.g. default.output json, profile.staging.token secret123).
-    /// Profile tokens/client_secret/refresh_token are stored encrypted in the OS keychain,
-    /// never in the config file. Setting profile.<name>.token_url marks a profile as
-    /// OAuth2-managed: `tooler http` then refreshes and caches an access token from the
-    /// configured refresh_token instead of using a static token.
+    /// Set a value by key (e.g. default.output json, profile.staging.token secret123,
+    /// mail.notify.host mail16.serv00.com). Profile tokens/client_secret/refresh_token and
+    /// mail.<name>.password are stored encrypted in the OS keychain, never in the config
+    /// file. Setting profile.<name>.token_url marks a profile as OAuth2-managed: `tooler
+    /// http` then refreshes and caches an access token from the configured refresh_token
+    /// instead of using a static token.
     Set { key: String, value: String },
     /// List configured profiles
     Profiles,
@@ -36,6 +37,14 @@ pub(crate) fn parse_profile_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix("profile.")?;
     rest.split_once('.')
 }
+
+/// Splits a "mail.<name>.<field>" key into (name, field).
+fn parse_mail_key(key: &str) -> Option<(&str, &str)> {
+    let rest = key.strip_prefix("mail.")?;
+    rest.split_once('.')
+}
+
+const MAIL_KEYS: &str = "host, port, user, from, tls, password";
 
 pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
@@ -119,6 +128,53 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
             }
         }
         ConfigSubcommand::Get { key } => {
+            if let Some((name, field)) = parse_mail_key(&key) {
+                let value = match field {
+                    "host" => ctx
+                        .config
+                        .mail
+                        .get(name)
+                        .map(|m| m.host.clone())
+                        .ok_or_else(|| anyhow::anyhow!("No host set for mail profile '{name}'"))?,
+                    "port" => ctx
+                        .config
+                        .mail
+                        .get(name)
+                        .map(|m| m.port.to_string())
+                        .ok_or_else(|| anyhow::anyhow!("No port set for mail profile '{name}'"))?,
+                    "user" => ctx
+                        .config
+                        .mail
+                        .get(name)
+                        .map(|m| m.user.clone())
+                        .ok_or_else(|| anyhow::anyhow!("No user set for mail profile '{name}'"))?,
+                    "from" => ctx
+                        .config
+                        .mail
+                        .get(name)
+                        .and_then(|m| m.from.clone())
+                        .ok_or_else(|| anyhow::anyhow!("No from set for mail profile '{name}'"))?,
+                    "tls" => ctx
+                        .config
+                        .mail
+                        .get(name)
+                        .and_then(|m| m.tls.clone())
+                        .ok_or_else(|| anyhow::anyhow!("No tls set for mail profile '{name}'"))?,
+                    "password" => secrets::get_secret(&format!("mail:{name}"), "password")?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "No password set for mail profile '{name}' (or the OS keychain is locked)"
+                            )
+                        })?,
+                    _ => bail!("Unknown mail profile key '{}'. Available: {}", field, MAIL_KEYS),
+                };
+                if json {
+                    println!("{}", serde_json::json!({"key": key, "value": value}));
+                } else {
+                    println!("{value}");
+                }
+                return Ok(());
+            }
             if let Some((name, field)) = parse_profile_key(&key) {
                 let value = match field {
                     "base_url" => ctx
@@ -181,6 +237,75 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
             }
         }
         ConfigSubcommand::Set { key, value } => {
+            if let Some((name, field)) = parse_mail_key(&key) {
+                match field {
+                    "host" => {
+                        let mut cfg = ctx.config.clone();
+                        cfg.mail.entry(name.to_string()).or_default().host = value.clone();
+                        config::save(&cfg)?;
+                    }
+                    "port" => {
+                        let port: u16 = value
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid port '{}'", value))?;
+                        let mut cfg = ctx.config.clone();
+                        cfg.mail.entry(name.to_string()).or_default().port = port;
+                        config::save(&cfg)?;
+                    }
+                    "user" => {
+                        let mut cfg = ctx.config.clone();
+                        cfg.mail.entry(name.to_string()).or_default().user = value.clone();
+                        config::save(&cfg)?;
+                    }
+                    "from" => {
+                        let mut cfg = ctx.config.clone();
+                        cfg.mail.entry(name.to_string()).or_default().from = Some(value.clone());
+                        config::save(&cfg)?;
+                    }
+                    "tls" => {
+                        if !["starttls", "tls", "none"].contains(&value.as_str()) {
+                            bail!("Invalid tls value '{}'. Use: starttls, tls, none", value);
+                        }
+                        let mut cfg = ctx.config.clone();
+                        cfg.mail.entry(name.to_string()).or_default().tls = Some(value.clone());
+                        config::save(&cfg)?;
+                    }
+                    "password" => {
+                        secrets::set_secret(&format!("mail:{name}"), "password", &value)?;
+                        // Ensure the profile is registered in the config file (with no
+                        // host/port/user yet) so it shows up in `config show`.
+                        let mut cfg = ctx.config.clone();
+                        cfg.mail.entry(name.to_string()).or_default();
+                        config::save(&cfg)?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({"key": key, "value": "***", "stored": "os keychain"})
+                            );
+                        } else {
+                            println!(
+                                "{} {} = {} {}",
+                                "set".green().bold(),
+                                key.cyan(),
+                                "***".dimmed(),
+                                "(stored in OS keychain)".dimmed()
+                            );
+                        }
+                        return Ok(());
+                    }
+                    _ => bail!(
+                        "Unknown mail profile key '{}'. Available: {}",
+                        field,
+                        MAIL_KEYS
+                    ),
+                }
+                if json {
+                    println!("{}", serde_json::json!({"key": key, "value": value}));
+                } else {
+                    println!("{} {} = {}", "set".green().bold(), key.cyan(), value);
+                }
+                return Ok(());
+            }
             if let Some((name, field)) = parse_profile_key(&key) {
                 match field {
                     "base_url" => {
@@ -271,6 +396,57 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
             }
         }
         ConfigSubcommand::Unset { key } => {
+            if let Some((name, field)) = parse_mail_key(&key) {
+                match field {
+                    "host" => {
+                        let mut cfg = ctx.config.clone();
+                        if let Some(m) = cfg.mail.get_mut(name) {
+                            m.host.clear();
+                        }
+                        config::save(&cfg)?;
+                    }
+                    "port" => {
+                        let mut cfg = ctx.config.clone();
+                        if let Some(m) = cfg.mail.get_mut(name) {
+                            m.port = 0;
+                        }
+                        config::save(&cfg)?;
+                    }
+                    "user" => {
+                        let mut cfg = ctx.config.clone();
+                        if let Some(m) = cfg.mail.get_mut(name) {
+                            m.user.clear();
+                        }
+                        config::save(&cfg)?;
+                    }
+                    "from" => {
+                        let mut cfg = ctx.config.clone();
+                        if let Some(m) = cfg.mail.get_mut(name) {
+                            m.from = None;
+                        }
+                        config::save(&cfg)?;
+                    }
+                    "tls" => {
+                        let mut cfg = ctx.config.clone();
+                        if let Some(m) = cfg.mail.get_mut(name) {
+                            m.tls = None;
+                        }
+                        config::save(&cfg)?;
+                    }
+                    "password" => secrets::delete_secret(&format!("mail:{name}"), "password")?,
+                    _ => bail!(
+                        "Unknown mail profile key '{}'. Available: {}",
+                        field,
+                        MAIL_KEYS
+                    ),
+                }
+                if json {
+                    println!("{}", serde_json::json!({"key": key, "unset": true}));
+                } else {
+                    println!("{} {}", "unset".red().bold(), key.cyan());
+                }
+                return Ok(());
+            }
             if let Some((name, field)) = parse_profile_key(&key) {
                 match field {
                     "base_url" => {

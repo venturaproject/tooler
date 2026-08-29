@@ -433,6 +433,14 @@ struct PlayMcpArgs {
     /// fails fast (never blocks) without this, since this MCP tool runs non-interactively.
     #[serde(default)]
     yes: bool,
+    /// Skip ahead to this top-level task name, treating every earlier task as already
+    /// done. Mutually exclusive with resume.
+    start_at_task: Option<String>,
+    /// Resume from the checkpoint left by a previous failed run of this same playbook
+    /// file, restoring its vars and continuing right after the last completed task.
+    /// Mutually exclusive with start_at_task. Errors if no checkpoint exists.
+    #[serde(default)]
+    resume: bool,
     cwd: Option<String>,
 }
 
@@ -562,6 +570,29 @@ struct DbRestoreArgs {
     /// (bytes to send, target database) and makes no change.
     #[serde(default)]
     confirm: bool,
+}
+
+// ── mail ──────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct MailSendArgs {
+    /// Recipient address(es), comma-separated
+    to: String,
+    /// Cc address(es), comma-separated
+    cc: Option<String>,
+    /// Bcc address(es), comma-separated
+    bcc: Option<String>,
+    subject: String,
+    body: String,
+    /// Send the body as text/html instead of text/plain
+    #[serde(default)]
+    html: bool,
+    /// From address. Defaults to the profile's `from` (or its `user`)
+    from: Option<String>,
+    /// Mail profile to send through (see tooler_config_set mail.<name>.host). Required --
+    /// this tool only accepts profile-based, keychain-backed credentials; a mail password
+    /// can never be passed as a tool argument.
+    server: String,
 }
 
 // ── ps ────────────────────────────────────────────────────────────────────
@@ -1336,7 +1367,10 @@ impl ToolerMcp {
     #[tool(
         description = "Run a YAML playbook (tasks, vars, health checks) or generate a sample. \
                         A confirm: task in the playbook never blocks this tool waiting on \
-                        stdin — it fails fast unless yes=true is passed",
+                        stdin — it fails fast unless yes=true is passed. If a previous call \
+                        failed partway through, pass resume=true (optionally with vars \
+                        overrides) to continue right after the last completed task instead \
+                        of starting over — start_at_task and resume are mutually exclusive",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1358,6 +1392,8 @@ impl ToolerMcp {
         push_flag(&mut argv, "--init", args.init);
         push_flag(&mut argv, "--yes", args.yes);
         push_flag(&mut argv, "--notes", args.notes);
+        push_opt(&mut argv, "--start-at-task", &args.start_at_task);
+        push_flag(&mut argv, "--resume", args.resume);
         self.exec_self(argv, &args.cwd).await
     }
 
@@ -1617,6 +1653,42 @@ impl ToolerMcp {
         push_opt(&mut argv, "--database", &args.database);
         push_opt(&mut argv, "--user", &args.user);
         push_flag(&mut argv, "--confirm", args.confirm);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Send an email over SMTP through a configured mail profile. A mail \
+                        password can never be passed as a tool argument -- set it once with \
+                        tooler_config_set (key mail.<name>.password, stored in the OS \
+                        keychain) or TOOLER_MAIL_PASSWORD in the MCP server's own \
+                        environment, then reference the profile by name here.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_mail_send(
+        &self,
+        Parameters(args): Parameters<MailSendArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "mail".to_string(),
+            "send".to_string(),
+            "--to".to_string(),
+            args.to.clone(),
+            "--subject".to_string(),
+            args.subject.clone(),
+            "--body".to_string(),
+            args.body.clone(),
+            "--server".to_string(),
+            args.server.clone(),
+        ];
+        push_opt(&mut argv, "--cc", &args.cc);
+        push_opt(&mut argv, "--bcc", &args.bcc);
+        push_opt(&mut argv, "--from", &args.from);
+        push_flag(&mut argv, "--html", args.html);
         self.exec_self(argv, &None).await
     }
 

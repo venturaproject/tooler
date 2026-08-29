@@ -3,9 +3,10 @@ use crate::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, cron::CronArgs,
         db::DbArgs, deploy::DeployArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs,
         fleet::FleetArgs, fs::FsArgs, gh::GhArgs, git::GitArgs, group::GroupArgs, http::HttpArgs,
-        info::InfoArgs, jobs::JobsArgs, json::JsonArgs, logs::LogsArgs, mcp::McpArgs,
-        play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs,
-        server::ServerArgs, ssh::SshArgs, stat::StatArgs, systemd::SystemdArgs,
+        info::InfoArgs, jobs::JobsArgs, json::JsonArgs, logs::LogsArgs, mail::MailArgs,
+        mcp::McpArgs, play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs,
+        scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs, stat::StatArgs,
+        systemd::SystemdArgs,
     },
     output::OutputFormat,
 };
@@ -120,4 +121,7 @@ pub enum Commands {
 
     /// Manage named groups of server profiles (used by tooler fleet and playbook tasks)
     Group(GroupArgs),
+
+    /// Send email over SMTP (config.mail.<name> profiles or inline host/user/password)
+    Mail(MailArgs),
 }

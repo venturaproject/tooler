@@ -309,6 +309,16 @@ fn ensure_read_only(sql: &str) -> Result<&str> {
             ALLOWED.join("/")
         );
     }
+    // MySQL's `SELECT ... INTO OUTFILE '/path'`/`INTO DUMPFILE` still starts with
+    // SELECT (so passes the check above) but writes an arbitrary file on the server
+    // when the connecting user has the FILE privilege -- exactly the kind of write
+    // this function exists to block. No legitimate reporting query needs `INTO
+    // OUTFILE`/`INTO DUMPFILE`, so reject it outright rather than trying to allow-list
+    // safe uses of `INTO`.
+    let upper = body.to_uppercase();
+    if upper.contains("INTO OUTFILE") || upper.contains("INTO DUMPFILE") {
+        bail!("INTO OUTFILE/DUMPFILE is not allowed (writes a file on the database server)");
+    }
     Ok(body)
 }
 
@@ -495,6 +505,20 @@ mod tests {
             assert!(
                 ensure_read_only(verb).is_err(),
                 "expected {verb} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_read_only_rejects_into_outfile_and_dumpfile() {
+        for sql in [
+            "SELECT * FROM users INTO OUTFILE '/tmp/x'",
+            "select * from users into outfile '/tmp/x'",
+            "SELECT secret INTO DUMPFILE '/var/www/html/shell.php'",
+        ] {
+            assert!(
+                ensure_read_only(sql).is_err(),
+                "expected {sql} to be rejected"
             );
         }
     }

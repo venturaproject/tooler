@@ -2,6 +2,7 @@ use crate::{context::Context, output::OutputFormat, project, report};
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use colored::Colorize;
+use rustyline::{Editor, error::ReadlineError, history::DefaultHistory};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -211,6 +212,10 @@ struct Task {
     /// `scrape:` — directly chainable into `loop: {from: "{{reg}}"}` or `report:`. See
     /// `DbQuerySpec`.
     db_query: Option<DbQuerySpec>,
+    /// Send an email over SMTP, either through a configured `server:` profile
+    /// (`tooler config set mail.<name>.host ...` + `mail.<name>.password`, the latter in
+    /// the OS keychain) or fully inline `host`/`user`/`password` fields. See `MailSpec`.
+    mail: Option<MailSpec>,
     /// Cap concurrent `loop:` iterations to N at a time (processed in chunks of N) instead
     /// of the default strictly-sequential execution. Only valid combined with `loop:`. See
     /// `run_loop_parallel`.
@@ -485,7 +490,9 @@ fn default_report_title() -> String {
 }
 
 /// `write_file:` — writes rendered `content` to `path` (relative to the playbook's own
-/// directory), creating parent directories as needed.
+/// directory), creating parent directories as needed. `path` is confined to that
+/// directory by `join_confined` — an absolute path or a `..` that nets outside it is
+/// rejected, rather than silently writing wherever a rendered `{{var}}` happened to point.
 #[derive(Debug, Deserialize)]
 struct WriteFileSpec {
     path: String,
@@ -527,6 +534,44 @@ fn default_db_max_rows() -> usize {
     1000
 }
 
+/// `mail:` — every field is renderable via `render()` (so `{{secret.<profile>.password}}`
+/// or any `{{var}}` works anywhere here, same as `db_query:`). `to`/`cc`/`bcc` accept a
+/// comma-separated list of addresses. Credentials resolve through `resolve_mail_creds`:
+/// explicit `host`/`port`/`user`/`password`/`tls` fields win over the named `server:`
+/// profile (`config.mail.<name>` + the OS keychain), which wins over `TOOLER_MAIL_PASSWORD`
+/// for the password specifically.
+#[derive(Debug, Deserialize)]
+struct MailSpec {
+    /// Mail profile to send through (see: tooler config set mail.<name>.host, and
+    /// following fields).
+    #[serde(default)]
+    server: Option<String>,
+    to: String,
+    #[serde(default)]
+    cc: Option<String>,
+    #[serde(default)]
+    bcc: Option<String>,
+    subject: String,
+    body: String,
+    /// Send the body as `text/html` instead of `text/plain`.
+    #[serde(default)]
+    html: bool,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    /// "starttls" | "tls" | "none" — overrides both the profile's `tls` and the
+    /// port-based inference in `resolve_mail_creds`.
+    #[serde(default)]
+    tls: Option<String>,
+}
+
 fn default_timeout() -> u64 {
     5
 }
@@ -544,6 +589,40 @@ fn default_http_method() -> String {
 /// `<project_root>/playbooks/<name>.yml` (then `.yaml`).
 fn is_literal_path(s: &str) -> bool {
     s.contains('/') || s.ends_with(".yml") || s.ends_with(".yaml")
+}
+
+/// Joins `rel` onto `base`, rejecting anything that would land outside `base`: an
+/// absolute `rel` (which `Path::join` would otherwise honor verbatim, discarding `base`
+/// entirely), or a `..` that nets below `base` once walked lexically. Doesn't touch the
+/// filesystem (no `canonicalize`) since the caller — `write_file:` — may be about to
+/// create the file, so it need not exist yet. `a/../b` is allowed (it never actually
+/// leaves `base`, just references it awkwardly); `../b` or `a/../../b` are not.
+fn join_confined(base: &Path, rel: &str) -> Result<PathBuf> {
+    if Path::new(rel).is_absolute() {
+        bail!(
+            "path '{rel}' must be relative to the playbook directory (absolute paths are rejected)"
+        );
+    }
+    let mut resolved = base.to_path_buf();
+    let mut depth: i32 = 0;
+    for comp in Path::new(rel).components() {
+        match comp {
+            std::path::Component::Normal(part) => {
+                depth += 1;
+                resolved.push(part);
+            }
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    bail!("path '{rel}' escapes the playbook directory");
+                }
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => bail!("path '{rel}' is not a valid relative path"),
+        }
+    }
+    Ok(resolved)
 }
 
 /// Appends a trailing `/` to `path` if missing — rsync only copies a source directory's
@@ -866,11 +945,85 @@ fn save_repl_session(session: &[serde_yaml::Value], playbook_dir: &Path, arg: &s
     Ok(())
 }
 
+/// One meta-command or task-action prefix `--repl`'s tab-completion offers, matched
+/// against the start of the current line — see `ReplHelper`.
+const REPL_COMPLETIONS: &[&str] = &[
+    ".help",
+    ".vars",
+    ".clear",
+    ".save ",
+    ".exit",
+    ".quit",
+    "run: ",
+    "check_url: ",
+    "check_port: ",
+    "http: ",
+    "scrape: ",
+    "wait_for: ",
+    "report: ",
+    "env_check: ",
+    "ssh: ",
+    "fleet: ",
+    "include: ",
+    "assert: ",
+    "block:",
+    "debug: ",
+    "confirm: ",
+    "set_fact: ",
+    "sync_db: ",
+    "sync_files: ",
+    "write_file: ",
+    "db_query: ",
+    "mail: ",
+];
+
+/// `--repl`'s `rustyline` helper: tab-completion only (`REPL_COMPLETIONS`, prefix-matched
+/// against the whole line so far — covers the bare `run: ...`/`.command` line shapes, not
+/// the flow-style `{action: ...}` one). Hinting/highlighting/validation are all left at
+/// their default no-ops.
+struct ReplHelper;
+
+impl rustyline::completion::Completer for ReplHelper {
+    type Candidate = String;
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        let prefix = &line[..pos];
+        let matches = REPL_COMPLETIONS
+            .iter()
+            .filter(|c| c.starts_with(prefix))
+            .map(|c| c.to_string())
+            .collect();
+        Ok((0, matches))
+    }
+}
+impl rustyline::hint::Hinter for ReplHelper {
+    type Hint = String;
+}
+impl rustyline::highlight::Highlighter for ReplHelper {}
+impl rustyline::validate::Validator for ReplHelper {}
+impl rustyline::Helper for ReplHelper {}
+
+/// `--repl`'s history file (arrow-key recall within a session, persisted across them) —
+/// `~/.tooler/repl_history`, the same `~/.tooler/` directory `config::config_path()`
+/// already uses. `None` if the home directory can't be resolved; history then still works
+/// for the current session, it just isn't persisted.
+fn repl_history_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".tooler").join("repl_history"))
+}
+
 /// The `--repl` loop: reads one line at a time (a task action, minus `name:` — see
 /// `PlayArgs.repl`'s doc comment for the two accepted shapes), executes it immediately
 /// against `vars`/`env` via the exact same `run_task` a real playbook run uses, and keeps
 /// going even after a failing line — unlike a batch `tooler play` run, one bad REPL line
-/// must not end the session. `.help` lists the meta-commands.
+/// must not end the session. `.help` lists the meta-commands. Arrow-key history (in-session
+/// and persisted across sessions) and Tab-completion of action/meta-command prefixes come
+/// from `rustyline`; it degrades to plain line reads when stdin isn't a real terminal (a
+/// piped/scripted session), so a non-interactive `--repl` invocation keeps working exactly
+/// as before.
 fn run_repl(mut vars: HashMap<String, String>, env: RunEnv) -> Result<()> {
     println!(
         "{}",
@@ -882,22 +1035,28 @@ fn run_repl(mut vars: HashMap<String, String>, env: RunEnv) -> Result<()> {
     let mut session: Vec<serde_yaml::Value> = Vec::new();
     let mut counter = 0usize;
 
-    loop {
-        print!("tooler-repl> ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
+    let history_path = repl_history_path();
+    let mut editor: Editor<ReplHelper, DefaultHistory> = Editor::new()?;
+    editor.set_helper(Some(ReplHelper));
+    if let Some(path) = &history_path {
+        let _ = editor.load_history(path);
+    }
 
-        let mut line = String::new();
-        let bytes = std::io::stdin()
-            .read_line(&mut line)
-            .context("failed to read from stdin")?;
-        if bytes == 0 {
-            println!();
-            break; // EOF (Ctrl+D)
-        }
+    loop {
+        let line = match editor.readline("tooler-repl> ") {
+            Ok(l) => l,
+            Err(ReadlineError::Interrupted) => continue, // Ctrl+C: cancel this line, stay in the REPL
+            Err(ReadlineError::Eof) => break,            // Ctrl+D
+            Err(e) => {
+                println!("  readline error: {e}");
+                break;
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        let _ = editor.add_history_entry(line);
 
         if let Some(rest) = line.strip_prefix('.') {
             let mut parts = rest.splitn(2, char::is_whitespace);
@@ -974,6 +1133,13 @@ fn run_repl(mut vars: HashMap<String, String>, env: RunEnv) -> Result<()> {
                 }
             }
         }
+    }
+
+    if let Some(path) = &history_path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = editor.save_history(path);
     }
 
     Ok(())
@@ -1990,7 +2156,7 @@ fn run_task_once(
     }
 
     if let Some(spec) = &task.write_file {
-        let out_path = env.playbook_dir.join(render(&spec.path, vars));
+        let out_path = join_confined(&env.playbook_dir, &render(&spec.path, vars))?;
         if !env.quiet {
             println!(
                 "  {} {}",
@@ -2277,6 +2443,55 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.mail {
+        let to = render(&spec.to, vars);
+        let subject = render(&spec.subject, vars);
+        if !env.quiet {
+            println!(
+                "  {} mail to {} — {}",
+                "→".bold(),
+                render_for_display(&spec.to, vars).dimmed(),
+                render_for_display(&spec.subject, vars).dimmed()
+            );
+        }
+        if !env.dry {
+            let cc = spec.cc.as_deref().map(|s| render(s, vars));
+            let bcc = spec.bcc.as_deref().map(|s| render(s, vars));
+            let body = render(&spec.body, vars);
+            let from = spec.from.as_deref().map(|s| render(s, vars));
+            let host = spec.host.as_deref().map(|s| render(s, vars));
+            let user = spec.user.as_deref().map(|s| render(s, vars));
+            let password = spec.password.as_deref().map(|s| render(s, vars));
+            let server = spec.server.as_deref().map(|s| render(s, vars));
+            let creds = resolve_mail_creds(
+                env.ctx,
+                server.as_deref(),
+                host.as_deref(),
+                spec.port,
+                user.as_deref(),
+                password.as_deref(),
+                from.as_deref(),
+                spec.tls.as_deref(),
+            )?;
+            let count = send_mail(
+                &creds,
+                &to,
+                cc.as_deref(),
+                bcc.as_deref(),
+                &subject,
+                &body,
+                spec.html,
+            )?;
+            if !env.quiet {
+                println!("  {} sent to {} recipient(s)", "✓ ok".green().bold(), count);
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), "true".to_string());
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.include {
         let rendered = render(spec.file(), vars);
         let include_path = resolve_include_path(&rendered, env)?;
@@ -2377,7 +2592,7 @@ fn run_task_once(
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
          report, env_check, ssh, fleet, include, assert, block, debug, confirm, set_fact, \
-         sync_db, sync_files, write_file, db_query)",
+         sync_db, sync_files, write_file, db_query, mail)",
         task.name
     );
 }
@@ -2439,6 +2654,185 @@ fn resolve_conn_creds(
             password: password.as_deref(),
         },
     )
+}
+
+/// Resolved SMTP connection details for a `mail:` task or `tooler mail send` — always the
+/// output of `resolve_mail_creds`, never built directly.
+#[derive(Debug)]
+pub(crate) struct MailCreds {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) user: String,
+    pub(crate) password: String,
+    pub(crate) from: String,
+    pub(crate) tls: String,
+}
+
+/// Resolves SMTP connection details for `mail:`/`tooler mail send`: explicit fields win,
+/// falling back to the named `server:` profile's config fields (`config.mail.<name>`),
+/// falling back to `TOOLER_MAIL_PASSWORD` for the password specifically — mirrors
+/// `db_query:`'s `TOOLER_DB_PASSWORD` pattern in `commands::db`. TLS mode: explicit `tls`
+/// wins, else the profile's `tls`, else inferred from `port` (465 -> "tls", else
+/// "starttls").
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_mail_creds(
+    ctx: &Context,
+    server: Option<&str>,
+    host: Option<&str>,
+    port: Option<u16>,
+    user: Option<&str>,
+    password: Option<&str>,
+    from: Option<&str>,
+    tls: Option<&str>,
+) -> Result<MailCreds> {
+    let profile = server.and_then(|name| ctx.config.mail.get(name));
+    if let Some(name) = server
+        && profile.is_none()
+        && host.is_none()
+    {
+        bail!(
+            "No mail profile '{name}' configured. Set it with: tooler config set mail.{name}.host <host>"
+        );
+    }
+
+    let host = host
+        .map(String::from)
+        .or_else(|| profile.map(|p| p.host.clone()))
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("mail needs 'host' or a 'server:' mail profile with a host set")
+        })?;
+    let user = user
+        .map(String::from)
+        .or_else(|| profile.map(|p| p.user.clone()))
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("mail needs 'user' or a 'server:' mail profile with a user set")
+        })?;
+    let port = port
+        .or_else(|| profile.map(|p| p.port))
+        .filter(|&p| p != 0)
+        .unwrap_or(587);
+    let from = from
+        .map(String::from)
+        .or_else(|| profile.and_then(|p| p.from.clone()))
+        .unwrap_or_else(|| user.clone());
+    let tls = tls
+        .map(String::from)
+        .or_else(|| profile.and_then(|p| p.tls.clone()))
+        .unwrap_or_else(|| {
+            if port == 465 {
+                "tls".to_string()
+            } else {
+                "starttls".to_string()
+            }
+        });
+
+    let password = if let Some(p) = password {
+        p.to_string()
+    } else if let Some(name) = server {
+        match crate::secrets::get_secret(&format!("mail:{name}"), "password")? {
+            Some(p) => p,
+            None => std::env::var("TOOLER_MAIL_PASSWORD").map_err(|_| {
+                anyhow::anyhow!(
+                    "No password for mail profile '{name}' (or the OS keychain is locked) — \
+                     set it with: tooler config set mail.{name}.password <value>, or set \
+                     TOOLER_MAIL_PASSWORD"
+                )
+            })?,
+        }
+    } else {
+        std::env::var("TOOLER_MAIL_PASSWORD").map_err(|_| {
+            anyhow::anyhow!(
+                "mail needs 'password', a 'server:' profile's stored password, or \
+                 TOOLER_MAIL_PASSWORD"
+            )
+        })?
+    };
+
+    Ok(MailCreds {
+        host,
+        port,
+        user,
+        password,
+        from,
+        tls,
+    })
+}
+
+/// The one place `lettre` is touched. Builds a `Message` from `,`-separated to/cc/bcc
+/// lists and sends it over SMTP per `creds.tls` — "starttls" -> `starttls_relay` (upgrade
+/// an unencrypted connection, port 587 territory), "tls" -> `relay` (implicit/wrapper TLS,
+/// port 465 territory), "none" -> `builder_dangerous` (no TLS at all — an escape hatch for
+/// a local, unauthenticated relay only). Returns the number of recipients (to+cc+bcc).
+pub(crate) fn send_mail(
+    creds: &MailCreds,
+    to: &str,
+    cc: Option<&str>,
+    bcc: Option<&str>,
+    subject: &str,
+    body: &str,
+    html: bool,
+) -> Result<usize> {
+    use lettre::message::{Mailbox, SinglePart};
+    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::{Message, SmtpTransport, Transport};
+
+    let mut builder = Message::builder()
+        .from(
+            creds
+                .from
+                .parse::<Mailbox>()
+                .with_context(|| format!("invalid from address '{}'", creds.from))?,
+        )
+        .subject(subject);
+
+    let mut recipient_count = 0usize;
+    for addr in to.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        builder = builder.to(addr
+            .parse::<Mailbox>()
+            .with_context(|| format!("invalid to address '{addr}'"))?);
+        recipient_count += 1;
+    }
+    if recipient_count == 0 {
+        bail!("mail: 'to' has no addresses");
+    }
+    if let Some(cc) = cc {
+        for addr in cc.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            builder = builder.cc(addr
+                .parse::<Mailbox>()
+                .with_context(|| format!("invalid cc address '{addr}'"))?);
+            recipient_count += 1;
+        }
+    }
+    if let Some(bcc) = bcc {
+        for addr in bcc.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            builder = builder.bcc(
+                addr.parse::<Mailbox>()
+                    .with_context(|| format!("invalid bcc address '{addr}'"))?,
+            );
+            recipient_count += 1;
+        }
+    }
+
+    let part = if html {
+        SinglePart::html(body.to_string())
+    } else {
+        SinglePart::plain(body.to_string())
+    };
+    let message = builder.singlepart(part).context("building email message")?;
+
+    let transport = match creds.tls.as_str() {
+        "starttls" => SmtpTransport::starttls_relay(&creds.host)?.port(creds.port),
+        "tls" => SmtpTransport::relay(&creds.host)?.port(creds.port),
+        "none" => SmtpTransport::builder_dangerous(&creds.host).port(creds.port),
+        other => bail!("mail: unknown tls mode '{other}' — use starttls, tls, or none"),
+    }
+    .credentials(Credentials::new(creds.user.clone(), creds.password.clone()))
+    .build();
+
+    transport.send(&message).context("sending email")?;
+    Ok(recipient_count)
 }
 
 /// Spawns `cmd`, optionally capturing stdout (draining it on a concurrent reader thread
@@ -3233,6 +3627,125 @@ mod tests {
     }
 
     #[test]
+    fn mail_spec_deserializes_with_server_profile() {
+        let spec: MailSpec =
+            serde_yaml::from_str("server: notif\nto: a@example.com\nsubject: hi\nbody: hello\n")
+                .unwrap();
+        assert_eq!(spec.server.as_deref(), Some("notif"));
+        assert_eq!(spec.to, "a@example.com");
+        assert!(!spec.html);
+        assert!(spec.host.is_none());
+    }
+
+    #[test]
+    fn mail_spec_deserializes_with_inline_host_fields() {
+        let spec: MailSpec = serde_yaml::from_str(
+            "to: a@example.com\nsubject: hi\nbody: hello\nhtml: true\n\
+             host: smtp.example.com\nport: 465\nuser: u\npassword: p\ntls: tls\n",
+        )
+        .unwrap();
+        assert!(spec.server.is_none());
+        assert_eq!(spec.host.as_deref(), Some("smtp.example.com"));
+        assert_eq!(spec.port, Some(465));
+        assert!(spec.html);
+        assert_eq!(spec.tls.as_deref(), Some("tls"));
+    }
+
+    #[test]
+    fn resolve_mail_creds_prefers_explicit_over_profile() {
+        let mut cfg = crate::config::Config::default();
+        cfg.mail.insert(
+            "notif".to_string(),
+            crate::config::MailServer {
+                host: "profile.example.com".to_string(),
+                port: 465,
+                user: "profileuser@example.com".to_string(),
+                from: Some("profile-from@example.com".to_string()),
+                tls: None,
+            },
+        );
+        let ctx = Context::new(OutputFormat::Json, "default".to_string(), cfg);
+        let creds = resolve_mail_creds(
+            &ctx,
+            Some("notif"),
+            Some("explicit.example.com"),
+            None,
+            None,
+            Some("secretpw"),
+            None,
+            None,
+        )
+        .unwrap();
+        // Explicit `host` wins over the profile's.
+        assert_eq!(creds.host, "explicit.example.com");
+        // Unspecified fields fall back to the profile.
+        assert_eq!(creds.user, "profileuser@example.com");
+        assert_eq!(creds.from, "profile-from@example.com");
+        assert_eq!(creds.port, 465);
+        // Explicit password always wins (never touches the keychain).
+        assert_eq!(creds.password, "secretpw");
+        // tls inferred from the profile's port (465) since neither side set `tls`.
+        assert_eq!(creds.tls, "tls");
+    }
+
+    #[test]
+    fn resolve_mail_creds_infers_starttls_from_587_and_tls_from_465() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let creds_587 = resolve_mail_creds(
+            &ctx,
+            None,
+            Some("h"),
+            Some(587),
+            Some("u"),
+            Some("p"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(creds_587.tls, "starttls");
+
+        let creds_465 = resolve_mail_creds(
+            &ctx,
+            None,
+            Some("h"),
+            Some(465),
+            Some("u"),
+            Some("p"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(creds_465.tls, "tls");
+    }
+
+    #[test]
+    fn resolve_mail_creds_errors_clearly_with_no_creds() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let err = resolve_mail_creds(&ctx, None, None, None, None, None, None, None).unwrap_err();
+        assert!(err.to_string().contains("host"));
+    }
+
+    #[test]
+    fn resolve_mail_creds_errors_on_unknown_profile() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let err = resolve_mail_creds(&ctx, Some("ghost"), None, None, None, None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("No mail profile 'ghost'"));
+    }
+
+    #[test]
     fn max_parallel_without_loop_is_rejected() {
         let ctx = Context::new(
             OutputFormat::Json,
@@ -3694,6 +4207,42 @@ mod tests {
     fn ensure_trailing_slash_appends_when_missing_and_is_idempotent() {
         assert_eq!(ensure_trailing_slash("/a/b"), "/a/b/");
         assert_eq!(ensure_trailing_slash("/a/b/"), "/a/b/");
+    }
+
+    #[test]
+    fn join_confined_allows_plain_relative_paths() {
+        let base = Path::new("/pb/dir");
+        assert_eq!(
+            join_confined(base, "out.txt").unwrap(),
+            PathBuf::from("/pb/dir/out.txt")
+        );
+        assert_eq!(
+            join_confined(base, "sub/out.txt").unwrap(),
+            PathBuf::from("/pb/dir/sub/out.txt")
+        );
+    }
+
+    #[test]
+    fn join_confined_allows_a_dotdot_that_nets_back_inside_base() {
+        let base = Path::new("/pb/dir");
+        // Wanders outside and back, but never nets below `base`.
+        assert_eq!(
+            join_confined(base, "a/../b").unwrap(),
+            PathBuf::from("/pb/dir/b")
+        );
+    }
+
+    #[test]
+    fn join_confined_rejects_absolute_paths() {
+        let base = Path::new("/pb/dir");
+        assert!(join_confined(base, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn join_confined_rejects_dotdot_that_escapes_base() {
+        let base = Path::new("/pb/dir");
+        assert!(join_confined(base, "../outside.txt").is_err());
+        assert!(join_confined(base, "a/../../outside.txt").is_err());
     }
 
     #[test]

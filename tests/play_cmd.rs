@@ -1203,3 +1203,63 @@ fn repl_saved_session_is_a_real_playbook_that_tooler_play_can_run() {
     );
     assert!(out.contains("roundtrip"), "stdout was: {out}");
 }
+
+#[test]
+fn mail_task_against_an_unconfigured_profile_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Mail\ntasks:\n  - name: notify\n    mail:\n      server: ghost\n      \
+         to: a@example.com\n      subject: hi\n      body: hello\n",
+    )
+    .unwrap();
+
+    // Task-level failures print their detail to stdout (execute_playbook's own recap),
+    // then bail generically for the exit code -- see `resolve_mail_creds_errors_on_unknown_profile`
+    // for the same message asserted directly against the function's `Result`.
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("No mail profile 'ghost' configured"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn mail_task_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Mail\ntasks:\n  - name: notify\n    mail:\n      server: ghost\n      \
+         to: a@example.com\n      subject: dry subject\n      body: hello\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    // The preview line renders even though `ghost` isn't a configured profile — a dry
+    // run never resolves credentials or connects, so this can't fail on the missing
+    // profile the way a real run does (see `mail_task_against_an_unconfigured_profile_fails_clearly`).
+    assert!(out.contains("mail to"), "stdout was: {out}");
+    assert!(out.contains("dry subject"), "stdout was: {out}");
+}
+
+#[test]
+fn write_file_task_rejects_a_path_that_escapes_the_playbook_directory() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Escape\ntasks:\n  - name: t\n    write_file:\n      \
+         path: \"../outside.txt\"\n      content: \"pwned\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("escapes the playbook directory"),
+        "stdout was: {out}"
+    );
+    assert!(!dir.path().parent().unwrap().join("outside.txt").exists());
+}
