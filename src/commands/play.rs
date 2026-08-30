@@ -216,6 +216,15 @@ struct Task {
     /// (`tooler config set mail.<name>.host ...` + `mail.<name>.password`, the latter in
     /// the OS keychain) or fully inline `host`/`user`/`password` fields. See `MailSpec`.
     mail: Option<MailSpec>,
+    /// Read a mail profile's inbox over IMAP (defaults to unseen messages only).
+    /// `register:` (if set) captures a JSON array of messages — same
+    /// `loop: {from: "{{reg}}"}`-chainable convention as `db_query:`/`scrape:`. See
+    /// `MailCheckSpec`.
+    mail_check: Option<MailCheckSpec>,
+    /// Run a single INSERT/UPDATE/DELETE statement against a database over SSH.
+    /// Deliberately requires `confirm: true` in the YAML itself — never runs silently.
+    /// See `DbExecSpec`.
+    db_exec: Option<DbExecSpec>,
     /// Cap concurrent `loop:` iterations to N at a time (processed in chunks of N) instead
     /// of the default strictly-sequential execution. Only valid combined with `loop:`. See
     /// `run_loop_parallel`.
@@ -534,6 +543,35 @@ fn default_db_max_rows() -> usize {
     1000
 }
 
+/// `db_exec:` — same connection fields as `DbQuerySpec` minus `max_rows` (a single
+/// statement has no rows to cap), plus `confirm`. Mirrors `commands::db::DbSubcommand::
+/// Exec`'s fields, enforced read-side by `db::ensure_write_only` (INSERT/UPDATE/DELETE
+/// only, no DDL). `confirm` must be `true` in the YAML itself -- the same "never runs
+/// silently" posture `tooler db restore --confirm` uses on the CLI, just expressed as a
+/// visible task field instead of a flag, so it shows up in a code review/diff.
+#[derive(Debug, Deserialize)]
+struct DbExecSpec {
+    server: String,
+    /// SQL statement (INSERT/UPDATE/DELETE only — enforced by `db::run_exec`)
+    sql: String,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
 /// `mail:` — every field is renderable via `render()` (so `{{secret.<profile>.password}}`
 /// or any `{{var}}` works anywhere here, same as `db_query:`). `to`/`cc`/`bcc` accept a
 /// comma-separated list of addresses. Credentials resolve through `resolve_mail_creds`:
@@ -570,6 +608,44 @@ struct MailSpec {
     /// port-based inference in `resolve_mail_creds`.
     #[serde(default)]
     tls: Option<String>,
+}
+
+/// `mail_check:` — reads a `server:` mail profile's inbox over IMAP. Profile-only (no
+/// inline host/user/password the way `mail:`/`db_query:` allow): narrower, newer, and a
+/// profile is the common case since IMAP shares the same mailbox login `mail:` already
+/// uses. See `fetch_mail`.
+#[derive(Debug, Deserialize)]
+struct MailCheckSpec {
+    /// Mail profile to read from (see: tooler config set mail.<name>.imap_port, etc).
+    server: String,
+    #[serde(default = "default_mail_folder")]
+    folder: String,
+    /// Only fetch messages without the \Seen flag. Default true — the common "what's new"
+    /// case.
+    #[serde(default = "default_true")]
+    unseen_only: bool,
+    #[serde(default = "default_mail_check_limit")]
+    limit: u32,
+    /// Fetch each message's plain-text body too, not just headers. Off by default to keep
+    /// `register:`'s captured JSON small.
+    #[serde(default)]
+    include_body: bool,
+    /// Mark fetched messages \Seen afterward, so a later run's `unseen_only` doesn't
+    /// reprocess them -- the idempotency primitive for "check inbox -> act -> don't act
+    /// twice". Off by default: mutating mailbox state is opt-in, same posture `db_query:`'s
+    /// read-only default and `db exec`'s `confirm:` gate already establish.
+    #[serde(default)]
+    mark_seen: bool,
+}
+
+fn default_mail_folder() -> String {
+    "INBOX".to_string()
+}
+fn default_mail_check_limit() -> u32 {
+    10
+}
+fn default_true() -> bool {
+    true
 }
 
 fn default_timeout() -> u64 {
@@ -974,7 +1050,9 @@ const REPL_COMPLETIONS: &[&str] = &[
     "sync_files: ",
     "write_file: ",
     "db_query: ",
+    "db_exec: ",
     "mail: ",
+    "mail_check: ",
 ];
 
 /// `--repl`'s `rustyline` helper: tab-completion only (`REPL_COMPLETIONS`, prefix-matched
@@ -2443,6 +2521,48 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.db_exec {
+        let server_name = render(&spec.server, vars);
+        let sql = render(&spec.sql, vars);
+        if !env.quiet {
+            println!(
+                "  {} {} on {}",
+                "→".bold(),
+                render_for_display(&spec.sql, vars).dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            if !spec.confirm {
+                bail!(
+                    "db_exec: refused to run without confirm: true (task '{}') — this is a \
+                     deliberate write, add confirm: true to the task once you've reviewed it",
+                    task.name
+                );
+            }
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let creds = resolve_conn_creds(
+                &server,
+                spec.env.as_deref(),
+                spec.engine.as_deref(),
+                spec.host.as_deref(),
+                spec.port,
+                spec.database.as_deref(),
+                spec.user.as_deref(),
+                spec.password.as_deref(),
+                vars,
+            )?;
+            let output = crate::db::run_exec(&server, &creds, &sql)?;
+            if !env.quiet {
+                println!("  {} {}", "✓ ok".green().bold(), output.dimmed());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), output);
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.mail {
         let to = render(&spec.to, vars);
         let subject = render(&spec.subject, vars);
@@ -2487,6 +2607,41 @@ fn run_task_once(
             }
             if let Some(reg) = &task.register {
                 vars.insert(reg.clone(), "true".to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.mail_check {
+        let server_name = render(&spec.server, vars);
+        let folder = render(&spec.folder, vars);
+        if !env.quiet {
+            println!(
+                "  {} checking {} on {} ({})",
+                "→".bold(),
+                folder.dimmed(),
+                server_name.dimmed(),
+                if spec.unseen_only { "unseen" } else { "all" }
+            );
+        }
+        if !env.dry {
+            let creds = resolve_imap_creds(env.ctx, &server_name)?;
+            let messages = crate::commands::mail::fetch_mail(
+                &creds,
+                &folder,
+                spec.unseen_only,
+                spec.limit,
+                spec.include_body,
+                spec.mark_seen,
+            )?;
+            if !env.quiet {
+                println!("  {} {} message(s)", "✓ ok".green().bold(), messages.len());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    reg.clone(),
+                    serde_json::to_string(&messages).unwrap_or_default(),
+                );
             }
         }
         return Ok(());
@@ -2592,7 +2747,7 @@ fn run_task_once(
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
          report, env_check, ssh, fleet, include, assert, block, debug, confirm, set_fact, \
-         sync_db, sync_files, write_file, db_query, mail)",
+         sync_db, sync_files, write_file, db_query, db_exec, mail, mail_check)",
         task.name
     );
 }
@@ -2757,6 +2912,77 @@ pub(crate) fn resolve_mail_creds(
         password,
         from,
         tls,
+    })
+}
+
+/// Resolved IMAP connection details for `mail_check:`/`tooler mail check` — always the
+/// output of `resolve_imap_creds`, never built directly.
+#[derive(Debug)]
+pub(crate) struct ImapCreds {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) user: String,
+    pub(crate) password: String,
+}
+
+/// Resolves IMAP connection details for a mail profile — profile-only (no inline
+/// host/user/password override the way `resolve_mail_creds` allows for SMTP, since
+/// `mail_check:`/`tooler mail check` are narrower/newer and a profile is the only
+/// supported path in v1). `imap_host` defaults to the profile's SMTP `host` (the common
+/// case: one mailbox, two protocols, same server); `imap_port` defaults to `993`. The
+/// password is the exact same keychain entry `resolve_mail_creds` reads (`mail:<name>`) —
+/// one login shared by both protocols.
+/// The pure, keychain-free half of `resolve_imap_creds`'s resolution: `imap_host`
+/// defaults to the profile's SMTP `host` (one mailbox, two protocols, same server —
+/// exactly the case with every mail profile set up so far), `imap_port` defaults to
+/// `993`. Split out so this defaulting logic is unit-testable without a real OS
+/// credential store in the loop.
+fn resolve_imap_host_port(profile: &crate::config::MailServer) -> (Option<String>, u16) {
+    let host = profile
+        .imap_host
+        .clone()
+        .filter(|h| !h.is_empty())
+        .or_else(|| Some(profile.host.clone()).filter(|h| !h.is_empty()));
+    let port = profile.imap_port.filter(|&p| p != 0).unwrap_or(993);
+    (host, port)
+}
+
+pub(crate) fn resolve_imap_creds(ctx: &Context, server: &str) -> Result<ImapCreds> {
+    let profile = ctx.config.mail.get(server).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No mail profile '{server}' configured. Set it with: tooler config set mail.{server}.host <host>"
+        )
+    })?;
+    let (host, port) = resolve_imap_host_port(profile);
+    let host = host.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mail profile '{server}' has no host set (imap_host or host) -- set it with: \
+             tooler config set mail.{server}.host <host>"
+        )
+    })?;
+    let user = if profile.user.is_empty() {
+        bail!(
+            "mail profile '{server}' has no user set -- set it with: tooler config set \
+             mail.{server}.user <user>"
+        );
+    } else {
+        profile.user.clone()
+    };
+    let password = crate::secrets::get_secret(&format!("mail:{server}"), "password")?
+        .or_else(|| std::env::var("TOOLER_MAIL_PASSWORD").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No password for mail profile '{server}' (or the OS keychain is locked) — \
+                 set it with: tooler config set mail.{server}.password <value>, or set \
+                 TOOLER_MAIL_PASSWORD"
+            )
+        })?;
+
+    Ok(ImapCreds {
+        host,
+        port,
+        user,
+        password,
     })
 }
 
@@ -3652,6 +3878,52 @@ mod tests {
     }
 
     #[test]
+    fn mail_check_spec_deserializes_with_defaults() {
+        let spec: MailCheckSpec = serde_yaml::from_str("server: notif\n").unwrap();
+        assert_eq!(spec.server, "notif");
+        assert_eq!(spec.folder, "INBOX");
+        assert!(spec.unseen_only);
+        assert_eq!(spec.limit, 10);
+        assert!(!spec.include_body);
+        assert!(!spec.mark_seen);
+    }
+
+    #[test]
+    fn mail_check_spec_deserializes_explicit_fields() {
+        let spec: MailCheckSpec = serde_yaml::from_str(
+            "server: notif\nfolder: Archive\nunseen_only: false\nlimit: 5\n\
+             include_body: true\nmark_seen: true\n",
+        )
+        .unwrap();
+        assert_eq!(spec.folder, "Archive");
+        assert!(!spec.unseen_only);
+        assert_eq!(spec.limit, 5);
+        assert!(spec.include_body);
+        assert!(spec.mark_seen);
+    }
+
+    #[test]
+    fn db_exec_spec_deserializes_with_default_confirm() {
+        let spec: DbExecSpec =
+            serde_yaml::from_str("server: db1\nsql: UPDATE t SET x=1\nenv: /var/www/.env\n")
+                .unwrap();
+        assert_eq!(spec.server, "db1");
+        assert_eq!(spec.sql, "UPDATE t SET x=1");
+        assert!(!spec.confirm);
+    }
+
+    #[test]
+    fn db_exec_spec_deserializes_explicit_confirm() {
+        let spec: DbExecSpec = serde_yaml::from_str(
+            "server: db1\nsql: DELETE FROM t WHERE id=1\nengine: mysql\nhost: 127.0.0.1\n\
+             user: root\npassword: secret\nconfirm: true\n",
+        )
+        .unwrap();
+        assert!(spec.confirm);
+        assert_eq!(spec.engine.as_deref(), Some("mysql"));
+    }
+
+    #[test]
     fn resolve_mail_creds_prefers_explicit_over_profile() {
         let mut cfg = crate::config::Config::default();
         cfg.mail.insert(
@@ -3662,6 +3934,8 @@ mod tests {
                 user: "profileuser@example.com".to_string(),
                 from: Some("profile-from@example.com".to_string()),
                 tls: None,
+                imap_host: None,
+                imap_port: None,
             },
         );
         let ctx = Context::new(OutputFormat::Json, "default".to_string(), cfg);
@@ -3743,6 +4017,49 @@ mod tests {
         let err = resolve_mail_creds(&ctx, Some("ghost"), None, None, None, None, None, None)
             .unwrap_err();
         assert!(err.to_string().contains("No mail profile 'ghost'"));
+    }
+
+    #[test]
+    fn resolve_imap_creds_errors_on_unknown_profile() {
+        let ctx = Context::new(
+            OutputFormat::Json,
+            "default".to_string(),
+            crate::config::Config::default(),
+        );
+        let err = resolve_imap_creds(&ctx, "ghost").unwrap_err();
+        assert!(err.to_string().contains("No mail profile 'ghost'"));
+    }
+
+    #[test]
+    fn resolve_imap_host_port_defaults_from_smtp_host_and_993() {
+        let profile = crate::config::MailServer {
+            host: "mail16.serv00.com".to_string(),
+            port: 587,
+            user: "notification@example.com".to_string(),
+            from: None,
+            tls: None,
+            imap_host: None,
+            imap_port: None,
+        };
+        let (host, port) = resolve_imap_host_port(&profile);
+        assert_eq!(host.as_deref(), Some("mail16.serv00.com"));
+        assert_eq!(port, 993);
+    }
+
+    #[test]
+    fn resolve_imap_host_port_prefers_explicit_imap_fields() {
+        let profile = crate::config::MailServer {
+            host: "smtp.example.com".to_string(),
+            port: 587,
+            user: "notification@example.com".to_string(),
+            from: None,
+            tls: None,
+            imap_host: Some("imap.example.com".to_string()),
+            imap_port: Some(143),
+        };
+        let (host, port) = resolve_imap_host_port(&profile);
+        assert_eq!(host.as_deref(), Some("imap.example.com"));
+        assert_eq!(port, 143);
     }
 
     #[test]

@@ -400,6 +400,9 @@ The line editor (`rustyline`) gives you ↑/↓ history — both within the sess
 | `sync_files: {server, from, to, delete}` | Rsync a directory from one path to another on the same server |
 | `write_file: {path, content, append}` | Write (or append) rendered text to a local file |
 | `db_query: {server, sql, env/engine/host/port/database/user/password, max_rows}` | Run a read-only SQL query over SSH and capture the rows |
+| `db_exec: {server, sql, env/engine/host/port/database/user/password, confirm}` | Run a single guarded INSERT/UPDATE/DELETE — requires `confirm: true` |
+| `mail: {server/host/port/user/password, to, cc, bcc, subject, body, html}` | Send an email over SMTP |
+| `mail_check: {server, folder, unseen_only, limit, include_body, mark_seen}` | Read a mail profile's inbox over IMAP and capture the messages |
 
 ```yaml
 tasks:
@@ -551,6 +554,10 @@ tasks:
 
 `mail:` sends an email over SMTP — see [`tooler mail`](#tooler-mail) for the underlying config/keychain setup. `server:` names a `config.mail.<name>` profile, or set `host:`/`port:`/`user:`/`password:` inline; every field renders through `{{var}}`/`{{secret.*}}` like any other task. `register:` (if set) captures `"true"`.
 
+`mail_check:` reads a mail profile's inbox over IMAP — unseen messages by default. `register:` (if set) captures a JSON array of `{uid, from, subject, date}` (plus `body` if `include_body: true`) — the same `loop: {from: "{{reg}}"}`-chainable convention `db_query:`/`scrape:` already use. `mark_seen: true` flags fetched messages `\Seen` afterward, so a later run's unseen-only search doesn't reprocess them — the idempotency primitive for "check inbox → act → don't act twice". Profile-only: `server:` is required, no inline host/user/password.
+
+`db_exec:` runs a single guarded INSERT/UPDATE/DELETE statement — see [`tooler db exec`](#tooler-db) for the same DML-only restriction and connection-field shape as `db_query:`. Unlike every other action in this table, it **requires `confirm: true` written directly in the task** — omitting it fails the task outright rather than silently skipping, so a write is never accidental and is always visible in a diff/code review.
+
 ```yaml
 tasks:
   - name: notify ops on deploy failure
@@ -560,6 +567,20 @@ tasks:
       to: "ops@example.com"
       subject: "Deploy failed: {{env}}"
       body: "{{deploy_log}}"
+
+  - name: check for new order confirmations
+    mail_check:
+      server: notify
+      mark_seen: true
+    register: new_mail
+
+  - name: log each one processed
+    loop: {from: "{{new_mail}}"}
+    db_exec:
+      server: myserver
+      env: backend/.env
+      sql: "INSERT INTO processed_emails (uid, subject) VALUES ({{item.uid}}, '{{item.subject}}')"
+      confirm: true
 ```
 
 ```yaml
@@ -908,6 +929,14 @@ tooler db restore myserver --in shop.sql.gz --env backend/.env --confirm
 
 `backup` pipes `pg_dump`/`mysqldump` through `gzip -c` by default (pass `--no-gzip` to skip it) and writes the raw bytes straight to `--out`. `restore` pipes the local file into `psql`/`mysql` on the remote host, auto-detecting gzip by magic bytes rather than trusting the filename — and, like `tooler git clean`, is **preview-only unless you pass `--confirm`**: without it, it just reports how many bytes would be sent and to which database.
 
+**`tooler db exec`** runs a single guarded write — deliberately narrower than `query`: only `INSERT`/`UPDATE`/`DELETE` are accepted, no DDL (no `DROP`/`TRUNCATE`/`ALTER`/`CREATE`), exactly what marking a row processed or logging an event needs, not general-purpose SQL execution. Same `--confirm` gate as `restore`:
+
+```sh
+tooler db exec myserver "UPDATE orders SET processed=1 WHERE id=42" --env backend/.env --confirm
+```
+
+Without `--confirm` it only previews the resolved SQL and target database. Postgres's `psql -c` reports a command-tag line (`UPDATE 3`, ...) as the command's output; MySQL's client doesn't reliably report an affected-row count here, so treat a MySQL result as "statement succeeded" and follow up with a `db_query: {sql: "SELECT ROW_COUNT()"}` task if the exact count matters.
+
 **Full pipeline** — a real report from a live database in three commands:
 
 ```sh
@@ -952,6 +981,29 @@ with `--tls starttls|tls|none`. `--to`/`--cc`/`--bcc` each accept a comma-separa
 The `tooler_mail_send` MCP tool only accepts `server` (never raw host/user/password) — a
 mail password can never be passed as a tool argument, same rule `tooler_db_query` already
 enforces for DB passwords.
+
+**`tooler mail check`** reads a profile's inbox over IMAP (via the `imap` crate, also
+`rustls`-backed) — unseen messages by default, the "what's new" case an RPA-style process
+needs:
+
+```sh
+tooler config set mail.notify.imap_port 993   # imap_host defaults to the SMTP host above
+tooler mail check --server notify --limit 20
+```
+
+Prints `uid`/`date`/`from`/`subject` per message (`--include-body` also fetches the
+plain-text body; `--output json` gives the full structured array). `--mark-seen` flags
+fetched messages `\Seen` afterward — off by default (mutating mailbox state is opt-in,
+same posture `db_query:`'s read-only default already establishes) — so a later run's
+default unseen-only search doesn't reprocess them: the idempotency primitive behind
+"check inbox → act → don't act twice". Header decoding is best-effort
+(`String::from_utf8_lossy`, no RFC 2047 encoded-word or MIME quoted-printable body
+decoding) — good enough for ASCII/transactional mail, not a full mail client.
+
+Profile-only (no inline `--host`/`--user`/`--password` the way `mail send` allows) —
+narrower and newer, and IMAP shares the exact same mailbox login `mail send` already
+uses. The `tooler_mail_check` MCP tool follows the same profile-only rule, `mark_seen`
+defaulting `false` even for an agent.
 
 ---
 
@@ -999,6 +1051,16 @@ tooler cron remove myserver backup.sh
 ```
 
 `list` parses standard 5-field cron lines into `schedule`/`command`, keeping comments and env-var assignments (e.g. `MAILTO=root`) as raw lines. `add` appends a full crontab line as-is. `remove` drops every line containing the given fixed substring (not a regex) and reports which lines were removed. A user with no crontab yet reads as an empty list rather than an error.
+
+**`tooler cron local`** does the exact same thing to *this* machine's own crontab — no SSH, no server profile, direct `crontab -l`/`crontab -`:
+
+```sh
+tooler cron local add "0 8 * * * /usr/local/bin/tooler play ~/playbooks/morning_check.yml"
+tooler cron local list
+tooler cron local remove morning_check
+```
+
+This is how a whole `tooler play` process — `mail_check:` → act → `report:`/`mail:` — gets scheduled to run unattended, without leaving `tooler` for `crontab -e` by hand. Not supported on Windows (no `crontab` there); use `tooler cron <server>` against a remote Linux target instead.
 
 ---
 
@@ -1133,7 +1195,7 @@ Most tools accept an optional `cwd` parameter so a single long-running server ca
 
 Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can distinguish safe reads (`tooler_info`, `tooler_env_show`, `tooler_check_url`, `tooler_stat`, `tooler_fleet_check`, ...) from destructive operations (`tooler_ssh_exec`, `tooler_ssh_ssl`, `tooler_git_clean`, `tooler_fleet_exec`, ...).
 
-`tooler_ssh_ssl`, `tooler_systemd_restart`, `tooler_ps_kill`, and `tooler_deploy_run` never accept `pfx_password`/`sudo_pass` as tool arguments, `tooler_http_get`/`tooler_http_post` never accept a bearer `token`, and `tooler_db_query`/`tooler_db_backup`/`tooler_db_restore` never accept a database `password` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` / `TOOLER_DB_PASSWORD` in the MCP server's own environment instead, e.g.:
+`tooler_ssh_ssl`, `tooler_systemd_restart`, `tooler_ps_kill`, and `tooler_deploy_run` never accept `pfx_password`/`sudo_pass` as tool arguments, `tooler_http_get`/`tooler_http_post` never accept a bearer `token`, `tooler_db_query`/`tooler_db_backup`/`tooler_db_restore`/`tooler_db_exec` never accept a database `password`, and `tooler_mail_send`/`tooler_mail_check` never accept a mail `password` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` / `TOOLER_DB_PASSWORD` / `TOOLER_MAIL_PASSWORD` in the MCP server's own environment instead, e.g.:
 
 ```json
 {
@@ -1271,3 +1333,7 @@ Builds for: `linux/x86_64`, `linux/aarch64`, `macos/x86_64`, `macos/aarch64`, `w
 | `keyring` | Encrypted credential storage (OS Keychain / Credential Manager / Secret Service) |
 | `printpdf` | PDF generation (`tooler report pdf`) |
 | `rust_xlsxwriter` | Excel generation (`tooler report excel`) |
+| `scraper` | HTML parsing (`scrape:` playbook task) |
+| `rustyline` | Line editor for `tooler play --repl` (history, tab-completion) |
+| `lettre` (`rustls-tls`) | SMTP client (`tooler mail send`, `mail:` playbook task) |
+| `imap` + `imap-proto` (`rustls-tls`) | IMAP client (`tooler mail check`, `mail_check:` playbook task) |

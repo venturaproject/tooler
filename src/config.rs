@@ -132,6 +132,11 @@ pub struct MailServer {
     pub from: Option<String>,
     /// "starttls" | "tls" | "none". `None` -> inferred from `port` (465 -> tls, else starttls).
     pub tls: Option<String>,
+    /// IMAP host, for `mail_check:`/`tooler mail check`. Defaults to `host` (SMTP) --
+    /// the common case is one mailbox serving both protocols on the same server.
+    pub imap_host: Option<String>,
+    /// IMAP port. Defaults to `993`.
+    pub imap_port: Option<u16>,
 }
 
 pub fn config_path() -> PathBuf {

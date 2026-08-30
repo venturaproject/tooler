@@ -530,6 +530,31 @@ struct DbQueryArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct DbExecArgs {
+    /// Server profile to run psql/mysql on (see tooler_server_list)
+    server: String,
+    /// SQL statement -- INSERT/UPDATE/DELETE only, no DDL (no DROP/TRUNCATE/ALTER/CREATE)
+    sql: String,
+    /// Remote path to a dotenv-style file (e.g. Laravel .env) to read DB_* credentials
+    /// from. Preferred over passing credentials explicitly.
+    env: Option<String>,
+    /// DB engine when not using `env`: mysql or postgres
+    engine: Option<String>,
+    /// DB host as reachable from the server profile (when not using `env`)
+    host: Option<String>,
+    /// DB port (when not using `env`; defaults to the engine's standard port)
+    port: Option<u16>,
+    /// Database name (when not using `env`)
+    database: Option<String>,
+    /// DB username (when not using `env`)
+    user: Option<String>,
+    /// Actually run the statement. Without this, the call only previews what would run
+    /// (the resolved SQL and target database) and makes no change.
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct DbBackupArgs {
     /// Server profile to run pg_dump/mysqldump on (see tooler_server_list)
     server: String,
@@ -593,6 +618,31 @@ struct MailSendArgs {
     /// this tool only accepts profile-based, keychain-backed credentials; a mail password
     /// can never be passed as a tool argument.
     server: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct MailCheckArgs {
+    /// Mail profile to read from (see tooler_config_set mail.<name>.imap_port). Required --
+    /// this tool only accepts profile-based, keychain-backed credentials.
+    server: String,
+    #[serde(default = "default_mail_folder")]
+    folder: String,
+    /// Fetch every message in the folder, not just unseen ones (default: unseen only)
+    #[serde(default)]
+    all: bool,
+    /// Fetch each message's plain-text body too, not just headers
+    #[serde(default)]
+    include_body: bool,
+    limit: Option<u32>,
+    /// Mark fetched messages \Seen afterward, so a later call with unseen-only (the
+    /// default) doesn't see them again. Defaults to false even for an agent -- mutating
+    /// mailbox state needs an explicit opt-in.
+    #[serde(default)]
+    mark_seen: bool,
+}
+
+fn default_mail_folder() -> String {
+    "INBOX".to_string()
 }
 
 // ── ps ────────────────────────────────────────────────────────────────────
@@ -813,6 +863,18 @@ struct CronAddArgs {
 #[derive(Deserialize, JsonSchema)]
 struct CronRemoveArgs {
     server: String,
+    /// Fixed substring to match (not a regex) -- matching lines are dropped
+    pattern: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CronLocalAddArgs {
+    /// Full crontab line, e.g. "0 8 * * * /usr/local/bin/tooler play ~/playbooks/x.yml"
+    line: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CronLocalRemoveArgs {
     /// Fixed substring to match (not a regex) -- matching lines are dropped
     pattern: String,
 }
@@ -1587,6 +1649,44 @@ impl ToolerMcp {
     }
 
     #[tool(
+        description = "Run a single INSERT/UPDATE/DELETE statement against a remote \
+                        database by running psql/mysql directly on a server profile over \
+                        SSH -- deliberately narrower than tooler_db_query: no SELECT, no \
+                        DDL (no DROP/TRUNCATE/ALTER/CREATE), exactly what marking a row \
+                        processed or logging an event needs. Without confirm, this only \
+                        previews what would run (the resolved SQL and target database) and \
+                        makes no change -- pass confirm: true to actually apply it. Prefer \
+                        `env` for credentials; a DB password can never be passed as a tool \
+                        argument -- set TOOLER_DB_PASSWORD in the MCP server's own \
+                        environment instead.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_db_exec(
+        &self,
+        Parameters(args): Parameters<DbExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "db".to_string(),
+            "exec".to_string(),
+            args.server.clone(),
+            args.sql.clone(),
+        ];
+        push_opt(&mut argv, "--env", &args.env);
+        push_opt(&mut argv, "--engine", &args.engine);
+        push_opt(&mut argv, "--host", &args.host);
+        push_opt_num(&mut argv, "--port", args.port);
+        push_opt(&mut argv, "--database", &args.database);
+        push_opt(&mut argv, "--user", &args.user);
+        push_flag(&mut argv, "--confirm", args.confirm);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
         description = "Dump a remote database (pg_dump/mysqldump) over SSH to a local file, \
                         gzip-compressed by default. Prefer `env` (a remote dotenv-style file) \
                         to supply DB_* credentials rather than passing them explicitly; a DB \
@@ -1689,6 +1789,31 @@ impl ToolerMcp {
         push_opt(&mut argv, "--bcc", &args.bcc);
         push_opt(&mut argv, "--from", &args.from);
         push_flag(&mut argv, "--html", args.html);
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Read a mail profile's inbox over IMAP (unseen messages by default). \
+                        Only accepts a profile (server) -- never raw host/user/password, \
+                        same rule tooler_mail_send follows.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn tooler_mail_check(
+        &self,
+        Parameters(args): Parameters<MailCheckArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec![
+            "mail".to_string(),
+            "check".to_string(),
+            "--server".to_string(),
+            args.server.clone(),
+            "--folder".to_string(),
+            args.folder.clone(),
+        ];
+        push_flag(&mut argv, "--all", args.all);
+        push_flag(&mut argv, "--include-body", args.include_body);
+        push_opt_num(&mut argv, "--limit", args.limit);
+        push_flag(&mut argv, "--mark-seen", args.mark_seen);
         self.exec_self(argv, &None).await
     }
 
@@ -1829,6 +1954,62 @@ impl ToolerMcp {
             "cron".to_string(),
             "remove".to_string(),
             args.server.clone(),
+            args.pattern.clone(),
+        ];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "List this machine's own crontab entries (no SSH -- the machine \
+                        the tooler MCP server itself runs on)",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn tooler_cron_local_list(&self) -> Result<CallToolResult, McpError> {
+        let argv = vec!["cron".to_string(), "local".to_string(), "list".to_string()];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Append a line to this machine's own crontab (no SSH) -- e.g. to \
+                        schedule a recurring `tooler play` run locally",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_cron_local_add(
+        &self,
+        Parameters(args): Parameters<CronLocalAddArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec![
+            "cron".to_string(),
+            "local".to_string(),
+            "add".to_string(),
+            args.line.clone(),
+        ];
+        self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Remove crontab lines containing a fixed substring, from this \
+                        machine's own crontab (no SSH)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_cron_local_remove(
+        &self,
+        Parameters(args): Parameters<CronLocalRemoveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vec![
+            "cron".to_string(),
+            "local".to_string(),
+            "remove".to_string(),
             args.pattern.clone(),
         ];
         self.exec_self(argv, &None).await

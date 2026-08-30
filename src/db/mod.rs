@@ -322,6 +322,33 @@ fn ensure_read_only(sql: &str) -> Result<&str> {
     Ok(body)
 }
 
+/// Rejects anything but a single INSERT/UPDATE/DELETE statement -- deliberately narrower
+/// than "any SQL": `db_exec:`/`tooler db exec` exist for exactly what an RPA-style
+/// process needs (mark a row processed, update a status, insert a log entry), not
+/// general-purpose SQL execution. DDL (DROP/TRUNCATE/ALTER/CREATE) and everything else
+/// stays out of reach here, same as it's out of reach of `ensure_read_only`.
+fn ensure_write_only(sql: &str) -> Result<&str> {
+    let trimmed = sql.trim();
+    let body = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+    if body.contains(';') {
+        bail!("Only a single statement is allowed");
+    }
+    let first_word = body
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_uppercase();
+    const ALLOWED: &[&str] = &["INSERT", "UPDATE", "DELETE"];
+    if !ALLOWED.contains(&first_word.as_str()) {
+        bail!(
+            "Only INSERT/UPDATE/DELETE are allowed by db_exec: ({}); got '{first_word}'. \
+             Use db_query: for reads, or run this by hand if it's really DDL.",
+            ALLOWED.join("/")
+        );
+    }
+    Ok(body)
+}
+
 fn truncate(rows: Vec<Value>, max_rows: usize) -> (Vec<Value>, bool) {
     let truncated = rows.len() > max_rows;
     (rows.into_iter().take(max_rows).collect(), truncated)
@@ -389,6 +416,56 @@ fn parse_mysql_tsv(output: &str) -> Vec<Value> {
             Value::Object(obj)
         })
         .collect()
+}
+
+/// Runs a single INSERT/UPDATE/DELETE statement (see `ensure_write_only`) against
+/// `creds`'s database, invoking `psql`/`mysql` directly on `server` over SSH exactly
+/// like `run_query` does, but without the `json_agg` wrapping (that's SELECT-only) --
+/// returns whatever the client itself printed, trimmed. Postgres's `psql -c` prints a
+/// command-tag line by default (`UPDATE 3`, `INSERT 0 1`, `DELETE 2`), so that comes
+/// back usable as-is; MySQL's non-batch `mysql -e` prints a "Query OK, N rows affected"
+/// line interactively, but that specific line is a client message, not query output, so
+/// it may come back empty depending on the exact mysql client build -- treat a MySQL
+/// result as "statement succeeded" and use a follow-up `db_query: {sql: "SELECT
+/// ROW_COUNT()"}` task if the exact affected-row count matters.
+pub fn run_exec(server: &Server, creds: &Credentials, sql: &str) -> Result<String> {
+    let body = ensure_write_only(sql)?;
+    let output = match creds.engine {
+        Engine::Postgres => run_postgres_exec(server, creds, body)?,
+        Engine::MySql => run_mysql_exec(server, creds, body)?,
+    };
+    Ok(output.trim().to_string())
+}
+
+/// Runs `body` on Postgres via `psql`, no `-tAX`/`json_agg` wrapping -- lets the normal
+/// command-tag output (`UPDATE 3`, ...) through so `run_exec` can hand it back as-is.
+fn run_postgres_exec(server: &Server, creds: &Credentials, body: &str) -> Result<String> {
+    let command = format!(
+        "PGPASSWORD={} PGCONNECT_TIMEOUT=10 psql -h {} -p {} -U {} -d {} -c {}",
+        shell_quote(&creds.password),
+        shell_quote(&creds.host),
+        creds.port,
+        shell_quote(&creds.user),
+        shell_quote(&creds.database),
+        shell_quote(body),
+    );
+    ssh_exec_capture(server, &command)
+}
+
+/// Runs `body` on MySQL/MariaDB via the `mysql` CLI -- deliberately without
+/// `run_mysql_query`'s `--batch --raw` (those exist for TSV-parsing a SELECT result, not
+/// relevant here).
+fn run_mysql_exec(server: &Server, creds: &Credentials, body: &str) -> Result<String> {
+    let command = format!(
+        "MYSQL_PWD={} mysql --connect-timeout=10 -h {} -P {} -u {} -D {} -e {}",
+        shell_quote(&creds.password),
+        shell_quote(&creds.host),
+        creds.port,
+        shell_quote(&creds.user),
+        shell_quote(&creds.database),
+        shell_quote(body),
+    );
+    ssh_exec_capture(server, &command)
 }
 
 /// Runs a single read-only query against `creds`'s database by invoking `psql`
@@ -526,6 +603,46 @@ mod tests {
     #[test]
     fn ensure_read_only_rejects_multiple_statements() {
         assert!(ensure_read_only("SELECT 1; DROP TABLE t;").is_err());
+    }
+
+    #[test]
+    fn ensure_write_only_accepts_insert_update_delete() {
+        for sql in [
+            "INSERT INTO t (x) VALUES (1)",
+            "update t set x=1 where id=1",
+            "DELETE FROM t WHERE id=1",
+        ] {
+            assert!(
+                ensure_write_only(sql).is_ok(),
+                "expected {sql} to be allowed"
+            );
+        }
+        assert_eq!(
+            ensure_write_only("UPDATE t SET x=1;").unwrap(),
+            "UPDATE t SET x=1"
+        );
+    }
+
+    #[test]
+    fn ensure_write_only_rejects_reads_and_ddl() {
+        for sql in [
+            "SELECT 1",
+            "SHOW TABLES",
+            "DROP TABLE t",
+            "TRUNCATE t",
+            "ALTER TABLE t ADD COLUMN x int",
+            "CREATE TABLE t (x int)",
+        ] {
+            assert!(
+                ensure_write_only(sql).is_err(),
+                "expected {sql} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_write_only_rejects_multiple_statements() {
+        assert!(ensure_write_only("UPDATE t SET x=1; DROP TABLE t;").is_err());
     }
 
     #[test]

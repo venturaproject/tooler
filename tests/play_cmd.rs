@@ -1263,3 +1263,91 @@ fn write_file_task_rejects_a_path_that_escapes_the_playbook_directory() {
     );
     assert!(!dir.path().parent().unwrap().join("outside.txt").exists());
 }
+
+#[test]
+fn db_exec_without_confirm_fails_clearly_and_makes_no_connection() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Exec\ntasks:\n  - name: mark processed\n    db_exec:\n      \
+         server: ghost\n      sql: \"UPDATE t SET x=1\"\n",
+    )
+    .unwrap();
+
+    // Fails on the missing `confirm: true` before ever resolving `server` (an
+    // unconfigured profile that would also fail, just with a different message) --
+    // proves the gate is checked first, not as an afterthought.
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn db_exec_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Exec\ntasks:\n  - name: mark processed\n    db_exec:\n      \
+         server: ghost\n      sql: \"UPDATE t SET x=1\"\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("UPDATE t SET x=1"), "stdout was: {out}");
+}
+
+#[test]
+fn db_exec_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Exec\ntasks:\n  - name: mark processed\n    db_exec:\n      \
+         server: ghost\n      sql: \"UPDATE t SET x=1\"\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn mail_check_against_an_unconfigured_profile_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Check\ntasks:\n  - name: check inbox\n    mail_check:\n      server: ghost\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("No mail profile 'ghost' configured"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn mail_check_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Check\ntasks:\n  - name: check inbox\n    mail_check:\n      server: ghost\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    // The preview line renders even though `ghost` isn't a configured profile — a dry
+    // run never resolves credentials or connects (mirrors mail_task_dry_run_previews_
+    // without_connecting's same reasoning).
+    assert!(out.contains("checking"), "stdout was: {out}");
+}

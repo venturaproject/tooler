@@ -50,6 +50,40 @@ pub enum DbSubcommand {
         #[arg(long, default_value_t = 1000)]
         max_rows: usize,
     },
+    /// Run a single INSERT/UPDATE/DELETE statement against a remote database. Preview-only
+    /// unless --confirm is passed -- deliberately narrower than `query`: no SELECT, no DDL
+    /// (DROP/TRUNCATE/ALTER/CREATE), exactly what marking a row processed or logging an
+    /// event needs, not general-purpose SQL execution.
+    Exec {
+        /// Server profile to run the statement through (see: tooler server list)
+        server: String,
+        /// SQL statement (INSERT/UPDATE/DELETE only)
+        sql: String,
+        /// Remote path to a dotenv-style file (e.g. Laravel .env) to read DB_* credentials from
+        #[arg(long)]
+        env: Option<String>,
+        /// DB engine when not using --env: mysql or postgres
+        #[arg(long)]
+        engine: Option<String>,
+        /// DB host as reachable from the server profile (when not using --env)
+        #[arg(long)]
+        host: Option<String>,
+        /// DB port (when not using --env; defaults to the engine's standard port)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Database name (when not using --env)
+        #[arg(long)]
+        database: Option<String>,
+        /// DB username (when not using --env)
+        #[arg(long)]
+        user: Option<String>,
+        /// DB password [env: TOOLER_DB_PASSWORD] (when not using --env)
+        #[arg(long, env = "TOOLER_DB_PASSWORD")]
+        password: Option<String>,
+        /// Actually run the statement (default is preview-only: shows what would run)
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Dump a remote database (pg_dump/mysqldump) to a local file, gzip-compressed by default
     Backup {
         /// Server profile to run pg_dump/mysqldump through (see: tooler server list)
@@ -144,6 +178,32 @@ pub fn run(args: DbArgs, ctx: &Context) -> Result<()> {
                 password: password.as_deref(),
             },
             max_rows,
+        ),
+        DbSubcommand::Exec {
+            server,
+            sql,
+            env,
+            engine,
+            host,
+            port,
+            database,
+            user,
+            password,
+            confirm,
+        } => exec(
+            ctx,
+            &server,
+            &sql,
+            ConnOpts {
+                env: env.as_deref(),
+                engine: engine.as_deref(),
+                host: host.as_deref(),
+                port,
+                database: database.as_deref(),
+                user: user.as_deref(),
+                password: password.as_deref(),
+            },
+            confirm,
         ),
         DbSubcommand::Backup {
             server,
@@ -349,6 +409,59 @@ fn query(
     );
     println!("{}", "─".repeat(40).dimmed());
     print_table(&rows);
+    Ok(())
+}
+
+fn exec(ctx: &Context, server_name: &str, sql: &str, opts: ConnOpts, confirm: bool) -> Result<()> {
+    let json = ctx.output == OutputFormat::Json;
+
+    let server = resolve_server(ctx, server_name)?;
+    let creds = match resolve_credentials(&server, &opts) {
+        Ok(c) => c,
+        Err(e) => return fail(json, format!("{e:#}")),
+    };
+
+    if !confirm {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "server": server_name,
+                    "database": creds.database,
+                    "sql": sql,
+                    "confirmed": false,
+                })
+            );
+            return Ok(());
+        }
+        println!(
+            "Would run {} on {}@{} (database {}). Re-run with --confirm to apply.",
+            sql.dimmed(),
+            creds.user,
+            server.host_target().cyan(),
+            creds.database.bold(),
+        );
+        return Ok(());
+    }
+
+    let output = match db::run_exec(&server, &creds, sql) {
+        Ok(o) => o,
+        Err(e) => return fail(json, format!("{e:#}")),
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "server": server_name,
+                "database": creds.database,
+                "sql": sql,
+                "output": output,
+            })
+        );
+        return Ok(());
+    }
+    println!("{} {}", "✓ ok".green().bold(), output.dimmed());
     Ok(())
 }
 

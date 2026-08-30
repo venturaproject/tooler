@@ -44,7 +44,7 @@ fn parse_mail_key(key: &str) -> Option<(&str, &str)> {
     rest.split_once('.')
 }
 
-const MAIL_KEYS: &str = "host, port, user, from, tls, password";
+const MAIL_KEYS: &str = "host, port, user, from, tls, imap_host, imap_port, password";
 
 pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
@@ -160,6 +160,23 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                         .get(name)
                         .and_then(|m| m.tls.clone())
                         .ok_or_else(|| anyhow::anyhow!("No tls set for mail profile '{name}'"))?,
+                    "imap_host" => ctx
+                        .config
+                        .mail
+                        .get(name)
+                        .and_then(|m| m.imap_host.clone())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("No imap_host set for mail profile '{name}'")
+                        })?,
+                    "imap_port" => ctx
+                        .config
+                        .mail
+                        .get(name)
+                        .and_then(|m| m.imap_port)
+                        .map(|p| p.to_string())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("No imap_port set for mail profile '{name}'")
+                        })?,
                     "password" => secrets::get_secret(&format!("mail:{name}"), "password")?
                         .ok_or_else(|| {
                             anyhow::anyhow!(
@@ -268,6 +285,20 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                         }
                         let mut cfg = ctx.config.clone();
                         cfg.mail.entry(name.to_string()).or_default().tls = Some(value.clone());
+                        config::save(&cfg)?;
+                    }
+                    "imap_host" => {
+                        let mut cfg = ctx.config.clone();
+                        cfg.mail.entry(name.to_string()).or_default().imap_host =
+                            Some(value.clone());
+                        config::save(&cfg)?;
+                    }
+                    "imap_port" => {
+                        let port: u16 = value
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid imap_port '{}'", value))?;
+                        let mut cfg = ctx.config.clone();
+                        cfg.mail.entry(name.to_string()).or_default().imap_port = Some(port);
                         config::save(&cfg)?;
                     }
                     "password" => {
@@ -430,6 +461,20 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                         let mut cfg = ctx.config.clone();
                         if let Some(m) = cfg.mail.get_mut(name) {
                             m.tls = None;
+                        }
+                        config::save(&cfg)?;
+                    }
+                    "imap_host" => {
+                        let mut cfg = ctx.config.clone();
+                        if let Some(m) = cfg.mail.get_mut(name) {
+                            m.imap_host = None;
+                        }
+                        config::save(&cfg)?;
+                    }
+                    "imap_port" => {
+                        let mut cfg = ctx.config.clone();
+                        if let Some(m) = cfg.mail.get_mut(name) {
+                            m.imap_port = None;
                         }
                         config::save(&cfg)?;
                     }
