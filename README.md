@@ -347,6 +347,25 @@ tooler play playbook.yml --resume --var host=fixed.example.com  # resume after a
 
 **`--resume`** is the real thing: every top-level run writes a checkpoint (`<file>.state.json`, a sibling of the playbook file) after each task's non-fatal outcome, capturing the *entire* vars map at that point — deleted automatically once the playbook fully succeeds. `tooler play playbook.yml --resume` restores those vars exactly as they were after the last completed task, continues with the task right after it, and errors clearly if no checkpoint exists. `--var` overrides still apply on top of the restored vars, so a bad value can be fixed before retrying — the whole point of resuming rather than restarting from scratch. **Security note**: since the checkpoint holds the *entire* vars snapshot, it can contain values resolved from `{{secret.*}}` (e.g. via `set_fact:`) — the file is written with `0600` permissions on Unix, but treat it like any other local credential material (gitignore `*.state.json`) rather than relying on that alone.
 
+**Persistent state (`state_set:` + `{{state.*}}`)** is the durable counterpart to `--resume`'s checkpoint — deliberately a *different* file (`<file>.data.json`, never auto-deleted) for a different purpose: `--resume` restores one specific failed run; `state_set:` carries memory forward across many separate *successful* runs, e.g. a `tooler cron local`-scheduled playbook remembering "the last row ID processed" or "already sent today's report" without abusing IMAP's `\Seen` flag or a DB write for bookkeeping unrelated to the DB itself.
+
+```yaml
+tasks:
+  - name: check for new orders since last run
+    db_query:
+      server: myserver
+      env: backend/.env
+      sql: "SELECT * FROM orders WHERE id > {{state.last_order_id}} ORDER BY id"
+    register: new_orders
+
+  - name: process each one and remember the newest as we go
+    loop: {from: "{{new_orders}}"}
+    state_set:
+      last_order_id: "{{item.id}}"
+```
+
+`state_set:` works exactly like `set_fact:` (same `key: "<rendered expr>"` map shape, no `register:`), except every value it sets is also written to `<file>.data.json` immediately — so it survives even a later task's crash — and becomes readable as `{{state.<key>}}` in *this* run right away, plus every future run of this same playbook file. There's no symmetric `state_get:` task: reading is just `{{state.<key>}}` in any field, the same way there's no `get_fact:` counterpart to `set_fact:`. A key with no prior persisted value renders as the literal `{{state.<key>}}` text, same as any other unresolved token — check for that (or seed a default via `--var`) on a playbook's first-ever run. **Security note**: same as `--resume`'s checkpoint — a `state_set:` value resolved from `{{secret.*}}` ends up on disk, `0600` on Unix but not encrypted, so gitignore `*.data.json` too.
+
 **`--repl`** starts an interactive console over the same task-action engine — type one task at a time and see it execute immediately against a `vars` map that persists for the whole session, instead of writing a whole YAML file up front:
 
 ```sh
@@ -399,6 +418,8 @@ The line editor (`rustyline`) gives you ↑/↓ history — both within the sess
 | `sync_db: {server, from, to}` | Dump `from`'s database and restore it into `to`'s, both reached through the same server |
 | `sync_files: {server, from, to, delete}` | Rsync a directory from one path to another on the same server |
 | `write_file: {path, content, append}` | Write (or append) rendered text to a local file |
+| `read_csv: {path, headers, delimiter}` | Parse a local CSV file and capture the rows |
+| `state_set: {key: "<expr>", ...}` | Like `set_fact:`, but persisted to disk — readable via `{{state.<key>}}` in later runs |
 | `db_query: {server, sql, env/engine/host/port/database/user/password, max_rows}` | Run a read-only SQL query over SSH and capture the rows |
 | `db_exec: {server, sql, env/engine/host/port/database/user/password, confirm}` | Run a single guarded INSERT/UPDATE/DELETE — requires `confirm: true` |
 | `mail: {server/host/port/user/password, to, cc, bcc, subject, body, html}` | Send an email over SMTP |
@@ -502,7 +523,7 @@ tasks:
       timeout: 60
 ```
 
-`wait_for:` polls exactly one of `check_url:`/`check_port:`/`ssh:` (same shapes as the standalone actions) every `interval:` seconds (default 2) until it succeeds or `timeout:` (default 60) elapses, then fails with a clear timeout message. It's the poll-until-ready counterpart to `retries:` — `retries:` re-runs a whole task after it *fails*; `wait_for:` is for "keep checking until this becomes true," so it only logs a start line and the final outcome, not one line per attempt. `register:` isn't supported on it (nothing to capture beyond pass/fail).
+`wait_for:` polls exactly one of `check_url:`/`check_port:`/`ssh:`/`file_exists:`/`file_absent:` (the first three are the same shapes as the standalone actions; the last two are a local path, relative to the playbook directory) every `interval:` seconds (default 2) until it succeeds or `timeout:` (default 60) elapses, then fails with a clear timeout message. It's the poll-until-ready counterpart to `retries:` — `retries:` re-runs a whole task after it *fails*; `wait_for:` is for "keep checking until this becomes true," so it only logs a start line and the final outcome, not one line per attempt. `file_exists`/`file_absent` cover the local-filesystem case network checks can't — waiting for an upload to land, or a lock file to clear. `register:` isn't supported on it (nothing to capture beyond pass/fail).
 
 ```yaml
 tasks:
@@ -551,6 +572,8 @@ tasks:
 `db_query:` runs a read-only query (SELECT/SHOW/EXPLAIN/WITH/DESCRIBE only — the same enforcement `tooler db query` uses, which also rejects MySQL's `SELECT ... INTO OUTFILE`/`INTO DUMPFILE`, since those still start with `SELECT` but write a file on the database server) over SSH and, with `register:`, captures the rows as a JSON array — same convention as `scrape:`, so it plugs directly into `loop: {from: "{{reg}}"}` or `report:` with no temp file. Credentials resolve exactly like `sync_db:`'s `from:`/`to:` sides: either `env: <remote .env path>` or explicit `engine:`/`host:`/`port:`/`database:`/`user:`/`password:` fields. `max_rows:` caps the result (default 1000, same as `tooler db query --max-rows`).
 
 `write_file:` renders `content:` and writes it to `path:` (resolved relative to the playbook's own directory, parent directories created as needed) — `report:`'s counterpart for arbitrary text instead of structured data: a generated config, a `.env`, a one-line summary. `append: true` appends instead of overwriting. Unlike `run:`, only the destination path and byte count are ever printed — never the content — since it may itself resolve `{{secret.*}}` tokens. `register:` (if set) captures the byte count written.
+
+`read_csv:` is `write_file:`'s read-side counterpart — parses a local CSV at `path:` (same directory confinement) and, with `register:`, captures the rows as a JSON array: one object per row keyed by the header row's column names (`headers: true`, the default), or a plain array of cells per row (`headers: false`, when the file has no header row). Every cell comes back as a string, no type guessing — same convention `db_query:`'s row objects already use. `delimiter:` overrides the default `,` for TSV/other-delimited files. Same `loop: {from: "{{reg}}"}`-chainable convention as `db_query:`/`scrape:`/`mail_check:`; only the row count is ever printed, never the content.
 
 `mail:` sends an email over SMTP — see [`tooler mail`](#tooler-mail) for the underlying config/keychain setup. `server:` names a `config.mail.<name>` profile, or set `host:`/`port:`/`user:`/`password:` inline; every field renders through `{{var}}`/`{{secret.*}}` like any other task. `register:` (if set) captures `"true"`.
 
@@ -1337,3 +1360,4 @@ Builds for: `linux/x86_64`, `linux/aarch64`, `macos/x86_64`, `macos/aarch64`, `w
 | `rustyline` | Line editor for `tooler play --repl` (history, tab-completion) |
 | `lettre` (`rustls-tls`) | SMTP client (`tooler mail send`, `mail:` playbook task) |
 | `imap` + `imap-proto` (`rustls-tls`) | IMAP client (`tooler mail check`, `mail_check:` playbook task) |
+| `csv` | CSV parsing (`read_csv:` playbook task) |

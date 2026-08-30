@@ -33,6 +33,7 @@ rustyline = "18.0.1"
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "hostname", "pool", "rustls-tls"] }
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 imap-proto = "0.16.7"
+csv = "1.4.0"
 
 [dev-dependencies]
 assert_cmd = "2"

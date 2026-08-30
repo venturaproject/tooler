@@ -182,6 +182,13 @@ struct Task {
     /// don't see each other (`HashMap` iteration order isn't defined) — split into
     /// separate tasks if one fact needs to build on another.
     set_fact: Option<HashMap<String, String>>,
+    /// Like `set_fact:`, but persisted to `<file>.data.json` (a sibling of the playbook,
+    /// never auto-deleted) so `{{state.<key>}}` is readable in *later, separate*
+    /// `tooler play` invocations too, not just later tasks in this same run -- the
+    /// memory a `tooler cron local`-scheduled playbook needs across runs (e.g. "last
+    /// processed row ID"). No symmetric `state_get:`: reading is just `{{state.<key>}}`
+    /// in any field, the same way there's no `get_fact:` for `set_fact:`.
+    state_set: Option<HashMap<String, String>>,
     /// Pause for a human `y`/`N` confirmation before continuing; the rendered message is
     /// the prompt. Never blocks when driven non-interactively (`--output json`, which is
     /// also the MCP/agent path) unless `--yes` was passed — it fails fast instead, so an
@@ -207,6 +214,11 @@ struct Task {
     /// writing a `.env` file). `register:` (if set) captures the byte count written. See
     /// `WriteFileSpec`.
     write_file: Option<WriteFileSpec>,
+    /// Parse a local CSV file at `path` (relative to this playbook's own directory).
+    /// `register:` (if set) captures a JSON array of rows — same directly-`loop:
+    /// {from: "{{reg}}"}`-chainable convention `db_query:`/`scrape:`/`mail_check:` all
+    /// use. See `ReadCsvSpec`.
+    read_csv: Option<ReadCsvSpec>,
     /// Run a read-only SQL query against a database over SSH and capture the rows.
     /// `register:` (if set) captures a JSON array of row objects, same convention as
     /// `scrape:` — directly chainable into `loop: {from: "{{reg}}"}` or `report:`. See
@@ -446,6 +458,13 @@ struct WaitForSpec {
     check_port: Option<CheckPortSpec>,
     #[serde(default)]
     ssh: Option<SshSpec>,
+    /// Poll until a local file (relative to the playbook directory, confined via
+    /// `join_confined`) exists -- e.g. waiting for an upload to land.
+    #[serde(default)]
+    file_exists: Option<String>,
+    /// Poll until a local file no longer exists -- e.g. waiting for a lock to clear.
+    #[serde(default)]
+    file_absent: Option<String>,
     #[serde(default = "default_wait_interval")]
     interval: u64,
     #[serde(default = "default_wait_timeout")]
@@ -509,6 +528,21 @@ struct WriteFileSpec {
     /// Append instead of overwrite.
     #[serde(default)]
     append: bool,
+}
+
+/// `read_csv:` — the read-side counterpart to `write_file:`. `path` is confined to the
+/// playbook's own directory the same way (`join_confined`). `headers: true` (default)
+/// uses the first row as field names, producing one JSON object per row; `headers: false`
+/// produces plain arrays instead. Every cell comes back as a JSON string -- no type
+/// guessing, same "let the consumer decide" philosophy `parse_mysql_tsv` already uses.
+#[derive(Debug, Deserialize)]
+struct ReadCsvSpec {
+    path: String,
+    #[serde(default = "default_true")]
+    headers: bool,
+    /// Single character. Defaults to ','.
+    #[serde(default)]
+    delimiter: Option<String>,
 }
 
 /// `db_query:` — mirrors `commands::db::DbSubcommand::Query`'s fields exactly, so the
@@ -783,6 +817,12 @@ struct RunEnv<'a> {
     /// `Some(...)` only on the top-level run's own `RunEnv`, `None` for `include:`'s
     /// `sub_env` — checkpointing, like `start_at`, is a top-level-only concept.
     state_path: Option<PathBuf>,
+    /// Where `state_set:` persists `{{state.*}}` values (`<file>.data.json`). `Some(...)`
+    /// only on the top-level run's own `RunEnv`, same top-level-only scoping `state_path`
+    /// has and for the same reason — an `include:`'s `sub_env` shares the outer
+    /// playbook's `vars` map already, so its `state.*` vars flow through for free with
+    /// no extra plumbing; only the on-disk *persistence* is a top-level concept.
+    data_path: Option<PathBuf>,
     ctx: &'a Context,
 }
 
@@ -856,6 +896,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
             auto_yes: false,
             start_at: None,
             state_path: None,
+            data_path: None,
             ctx,
         };
         return run_repl(vars, env);
@@ -928,6 +969,16 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     // resuming rather than restarting from scratch).
     apply_var_overrides(&mut vars, &args.vars)?;
 
+    // Independent of --resume/--start-at-task's checkpoint mechanism -- durable memory
+    // from previous *successful* runs (see `data_path_for`), not a resume snapshot.
+    // Loaded after --var overrides so a persisted value is what a later task's
+    // `{{state.*}}` sees by default, same as any other var seeded before the playbook
+    // starts.
+    let data_path = data_path_for(&file_path);
+    for (k, v) in load_persisted_state(&data_path)? {
+        vars.insert(format!("state.{k}"), v);
+    }
+
     let tag_filter: Option<Vec<&str>> = args
         .tags
         .as_deref()
@@ -942,6 +993,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         auto_yes: args.yes,
         start_at: start_at_task,
         state_path: Some(state_path),
+        data_path: Some(data_path),
         ctx,
     };
 
@@ -1046,9 +1098,11 @@ const REPL_COMPLETIONS: &[&str] = &[
     "debug: ",
     "confirm: ",
     "set_fact: ",
+    "state_set: ",
     "sync_db: ",
     "sync_files: ",
     "write_file: ",
+    "read_csv: ",
     "db_query: ",
     "db_exec: ",
     "mail: ",
@@ -1251,6 +1305,68 @@ fn state_path_for(file_path: &Path) -> PathBuf {
     let mut s = file_path.as_os_str().to_os_string();
     s.push(".state.json");
     PathBuf::from(s)
+}
+
+/// Where `state_set:`'s persisted values live -- `<file>.data.json`, a sibling of the
+/// playbook, deliberately a *different* suffix from `state_path_for`'s `.state.json`
+/// (the `--resume` checkpoint): that file is ephemeral (deleted on full success, exists
+/// to resume one specific failed run); this one is durable and never auto-deleted,
+/// meant to carry memory forward across many separate *successful* runs (e.g. once a day
+/// via `tooler cron local`).
+fn data_path_for(file_path: &Path) -> PathBuf {
+    let mut s = file_path.as_os_str().to_os_string();
+    s.push(".data.json");
+    PathBuf::from(s)
+}
+
+/// Loads `<file>.data.json` if it exists (a missing file is an empty map, not an error --
+/// the common case on a playbook's first run) into a flat, unprefixed `HashMap`. Callers
+/// insert each entry into `vars` under a `state.<key>` prefix so `{{state.<key>}}`
+/// resolves through the ordinary `vars.get(token)` branch of `resolve_token` -- no
+/// changes needed to `render`/`resolve_token` themselves.
+fn load_persisted_state(path: &Path) -> Result<HashMap<String, String>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading persisted state {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("parsing persisted state {}", path.display()))
+}
+
+/// Writes every `state.`-prefixed `vars` entry (stripped of that prefix) back to
+/// `env.data_path` as a flat JSON map, `0600` on Unix (same posture `write_checkpoint`
+/// already has for `--resume`'s checkpoint -- a `state_set:` value resolved from
+/// `{{secret.*}}` ends up here too). A no-op when `env.data_path` is `None` (an
+/// `include:`'s `sub_env`, or `--repl` -- state persistence, like `--resume`
+/// checkpointing, is a top-level-playbook-file concept). Called immediately after every
+/// `state_set:`, not batched, so state already set survives even a later task's crash --
+/// same "durable as you go" philosophy `write_checkpoint` already has.
+fn write_persisted_state(env: &RunEnv, vars: &HashMap<String, String>) {
+    let Some(path) = &env.data_path else {
+        return;
+    };
+    let state: HashMap<&str, &str> = vars
+        .iter()
+        .filter_map(|(k, v)| k.strip_prefix("state.").map(|key| (key, v.as_str())))
+        .collect();
+    let result = serde_json::to_string_pretty(&state)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| {
+            std::fs::write(path, json)
+                .with_context(|| format!("writing persisted state {}", path.display()))
+        });
+    if let Err(e) = result {
+        if !env.quiet {
+            println!("  {}", format!("(state not saved: {e})").dimmed());
+        }
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 fn load_checkpoint(path: &Path) -> Result<PlayCheckpoint> {
@@ -1925,13 +2041,16 @@ fn run_task_once(
             spec.check_url.is_some(),
             spec.check_port.is_some(),
             spec.ssh.is_some(),
+            spec.file_exists.is_some(),
+            spec.file_absent.is_some(),
         ]
         .into_iter()
         .filter(|b| *b)
         .count();
         if set_count != 1 {
             bail!(
-                "wait_for: needs exactly one of check_url/check_port/ssh, task '{}' has {set_count}",
+                "wait_for: needs exactly one of check_url/check_port/ssh/file_exists/file_absent, \
+                 task '{}' has {set_count}",
                 task.name
             );
         }
@@ -1985,6 +2104,28 @@ fn run_task_once(
                 println!("  {} {} = {}", "ƒ".cyan().bold(), k, rendered.dimmed());
             }
             vars.insert(k.clone(), rendered);
+        }
+        return Ok(());
+    }
+
+    if let Some(facts) = &task.state_set {
+        for (k, v) in facts {
+            let rendered = render(v, vars);
+            if !env.quiet {
+                println!(
+                    "  {} state.{} = {}",
+                    "ƒ".cyan().bold(),
+                    k,
+                    rendered.dimmed()
+                );
+            }
+            vars.insert(format!("state.{k}"), rendered);
+        }
+        // The actual persistence, like every other action's real work, is skipped in
+        // --dry — the in-memory vars.insert() above is enough to preview what the
+        // resulting {{state.*}} values would be within this run.
+        if !env.dry {
+            write_persisted_state(env, vars);
         }
         return Ok(());
     }
@@ -2111,6 +2252,16 @@ fn run_task_once(
 
     if let Some(spec) = &task.wait_for {
         // Exactly one of these is Some — enforced upfront above.
+        let file_exists_path = spec
+            .file_exists
+            .as_deref()
+            .map(|p| join_confined(&env.playbook_dir, &render(p, vars)))
+            .transpose()?;
+        let file_absent_path = spec
+            .file_absent
+            .as_deref()
+            .map(|p| join_confined(&env.playbook_dir, &render(p, vars)))
+            .transpose()?;
         let describe = if let Some(url) = &spec.check_url {
             format!("{} to respond", render(url, vars))
         } else if let Some(port_spec) = &spec.check_port {
@@ -2119,6 +2270,10 @@ fn run_task_once(
                 render(&port_spec.host, vars),
                 port_spec.port
             )
+        } else if let Some(path) = &file_exists_path {
+            format!("{} to exist", path.display())
+        } else if let Some(path) = &file_absent_path {
+            format!("{} to no longer exist", path.display())
         } else {
             let ssh_spec = spec.ssh.as_ref().expect("validated: exactly one check set");
             format!(
@@ -2147,6 +2302,10 @@ fn run_task_once(
                         true,
                     )
                     .is_ok()
+                } else if let Some(path) = &file_exists_path {
+                    path.exists()
+                } else if let Some(path) = &file_absent_path {
+                    !path.exists()
                 } else {
                     let ssh_spec = spec.ssh.as_ref().expect("validated: exactly one check set");
                     let server_name = render(&ssh_spec.server, vars);
@@ -2277,6 +2436,76 @@ fn run_task_once(
             }
             if let Some(reg) = &task.register {
                 vars.insert(reg.clone(), bytes_written.to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.read_csv {
+        let in_path = join_confined(&env.playbook_dir, &render(&spec.path, vars))?;
+        if !env.quiet {
+            println!(
+                "  {} {}",
+                "→ read".bold(),
+                in_path.display().to_string().dimmed()
+            );
+        }
+        if !env.dry {
+            let delimiter = match &spec.delimiter {
+                Some(d) if d.len() == 1 => d.as_bytes()[0],
+                Some(d) => bail!("read_csv: delimiter must be a single character, got '{d}'"),
+                None => b',',
+            };
+            let mut reader = csv::ReaderBuilder::new()
+                .has_headers(spec.headers)
+                .delimiter(delimiter)
+                .from_path(&in_path)
+                .with_context(|| format!("opening {}", in_path.display()))?;
+
+            let rows: Vec<serde_json::Value> = if spec.headers {
+                let headers = reader
+                    .headers()
+                    .with_context(|| format!("reading header row of {}", in_path.display()))?
+                    .clone();
+                reader
+                    .records()
+                    .map(|r| {
+                        let record =
+                            r.with_context(|| format!("reading a row of {}", in_path.display()))?;
+                        let mut obj = serde_json::Map::new();
+                        for (col, cell) in headers.iter().zip(record.iter()) {
+                            obj.insert(
+                                col.to_string(),
+                                serde_json::Value::String(cell.to_string()),
+                            );
+                        }
+                        Ok(serde_json::Value::Object(obj))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                reader
+                    .records()
+                    .map(|r| {
+                        let record =
+                            r.with_context(|| format!("reading a row of {}", in_path.display()))?;
+                        Ok(serde_json::Value::Array(
+                            record
+                                .iter()
+                                .map(|c| serde_json::Value::String(c.to_string()))
+                                .collect(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+
+            if !env.quiet {
+                println!("  {} {} row(s)", "✓ ok".green().bold(), rows.len());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    reg.clone(),
+                    serde_json::to_string(&rows).unwrap_or_default(),
+                );
             }
         }
         return Ok(());
@@ -2712,6 +2941,7 @@ fn run_task_once(
                 auto_yes: env.auto_yes,
                 start_at: None,
                 state_path: None,
+                data_path: None,
                 ctx: env.ctx,
             };
             include_stack.push(include_path);
@@ -2747,7 +2977,8 @@ fn run_task_once(
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
          report, env_check, ssh, fleet, include, assert, block, debug, confirm, set_fact, \
-         sync_db, sync_files, write_file, db_query, db_exec, mail, mail_check)",
+         state_set, sync_db, sync_files, write_file, read_csv, db_query, db_exec, mail, \
+         mail_check)",
         task.name
     );
 }
@@ -3708,6 +3939,7 @@ mod tests {
             auto_yes: false,
             start_at: None,
             state_path: None,
+            data_path: None,
             ctx,
         }
     }
@@ -3828,6 +4060,22 @@ mod tests {
         let spec: WriteFileSpec =
             serde_yaml::from_str("path: out.txt\ncontent: hello\nappend: true\n").unwrap();
         assert!(spec.append);
+    }
+
+    #[test]
+    fn read_csv_spec_deserializes_with_defaults() {
+        let spec: ReadCsvSpec = serde_yaml::from_str("path: data.csv\n").unwrap();
+        assert_eq!(spec.path, "data.csv");
+        assert!(spec.headers);
+        assert!(spec.delimiter.is_none());
+    }
+
+    #[test]
+    fn read_csv_spec_deserializes_explicit_fields() {
+        let spec: ReadCsvSpec =
+            serde_yaml::from_str("path: data.tsv\nheaders: false\ndelimiter: \"\\t\"\n").unwrap();
+        assert!(!spec.headers);
+        assert_eq!(spec.delimiter.as_deref(), Some("\t"));
     }
 
     #[test]
@@ -4460,6 +4708,27 @@ mod tests {
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+
+        // file_exists alone — accepted.
+        let task = Task {
+            wait_for: Some(WaitForSpec {
+                file_exists: Some("flag.txt".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
+
+        // file_exists and file_absent set together.
+        let task = Task {
+            wait_for: Some(WaitForSpec {
+                file_exists: Some("flag.txt".to_string()),
+                file_absent: Some("lock.txt".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
     }
 
     #[test]
@@ -4560,6 +4829,32 @@ mod tests {
         let base = Path::new("/pb/dir");
         assert!(join_confined(base, "../outside.txt").is_err());
         assert!(join_confined(base, "a/../../outside.txt").is_err());
+    }
+
+    #[test]
+    fn data_path_for_uses_a_different_suffix_than_state_path_for() {
+        let file = Path::new("/pb/dir/playbook.yml");
+        let data_path = data_path_for(file);
+        let state_path = state_path_for(file);
+        assert_eq!(data_path, PathBuf::from("/pb/dir/playbook.yml.data.json"));
+        assert_ne!(data_path, state_path);
+    }
+
+    #[test]
+    fn load_persisted_state_returns_an_empty_map_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.data.json");
+        let state = load_persisted_state(&missing).unwrap();
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn load_persisted_state_reads_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("playbook.yml.data.json");
+        std::fs::write(&path, r#"{"last_uid": "42"}"#).unwrap();
+        let state = load_persisted_state(&path).unwrap();
+        assert_eq!(state.get("last_uid"), Some(&"42".to_string()));
     }
 
     #[test]

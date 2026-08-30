@@ -1351,3 +1351,134 @@ fn mail_check_dry_run_previews_without_connecting() {
     // without_connecting's same reasoning).
     assert!(out.contains("checking"), "stdout was: {out}");
 }
+
+#[test]
+fn read_csv_task_parses_a_real_csv_and_registers_rows() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("data.csv"), "name,age\nAlice,30\nBob,25\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: CSV\ntasks:\n  - name: read it\n    read_csv:\n      path: data.csv\n    \
+         register: rows\n  - name: show first row\n    debug: \"{{rows}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    assert!(out.contains("2 row(s)"), "stdout was: {out}");
+    assert!(out.contains("\"name\":\"Alice\""), "stdout was: {out}");
+    assert!(out.contains("\"age\":\"30\""), "stdout was: {out}");
+}
+
+#[test]
+fn read_csv_task_rejects_a_path_that_escapes_the_playbook_directory() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Escape\ntasks:\n  - name: t\n    read_csv:\n      path: \"../outside.csv\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("escapes the playbook directory"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn state_set_persists_across_separate_tooler_play_invocations() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: State\ntasks:\n  - name: set it\n    state_set:\n      last_uid: \"42\"\n",
+    )
+    .unwrap();
+
+    tooler_in(dir.path())
+        .args(["play", "playbook.yml"])
+        .assert()
+        .success();
+
+    let data_path = dir.path().join("playbook.yml.data.json");
+    assert!(
+        data_path.exists(),
+        "expected {} to exist",
+        data_path.display()
+    );
+    let saved = std::fs::read_to_string(&data_path).unwrap();
+    assert!(saved.contains("42"), "saved state was: {saved}");
+
+    // A second, separate invocation against the same playbook file reads the value
+    // back via {{state.*}} -- the actual point of the feature: a cross-process
+    // round-trip, not just in-memory persistence within one run.
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: State\ntasks:\n  - name: read it back\n    debug: \"got {{state.last_uid}}\"\n",
+    )
+    .unwrap();
+    let out = stdout_of(
+        tooler_in(dir.path())
+            .args(["play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("got 42"), "stdout was: {out}");
+}
+
+#[test]
+fn state_set_does_not_persist_in_a_dry_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: State\ntasks:\n  - name: set it\n    state_set:\n      x: \"1\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--dry"])
+        .assert()
+        .success();
+
+    assert!(!dir.path().join("playbook.yml.data.json").exists());
+}
+
+#[test]
+fn wait_for_file_exists_unblocks_once_the_file_appears() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Wait\ntasks:\n  - name: wait for the flag\n    wait_for:\n      \
+         file_exists: flag.txt\n      interval: 1\n      timeout: 10\n",
+    )
+    .unwrap();
+
+    let flag_path = dir.path().join("flag.txt");
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::fs::write(flag_path, "go").unwrap();
+    });
+
+    cmd.args(["play", "playbook.yml"])
+        .timeout(std::time::Duration::from_secs(15))
+        .assert()
+        .success();
+}
+
+#[test]
+fn wait_for_file_absent_times_out_while_the_file_still_exists() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("lock.txt"), "held").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Wait\ntasks:\n  - name: wait for the lock to clear\n    wait_for:\n      \
+         file_absent: lock.txt\n      interval: 1\n      timeout: 2\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml"])
+            .timeout(std::time::Duration::from_secs(10))
+            .assert()
+            .failure(),
+    );
+    assert!(out.contains("timed out"), "stdout was: {out}");
+}
