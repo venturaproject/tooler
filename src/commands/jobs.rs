@@ -417,9 +417,34 @@ mod tests {
         }
     }
 
+    /// Some environments (e.g. a bare Linux CI runner with no Secret Service/D-Bus
+    /// session running) have no OS credential store backend at all — `Entry::new` itself
+    /// fails, not just "no such entry". Same round-trip probe `doctor.rs`'s
+    /// `check_keychain` uses. A test that needs to actually *write* a fixture into the
+    /// keychain (unlike `resolve_adzuna_creds`'s own fallback-to-None-on-error behavior,
+    /// which tolerates this fine in production) has no way to run meaningfully without
+    /// one, so it should skip rather than fail the whole suite over an environment gap
+    /// unrelated to the code under test.
+    fn keychain_available() -> bool {
+        const PROBE_PROFILE: &str = "__tooler_test_keychain_probe__";
+        let result = secrets::set_secret(PROBE_PROFILE, "probe", "1").and_then(|_| {
+            let value = secrets::get_secret(PROBE_PROFILE, "probe")?;
+            secrets::delete_secret(PROBE_PROFILE, "probe")?;
+            Ok(value)
+        });
+        matches!(result, Ok(Some(v)) if v == "1")
+    }
+
     #[test]
     fn resolve_adzuna_creds_prefers_explicit_then_falls_back_to_stored_secret() {
         let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        if !keychain_available() {
+            eprintln!(
+                "skipping resolve_adzuna_creds_prefers_explicit_then_falls_back_to_stored_secret: \
+                 no OS credential store backend available in this environment"
+            );
+            return;
+        }
         let ctx = test_ctx("jobs_test_creds");
         secrets::set_secret(&ctx.profile, "adzuna_app_id", "stored-id").unwrap();
         secrets::set_secret(&ctx.profile, "adzuna_app_key", "stored-key").unwrap();
