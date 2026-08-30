@@ -72,6 +72,7 @@ pub struct PlayArgs {
 // ── YAML schema ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Playbook {
     name: String,
     #[serde(default)]
@@ -92,6 +93,7 @@ struct Playbook {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct Task {
     name: String,
     #[serde(default)]
@@ -347,6 +349,7 @@ impl IncludeSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SshSpec {
     /// Server profile name (see: tooler server list)
     server: String,
@@ -356,6 +359,7 @@ struct SshSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FleetSpec {
     /// Comma-separated server profile names (mutually exclusive with all/group)
     #[serde(default)]
@@ -374,6 +378,7 @@ struct FleetSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DbSyncSpec {
     /// Server profile to run mysqldump/pg_dump + mysql/psql through (both sides)
     server: String,
@@ -385,6 +390,7 @@ struct DbSyncSpec {
 /// Laravel `.env`, to read DB_* credentials from) or the explicit fields. Mirrors
 /// `commands::db::ConnOpts`, which `resolve_db_sync_creds` delegates to.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct DbSyncSide {
     #[serde(default)]
     env: Option<String>,
@@ -403,6 +409,7 @@ struct DbSyncSide {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SyncFilesSpec {
     /// Server profile (see: tooler server list)
     server: String,
@@ -414,6 +421,7 @@ struct SyncFilesSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CheckPortSpec {
     host: String,
     port: u16,
@@ -422,6 +430,7 @@ struct CheckPortSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EnvCheckSpec {
     reference: String,
     #[serde(default = "default_env_target")]
@@ -429,6 +438,7 @@ struct EnvCheckSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HttpSpec {
     #[serde(default = "default_http_method")]
     method: String,
@@ -451,6 +461,7 @@ struct HttpSpec {
 /// "keep checking until this becomes true" (e.g. wait for a service to come back up after
 /// a restart), so it doesn't log every attempt the way `retries:` does.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct WaitForSpec {
     #[serde(default)]
     check_url: Option<String>,
@@ -479,6 +490,7 @@ fn default_wait_timeout() -> u64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScrapeSpec {
     url: String,
     #[serde(default)]
@@ -498,6 +510,7 @@ struct ScrapeSpec {
 /// so a `register:`ed `http:`/`scrape:` result can go straight into a report with no
 /// temp-file round-trip.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReportSpec {
     /// "html", "pdf", or "excel"
     format: String,
@@ -522,6 +535,7 @@ fn default_report_title() -> String {
 /// directory by `join_confined` — an absolute path or a `..` that nets outside it is
 /// rejected, rather than silently writing wherever a rendered `{{var}}` happened to point.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteFileSpec {
     path: String,
     content: String,
@@ -536,6 +550,7 @@ struct WriteFileSpec {
 /// produces plain arrays instead. Every cell comes back as a JSON string -- no type
 /// guessing, same "let the consumer decide" philosophy `parse_mysql_tsv` already uses.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadCsvSpec {
     path: String,
     #[serde(default = "default_true")]
@@ -548,6 +563,7 @@ struct ReadCsvSpec {
 /// `db_query:` — mirrors `commands::db::DbSubcommand::Query`'s fields exactly, so the
 /// mental model transfers 1:1 from the standalone `tooler db query` command.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DbQuerySpec {
     /// Server profile to run the query through (see: tooler server list)
     server: String,
@@ -584,6 +600,7 @@ fn default_db_max_rows() -> usize {
 /// silently" posture `tooler db restore --confirm` uses on the CLI, just expressed as a
 /// visible task field instead of a flag, so it shows up in a code review/diff.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DbExecSpec {
     server: String,
     /// SQL statement (INSERT/UPDATE/DELETE only — enforced by `db::run_exec`)
@@ -613,6 +630,7 @@ struct DbExecSpec {
 /// profile (`config.mail.<name>` + the OS keychain), which wins over `TOOLER_MAIL_PASSWORD`
 /// for the password specifically.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MailSpec {
     /// Mail profile to send through (see: tooler config set mail.<name>.host, and
     /// following fields).
@@ -649,6 +667,7 @@ struct MailSpec {
 /// profile is the common case since IMAP shares the same mailbox login `mail:` already
 /// uses. See `fetch_mail`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MailCheckSpec {
     /// Mail profile to read from (see: tooler config set mail.<name>.imap_port, etc).
     server: String,
@@ -4123,6 +4142,32 @@ mod tests {
         assert_eq!(spec.port, Some(465));
         assert!(spec.html);
         assert_eq!(spec.tls.as_deref(), Some("tls"));
+    }
+
+    #[test]
+    fn mail_spec_rejects_an_unknown_field_instead_of_silently_dropping_it() {
+        let err = serde_yaml::from_str::<MailSpec>(
+            "servre: notif\nto: a@example.com\nsubject: hi\nbody: hello\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `servre`"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn task_rejects_an_unknown_field_instead_of_silently_dropping_it() {
+        // A typo'd delya:/registerr: alongside a valid run: used to succeed silently,
+        // ignoring both -- see the deny_unknown_fields sweep across Task and every
+        // *Spec struct.
+        let err =
+            serde_yaml::from_str::<Task>("name: t\nrun: echo hi\ndelya: 5\nregisterr: oops\n")
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `delya`"),
+            "error was: {err}"
+        );
     }
 
     #[test]

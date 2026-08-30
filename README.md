@@ -395,6 +395,8 @@ Each line is the *body* of a task — everything a YAML task has except `name:`,
 
 The line editor (`rustyline`) gives you ↑/↓ history — both within the session and persisted across sessions in `~/.tooler/repl_history` — and Tab-completion of action names (`run: `, `http: `, ...) and meta-commands (`.vars`, `.save `, ...) against the start of the line. It degrades to plain, unedited line reads when stdin isn't a real terminal (piped/scripted input, e.g. `.write_stdin` in a test), so a non-interactive `--repl` session keeps working exactly as before.
 
+Every task's fields (and every action's own `{...}` spec, like `mail: {...}`/`db_query: {...}`) reject unknown keys with a clear `unknown field 'x', expected one of ...` error at load time, rather than silently ignoring a typo — `delya: 5` (meant to be `delay:`) or `servre: notify` (meant to be `server:`) fails the playbook immediately instead of quietly doing nothing. This matters most when a playbook is written by an LLM agent, where a plausible-looking typo is a real failure mode worth catching before anything runs.
+
 **Available task actions:**
 
 | Action | Description |

@@ -1482,3 +1482,21 @@ fn wait_for_file_absent_times_out_while_the_file_still_exists() {
     );
     assert!(out.contains("timed out"), "stdout was: {out}");
 }
+
+#[test]
+fn a_typo_d_task_field_fails_clearly_instead_of_being_silently_ignored() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Typo\ntasks:\n  - name: risky task\n    run: echo hi\n    delya: 5\n    \
+         registerr: oops\n",
+    )
+    .unwrap();
+
+    let out = cmd.args(["play", "playbook.yml"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("unknown field `delya`"),
+        "stderr was: {stderr}"
+    );
+}
