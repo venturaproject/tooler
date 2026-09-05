@@ -71,7 +71,7 @@ fn fail(json: bool, message: String) -> Result<()> {
 }
 
 #[derive(Serialize)]
-struct ProcessRow {
+pub(crate) struct ProcessRow {
     user: String,
     pid: u32,
     cpu: String,
@@ -85,7 +85,7 @@ struct ProcessRow {
 /// Parses `ps aux` output (USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND --
 /// the same 11-column layout on both Linux/procps and BSD/FreeBSD's `ps aux`), skipping
 /// the header line and anything too short to be a real process row.
-fn parse_ps_aux(output: &str) -> Vec<ProcessRow> {
+pub(crate) fn parse_ps_aux(output: &str) -> Vec<ProcessRow> {
     output
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -114,7 +114,7 @@ fn parse_ps_line(line: &str) -> Option<ProcessRow> {
 
 /// Keeps rows whose command line contains `filter` (case-insensitive) or whose PID
 /// matches it exactly.
-fn apply_filter(rows: Vec<ProcessRow>, filter: Option<&str>) -> Vec<ProcessRow> {
+pub(crate) fn apply_filter(rows: Vec<ProcessRow>, filter: Option<&str>) -> Vec<ProcessRow> {
     let Some(f) = filter else {
         return rows;
     };
@@ -124,7 +124,7 @@ fn apply_filter(rows: Vec<ProcessRow>, filter: Option<&str>) -> Vec<ProcessRow> 
         .collect()
 }
 
-fn kill_cmd(pid: u32, signal: &str, sudo: bool, sudo_pass: Option<&str>) -> String {
+pub(crate) fn kill_cmd(pid: u32, signal: &str, sudo: bool, sudo_pass: Option<&str>) -> String {
     format!(
         "{}kill {} {pid}",
         db::sudo_prefix(sudo, sudo_pass),

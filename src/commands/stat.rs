@@ -25,7 +25,7 @@ const MARK_UPTIME: &str = "__TOOLER_STAT_UPTIME__";
 const MARK_MEM: &str = "__TOOLER_STAT_MEM__";
 const MARK_DISK: &str = "__TOOLER_STAT_DISK__";
 
-fn stat_cmd() -> String {
+pub(crate) fn stat_cmd() -> String {
     format!(
         "echo {MARK_UPTIME}; uptime; echo {MARK_MEM}; \
          (free -h 2>/dev/null || vm_stat 2>/dev/null || echo 'unavailable'); \
@@ -35,7 +35,7 @@ fn stat_cmd() -> String {
 
 /// Splits the combined `stat_cmd` output into (uptime, memory, disk) blocks using the
 /// echo'd markers. Missing markers degrade to empty sections rather than panicking.
-fn parse_sections(output: &str) -> (String, String, String) {
+pub(crate) fn parse_sections(output: &str) -> (String, String, String) {
     let after_uptime = output.split(MARK_UPTIME).nth(1).unwrap_or("");
     let (uptime, rest) = after_uptime
         .split_once(MARK_MEM)

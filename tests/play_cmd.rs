@@ -1638,6 +1638,203 @@ fn logs_grep_against_an_unconfigured_server_fails_clearly() {
 }
 
 #[test]
+fn ps_list_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: PsList\ntasks:\n  - name: list them\n    ps_list:\n      server: ghost\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("processes"), "stdout was: {out}");
+}
+
+#[test]
+fn ps_list_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: PsList\ntasks:\n  - name: list them\n    ps_list:\n      server: ghost\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn ps_kill_without_confirm_fails_clearly_and_makes_no_connection() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: PsKill\ntasks:\n  - name: kill it\n    ps_kill:\n      \
+         server: ghost\n      pid: 1234\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn ps_kill_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: PsKill\ntasks:\n  - name: kill it\n    ps_kill:\n      \
+         server: ghost\n      pid: 1234\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("1234"), "stdout was: {out}");
+}
+
+#[test]
+fn ps_kill_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: PsKill\ntasks:\n  - name: kill it\n    ps_kill:\n      \
+         server: ghost\n      pid: 1234\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn stat_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Stat\ntasks:\n  - name: check it\n    stat:\n      server: ghost\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("stat"), "stdout was: {out}");
+}
+
+#[test]
+fn stat_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Stat\ntasks:\n  - name: check it\n    stat:\n      server: ghost\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+/// Initializes a real git repo with a pinned, deterministic branch name and two commits
+/// (one categorizable as a feature), mirroring `tests/git_cmd.rs`'s own `init_repo`
+/// helper exactly, so `git_summary:`/`git_changelog:` have real data to report.
+fn init_repo(dir: &std::path::Path) {
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "initial commit"]);
+    std::fs::write(dir.join("feature.md"), "feature\n").unwrap();
+    git(&["add", "feature.md"]);
+    git(&["commit", "-m", "feat: add a feature"]);
+}
+
+#[test]
+fn git_summary_task_registers_the_playbooks_own_repo_summary() {
+    let (mut cmd, dir) = tooler();
+    init_repo(dir.path());
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Summary\ntasks:\n  - name: summarize\n    git_summary: {}\n    \
+         register: s\n  - name: show\n    debug: \"{{s}}\"\n",
+    )
+    .unwrap();
+
+    // The playbook.yml file itself is untracked in the freshly-init'd repo, so `clean`
+    // is always false here -- assert on branch/recent instead, which don't depend on
+    // that incidental detail.
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    assert!(out.contains("\"branch\":\"main\""), "stdout was: {out}");
+    assert!(out.contains("add a feature"), "stdout was: {out}");
+}
+
+#[test]
+fn git_changelog_task_registers_categorized_commits() {
+    let (mut cmd, dir) = tooler();
+    init_repo(dir.path());
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Changelog\ntasks:\n  - name: changelog\n    git_changelog: {}\n    \
+         register: c\n  - name: show\n    debug: \"{{c}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    assert!(out.contains("add a feature"), "stdout was: {out}");
+    assert!(out.contains("\"features\":"), "stdout was: {out}");
+}
+
+#[test]
+fn gh_prs_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Prs\ntasks:\n  - name: list them\n    gh_prs: {}\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("gh pr list"), "stdout was: {out}");
+}
+
+#[test]
+fn gh_prs_rejects_an_invalid_after_date() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Prs\ntasks:\n  - name: list them\n    gh_prs:\n      after: not-a-date\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("expected a date"), "stdout was: {out}");
+}
+
+#[test]
 fn mail_check_against_an_unconfigured_profile_fails_clearly() {
     let (mut cmd, dir) = tooler();
     std::fs::write(

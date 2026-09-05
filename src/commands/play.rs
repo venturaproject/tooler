@@ -177,6 +177,15 @@ struct Task {
     /// Search a remote file over SSH — the same `commands::logs::grep_cmd` `tooler logs
     /// grep` uses. See `LogsGrepSpec`.
     logs_grep: Option<LogsGrepSpec>,
+    /// List remote processes over SSH — the same `commands::ps::parse_ps_aux`/
+    /// `apply_filter` `tooler ps list` uses. See `PsListSpec`.
+    ps_list: Option<PsListSpec>,
+    /// Send a signal to a remote process over SSH — the same `commands::ps::kill_cmd`
+    /// `tooler ps kill` uses. See `PsKillSpec`.
+    ps_kill: Option<PsKillSpec>,
+    /// A remote server's uptime/memory/disk snapshot — the same `commands::stat`
+    /// engine `tooler stat` uses. See `StatSpec`.
+    stat: Option<StatSpec>,
     /// Run another whole playbook (by bare playbooks/ name, or a path relative to this
     /// playbook's own directory) as a single task — either bare (`include: sub.yml`) or
     /// with per-call var overrides (`include: {file: sub.yml, vars: {...}}`). See
@@ -243,6 +252,17 @@ struct Task {
     /// a local CSV file at `path` (relative to this playbook's own directory) — the
     /// inverse of `read_csv:`. See `WriteCsvSpec`.
     write_csv: Option<WriteCsvSpec>,
+    /// The playbook's own repo's branch/tag/status/recent-commits summary — the same
+    /// `commands::git::compute_summary` `tooler git summary` uses. No fields; invoke as
+    /// `git_summary: {}`. See `GitSummarySpec`.
+    git_summary: Option<GitSummarySpec>,
+    /// Commits since the last tag (or `from:`), categorized into features/fixes/other —
+    /// the same `commands::git::compute_changelog` `tooler git changelog` uses. See
+    /// `GitChangelogSpec`.
+    git_changelog: Option<GitChangelogSpec>,
+    /// List GitHub pull requests via the `gh` CLI — the same `commands::gh::fetch_prs`
+    /// `tooler gh prs` uses. See `GhPrsSpec`.
+    gh_prs: Option<GhPrsSpec>,
     /// Run a read-only SQL query against a database over SSH and capture the rows.
     /// `register:` (if set) captures a JSON array of row objects, same convention as
     /// `scrape:` — directly chainable into `loop: {from: "{{reg}}"}` or `report:`. See
@@ -485,6 +505,96 @@ struct LogsGrepSpec {
 
 fn default_grep_max_lines() -> usize {
     200
+}
+
+/// `ps_list:` — lists remote processes over SSH via `commands::ps::parse_ps_aux`/
+/// `apply_filter`. Same content-hiding convention as `fs_cat:`/`logs_tail:`: row-shaped
+/// data, so only the count prints; `register:` captures the JSON array.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PsListSpec {
+    server: String,
+    /// Only include processes whose command line (or PID) matches this substring
+    #[serde(default)]
+    filter: Option<String>,
+}
+
+/// `ps_kill:` — sends a signal to a remote process via `commands::ps::kill_cmd`.
+/// Deliberately requires `confirm: true` in the YAML itself, same non-negotiable gate
+/// `db_exec:`/`fs_write:` use.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PsKillSpec {
+    server: String,
+    pid: u32,
+    #[serde(default = "default_kill_signal")]
+    signal: String,
+    #[serde(default)]
+    sudo: bool,
+    #[serde(default)]
+    sudo_pass: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+fn default_kill_signal() -> String {
+    "TERM".to_string()
+}
+
+/// `stat:` — a remote server's uptime/memory/disk snapshot via `commands::stat::stat_cmd`/
+/// `parse_sections`. A single small operational status blob, not row-shaped bulk data,
+/// so it prints directly (same as `systemd_status:`); `register:` captures
+/// `{uptime, memory, disk}` as JSON for `report:`/`mail:` chaining.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatSpec {
+    server: String,
+}
+
+/// `git_summary:` — the local repo's branch/tag/status/recent-commits summary via
+/// `commands::git::compute_summary`, run against the playbook's own directory (same cwd
+/// convention `run:` already has). No fields; invoked as `git_summary: {}`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct GitSummarySpec {}
+
+/// `git_changelog:` — commits since the last tag (or `from:`), categorized into
+/// features/fixes/other, via `commands::git::compute_changelog`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitChangelogSpec {
+    /// Starting tag or commit (defaults to the latest tag)
+    #[serde(default)]
+    from: Option<String>,
+}
+
+/// `gh_prs:` — lists GitHub pull requests via `commands::gh::fetch_prs` (shells out to
+/// the `gh` CLI). Row-shaped external data like `db_query:`, so only the count prints;
+/// `register:` captures the JSON array, directly chainable into `report:`/`loop:`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GhPrsSpec {
+    /// Repository as owner/name (defaults to the repo in the playbook's own directory)
+    #[serde(default)]
+    repo: Option<String>,
+    /// Only PRs created on/after this date (YYYY-MM-DD)
+    #[serde(default)]
+    after: Option<String>,
+    /// Only PRs created on/before this date (YYYY-MM-DD)
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default = "default_pr_state")]
+    state: String,
+    #[serde(default = "default_pr_limit")]
+    limit: u32,
+}
+
+fn default_pr_state() -> String {
+    "all".to_string()
+}
+
+fn default_pr_limit() -> u32 {
+    500
 }
 
 #[derive(Debug, Deserialize)]
@@ -1274,6 +1384,12 @@ const REPL_COMPLETIONS: &[&str] = &[
     "systemd_status: ",
     "logs_tail: ",
     "logs_grep: ",
+    "ps_list: ",
+    "ps_kill: ",
+    "stat: ",
+    "git_summary: ",
+    "git_changelog: ",
+    "gh_prs: ",
     "include: ",
     "assert: ",
     "block:",
@@ -2800,6 +2916,108 @@ fn run_task_once(
         return Ok(());
     }
 
+    if task.git_summary.is_some() {
+        if !env.quiet {
+            println!("  {} git summary", "→".bold());
+        }
+        if !env.dry {
+            let s = crate::commands::git::compute_summary(Some(&env.playbook_dir))?;
+            if !env.quiet {
+                let tag = s.tag.as_deref().unwrap_or("—");
+                let ab = if s.has_upstream {
+                    format!(" (↑{} ↓{})", s.ahead, s.behind)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  branch: {}{ab}  tag: {}  status: {}",
+                    s.branch,
+                    tag,
+                    if s.clean { "clean" } else { "dirty" }
+                );
+                for line in &s.recent {
+                    println!("    {}", line.dimmed());
+                }
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), serde_json::to_string(&s).unwrap_or_default());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.git_changelog {
+        let from = spec.from.as_ref().map(|f| render(f, vars));
+        if !env.quiet {
+            println!("  {} git changelog", "→".bold());
+        }
+        if !env.dry {
+            let c =
+                crate::commands::git::compute_changelog(Some(&env.playbook_dir), from.as_deref())?;
+            if !env.quiet {
+                if c.features.is_empty() && c.fixes.is_empty() && c.other.is_empty() {
+                    println!("  {}", "(no commits since last tag)".dimmed());
+                } else {
+                    for m in &c.features {
+                        println!("  feat: {m}");
+                    }
+                    for m in &c.fixes {
+                        println!("  fix: {m}");
+                    }
+                    for m in &c.other {
+                        println!("  {m}");
+                    }
+                }
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), serde_json::to_string(&c).unwrap_or_default());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.gh_prs {
+        let repo = spec.repo.as_ref().map(|r| render(r, vars));
+        let after_s = spec.after.as_ref().map(|a| render(a, vars));
+        let before_s = spec.before.as_ref().map(|b| render(b, vars));
+        let state = render(&spec.state, vars);
+        if !env.quiet {
+            println!(
+                "  {} gh pr list{}",
+                "→".bold(),
+                repo.as_deref()
+                    .map(|r| format!(" in {r}"))
+                    .unwrap_or_default()
+                    .dimmed()
+            );
+        }
+        if !env.dry {
+            let after = after_s
+                .as_deref()
+                .map(crate::commands::gh::parse_date)
+                .transpose()?;
+            let before = before_s
+                .as_deref()
+                .map(crate::commands::gh::parse_date)
+                .transpose()?;
+            let prs = crate::commands::gh::fetch_prs(
+                Some(&env.playbook_dir),
+                repo.as_deref(),
+                after,
+                before,
+                &state,
+                spec.limit,
+            )?;
+            if !env.quiet {
+                println!("  {} {} pr(s)", "✓ ok".green().bold(), prs.len());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), serde_json::to_string(&prs).unwrap_or_default());
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.env_check {
         let reference = env.playbook_dir.join(render(&spec.reference, vars));
         let target = env.playbook_dir.join(render(&spec.target, vars));
@@ -3106,6 +3324,91 @@ fn run_task_once(
                 vars.insert(
                     reg.clone(),
                     serde_json::to_string(&lines).unwrap_or_default(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.ps_list {
+        let server_name = render(&spec.server, vars);
+        let filter = spec.filter.as_deref().map(|f| render(f, vars));
+        if !env.quiet {
+            println!("  {} processes on {}", "→".bold(), server_name.dimmed());
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let output = crate::db::ssh_exec_capture(&server, "ps aux")?;
+            let rows = crate::commands::ps::apply_filter(
+                crate::commands::ps::parse_ps_aux(&output),
+                filter.as_deref(),
+            );
+            if !env.quiet {
+                println!("  {} {} process(es)", "✓ ok".green().bold(), rows.len());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    reg.clone(),
+                    serde_json::to_string(&rows).unwrap_or_default(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.ps_kill {
+        let server_name = render(&spec.server, vars);
+        let signal = render(&spec.signal, vars);
+        if !env.quiet {
+            println!(
+                "  {} SIG{} to pid {} on {}",
+                "→".bold(),
+                signal.dimmed(),
+                spec.pid,
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            if !spec.confirm {
+                bail!(
+                    "ps_kill: refused to run without confirm: true (task '{}') — this is a \
+                     deliberate write, add confirm: true to the task once you've reviewed it",
+                    task.name
+                );
+            }
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let sudo_pass = spec.sudo_pass.as_deref().map(|s| render(s, vars));
+            crate::db::ssh_exec_capture(
+                &server,
+                &crate::commands::ps::kill_cmd(spec.pid, &signal, spec.sudo, sudo_pass.as_deref()),
+            )?;
+            if !env.quiet {
+                println!("  {} sent", "✓ ok".green().bold());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), "true".to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.stat {
+        let server_name = render(&spec.server, vars);
+        if !env.quiet {
+            println!("  {} stat on {}", "→".bold(), server_name.dimmed());
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let output = crate::db::ssh_exec_capture(&server, &crate::commands::stat::stat_cmd())?;
+            let (uptime, memory, disk) = crate::commands::stat::parse_sections(&output);
+            if !env.quiet {
+                println!("{uptime}\n{memory}\n{disk}");
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    reg.clone(),
+                    serde_json::json!({"uptime": uptime, "memory": memory, "disk": disk})
+                        .to_string(),
                 );
             }
         }
@@ -3476,9 +3779,10 @@ fn run_task_once(
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
          report, env_check, ssh, fleet, fs_cat, fs_write, systemd_restart, systemd_status, \
-         logs_tail, logs_grep, include, assert, block, debug, confirm, set_fact, \
-         state_set, sync_db, sync_files, write_file, read_csv, write_csv, db_query, db_exec, \
-         mail, mail_check)",
+         logs_tail, logs_grep, ps_list, ps_kill, stat, include, assert, block, debug, \
+         confirm, set_fact, state_set, sync_db, sync_files, write_file, read_csv, \
+         write_csv, db_query, db_exec, mail, mail_check, git_summary, git_changelog, \
+         gh_prs)",
         task.name
     );
 }
@@ -4786,6 +5090,55 @@ mod tests {
         let spec: LogsGrepSpec =
             serde_yaml::from_str("server: web1\npath: /var/log/app.log\npattern: ERROR\n").unwrap();
         assert_eq!(spec.max_lines, 200);
+    }
+
+    #[test]
+    fn ps_list_spec_deserializes_with_default_filter() {
+        let spec: PsListSpec = serde_yaml::from_str("server: web1\n").unwrap();
+        assert!(spec.filter.is_none());
+    }
+
+    #[test]
+    fn ps_kill_spec_deserializes_with_defaults() {
+        let spec: PsKillSpec = serde_yaml::from_str("server: web1\npid: 1234\n").unwrap();
+        assert_eq!(spec.signal, "TERM");
+        assert!(!spec.sudo);
+        assert!(!spec.confirm);
+    }
+
+    #[test]
+    fn ps_kill_spec_rejects_an_unknown_field_instead_of_silently_dropping_it() {
+        let err = serde_yaml::from_str::<PsKillSpec>("server: web1\npid: 1234\nconfrim: true\n")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `confrim`"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn stat_spec_deserializes() {
+        let spec: StatSpec = serde_yaml::from_str("server: web1\n").unwrap();
+        assert_eq!(spec.server, "web1");
+    }
+
+    #[test]
+    fn git_summary_spec_deserializes_from_an_empty_map() {
+        serde_yaml::from_str::<GitSummarySpec>("{}").unwrap();
+    }
+
+    #[test]
+    fn git_changelog_spec_deserializes_with_default_from() {
+        let spec: GitChangelogSpec = serde_yaml::from_str("{}").unwrap();
+        assert!(spec.from.is_none());
+    }
+
+    #[test]
+    fn gh_prs_spec_deserializes_with_defaults() {
+        let spec: GhPrsSpec = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(spec.state, "all");
+        assert_eq!(spec.limit, 500);
+        assert!(spec.repo.is_none());
     }
 
     #[test]

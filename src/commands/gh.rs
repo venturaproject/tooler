@@ -4,6 +4,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Args)]
 pub struct GhArgs {
@@ -55,7 +56,7 @@ fn fail(json: bool, message: String) -> Result<()> {
     bail!(message);
 }
 
-fn parse_date(s: &str) -> Result<NaiveDate> {
+pub(crate) fn parse_date(s: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map_err(|_| anyhow::anyhow!("expected a date in YYYY-MM-DD format, got {s:?}"))
 }
@@ -105,6 +106,63 @@ fn flatten(pr: &Value) -> Value {
     })
 }
 
+/// Pure fetch+filter+flatten core behind `tooler gh prs` / the `gh_prs:` playbook task.
+/// `dir` is `None` for the CLI (process's own cwd, so `gh` infers the repo the same way
+/// it always has) or `Some(playbook_dir)` for `gh_prs:` (same convention `git_in` uses).
+pub(crate) fn fetch_prs(
+    dir: Option<&Path>,
+    repo: Option<&str>,
+    after: Option<NaiveDate>,
+    before: Option<NaiveDate>,
+    state: &str,
+    limit: u32,
+) -> Result<Vec<Value>> {
+    let mut version_cmd = std::process::Command::new("gh");
+    version_cmd.arg("--version");
+    if let Some(d) = dir {
+        version_cmd.current_dir(d);
+    }
+    if version_cmd.output().is_err() {
+        bail!("gh CLI not found -- install from https://cli.github.com and run `gh auth login`");
+    }
+
+    let mut cmd_args = vec![
+        "pr".to_string(),
+        "list".to_string(),
+        "--state".to_string(),
+        state.to_string(),
+        "--json".to_string(),
+        "number,title,state,author,labels,createdAt,mergedAt,url".to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+    ];
+    if let Some(r) = repo {
+        cmd_args.push("--repo".to_string());
+        cmd_args.push(r.to_string());
+    }
+
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(&cmd_args);
+    if let Some(d) = dir {
+        cmd.current_dir(d);
+    }
+    let out = cmd.output().context("running gh pr list")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let all: Vec<Value> =
+        serde_json::from_slice(&out.stdout).context("parsing gh pr list output")?;
+
+    Ok(all
+        .iter()
+        .filter(|pr| match created_date(pr) {
+            Some(d) => after.is_none_or(|a| d >= a) && before.is_none_or(|b| d <= b),
+            None => after.is_none() && before.is_none(),
+        })
+        .map(flatten)
+        .collect())
+}
+
 fn prs(
     repo: Option<String>,
     after: Option<String>,
@@ -115,18 +173,6 @@ fn prs(
 ) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
 
-    if std::process::Command::new("gh")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        return fail(
-            json,
-            "gh CLI not found -- install from https://cli.github.com and run `gh auth login`"
-                .to_string(),
-        );
-    }
-
     let after = match after.as_deref().map(parse_date).transpose() {
         Ok(d) => d,
         Err(e) => return fail(json, format!("{e:#}")),
@@ -136,49 +182,10 @@ fn prs(
         Err(e) => return fail(json, format!("{e:#}")),
     };
 
-    let mut cmd_args = vec![
-        "pr".to_string(),
-        "list".to_string(),
-        "--state".to_string(),
-        state,
-        "--json".to_string(),
-        "number,title,state,author,labels,createdAt,mergedAt,url".to_string(),
-        "--limit".to_string(),
-        limit.to_string(),
-    ];
-    if let Some(r) = &repo {
-        cmd_args.push("--repo".to_string());
-        cmd_args.push(r.clone());
-    }
-
-    let out = match std::process::Command::new("gh")
-        .args(&cmd_args)
-        .output()
-        .context("running gh pr list")
-    {
-        Ok(o) => o,
+    let prs = match fetch_prs(None, repo.as_deref(), after, before, &state, limit) {
+        Ok(p) => p,
         Err(e) => return fail(json, format!("{e:#}")),
     };
-    if !out.status.success() {
-        return fail(
-            json,
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        );
-    }
-    let all: Vec<Value> =
-        match serde_json::from_slice(&out.stdout).context("parsing gh pr list output") {
-            Ok(v) => v,
-            Err(e) => return fail(json, format!("{e:#}")),
-        };
-
-    let prs: Vec<Value> = all
-        .iter()
-        .filter(|pr| match created_date(pr) {
-            Some(d) => after.is_none_or(|a| d >= a) && before.is_none_or(|b| d <= b),
-            None => after.is_none() && before.is_none(),
-        })
-        .map(flatten)
-        .collect();
 
     if json {
         println!("{}", serde_json::json!({"pull_requests": prs}));

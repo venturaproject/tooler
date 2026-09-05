@@ -3,6 +3,8 @@ use anyhow::{Result, bail};
 use chrono::NaiveDate;
 use clap::{Args, Subcommand};
 use colored::Colorize;
+use serde::Serialize;
+use std::path::Path;
 
 #[derive(Args)]
 pub struct GitArgs {
@@ -42,7 +44,20 @@ pub enum GitSubcommand {
 }
 
 fn git(args: &[&str]) -> Result<String> {
-    let out = std::process::Command::new("git").args(args).output()?;
+    git_in(None, args)
+}
+
+/// Like `git()`, but runs in `dir` when given instead of the process's own cwd — used
+/// by the `git_summary:`/`git_changelog:` playbook tasks so they operate on the
+/// playbook's own repo (same convention `run:` already has via `current_dir`), not
+/// wherever `tooler` itself happened to be invoked from.
+pub(crate) fn git_in(dir: Option<&Path>, args: &[&str]) -> Result<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args);
+    if let Some(d) = dir {
+        cmd.current_dir(d);
+    }
+    let out = cmd.output()?;
     if !out.status.success() {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -81,14 +96,35 @@ fn date_suffix(branch: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(tail, "%d%m%y").ok()
 }
 
-fn summary(ctx: &Context) -> Result<()> {
-    let branch = git(&["branch", "--show-current"])?;
-    let status = git(&["status", "--short"])?;
-    let last_tag = git(&["describe", "--tags", "--abbrev=0"]).ok();
-    let log = git(&["log", "--oneline", "-5"])?;
+/// Pure data behind `tooler git summary` / the `git_summary:` playbook task — a plain
+/// struct rather than a print, so both callers can render/serialize it however they
+/// need. `dir` is `None` for the CLI (process's own cwd) or `Some(playbook_dir)` for
+/// `git_summary:`.
+#[derive(Serialize)]
+pub(crate) struct GitSummary {
+    pub(crate) branch: String,
+    pub(crate) tag: Option<String>,
+    pub(crate) ahead: u32,
+    pub(crate) behind: u32,
+    /// Whether `HEAD` has a configured upstream to compare against at all -- distinct
+    /// from `ahead`/`behind` both being 0, which also happens with an upstream that's
+    /// perfectly in sync. Text-mode only shows the "↑/↓" line when this is true, same
+    /// as the original inline implementation this was extracted from.
+    #[serde(skip)]
+    pub(crate) has_upstream: bool,
+    pub(crate) clean: bool,
+    pub(crate) status: Vec<String>,
+    pub(crate) recent: Vec<String>,
+}
+
+pub(crate) fn compute_summary(dir: Option<&Path>) -> Result<GitSummary> {
+    let branch = git_in(dir, &["branch", "--show-current"])?;
+    let status = git_in(dir, &["status", "--short"])?;
+    let tag = git_in(dir, &["describe", "--tags", "--abbrev=0"]).ok();
+    let log = git_in(dir, &["log", "--oneline", "-5"])?;
 
     let ahead_behind: Option<(u32, u32)> =
-        git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
+        git_in(dir, &["rev-list", "--left-right", "--count", "HEAD...@{u}"])
             .ok()
             .and_then(|s| {
                 let parts: Vec<&str> = s.split_whitespace().collect();
@@ -98,48 +134,55 @@ fn summary(ctx: &Context) -> Result<()> {
                     None
                 }
             });
+    let has_upstream = ahead_behind.is_some();
+    let (ahead, behind) = ahead_behind.unwrap_or((0, 0));
+
+    Ok(GitSummary {
+        branch,
+        tag,
+        ahead,
+        behind,
+        has_upstream,
+        clean: status.is_empty(),
+        status: status.lines().map(String::from).collect(),
+        recent: log.lines().map(String::from).collect(),
+    })
+}
+
+fn summary(ctx: &Context) -> Result<()> {
+    let s = compute_summary(None)?;
 
     if ctx.output == OutputFormat::Json {
-        let (ahead, behind) = ahead_behind.unwrap_or((0, 0));
-        println!(
-            "{}",
-            serde_json::json!({
-                "branch": branch,
-                "tag": last_tag,
-                "ahead": ahead,
-                "behind": behind,
-                "clean": status.is_empty(),
-                "status": status.lines().collect::<Vec<_>>(),
-                "recent": log.lines().collect::<Vec<_>>(),
-            })
-        );
+        println!("{}", serde_json::to_string(&s)?);
         return Ok(());
     }
 
-    let last_tag = last_tag.unwrap_or_else(|| "—".to_string());
-    let ahead_behind = ahead_behind.map(|(a, b)| format!("↑{a} ↓{b}"));
+    let tag = s.tag.unwrap_or_else(|| "—".to_string());
+    let ahead_behind = s
+        .has_upstream
+        .then(|| format!("↑{} ↓{}", s.ahead, s.behind));
 
     println!("{}", "git summary".bold().cyan());
     println!("{}", "─".repeat(40).dimmed());
-    print!("{} {}", "branch:".bold(), branch.green());
+    print!("{} {}", "branch:".bold(), s.branch.green());
     if let Some(ab) = ahead_behind {
         print!("  {}", ab.dimmed());
     }
     println!();
-    println!("{} {}", "tag:   ".bold(), last_tag.yellow());
+    println!("{} {}", "tag:   ".bold(), tag.yellow());
 
-    if status.is_empty() {
+    if s.clean {
         println!("{} {}", "status:".bold(), "clean".green());
     } else {
         println!("{}", "status:".bold());
-        for line in status.lines() {
+        for line in &s.status {
             println!("  {}", line);
         }
     }
 
-    if !log.is_empty() {
+    if !s.recent.is_empty() {
         println!("{}", "recent:".bold());
-        for line in log.lines() {
+        for line in &s.recent {
             println!("  {}", line.dimmed());
         }
     }
@@ -295,11 +338,20 @@ fn clean(
     Ok(())
 }
 
-fn changelog(from: Option<String>, ctx: &Context) -> Result<()> {
+/// Pure data behind `tooler git changelog` / the `git_changelog:` playbook task.
+#[derive(Serialize)]
+pub(crate) struct Changelog {
+    pub(crate) features: Vec<String>,
+    pub(crate) fixes: Vec<String>,
+    pub(crate) other: Vec<String>,
+}
+
+pub(crate) fn compute_changelog(dir: Option<&Path>, from: Option<&str>) -> Result<Changelog> {
     let from_ref = match from {
-        Some(f) => f,
-        None => git(&["describe", "--tags", "--abbrev=0"])
-            .unwrap_or_else(|_| git(&["rev-list", "--max-parents=0", "HEAD"]).unwrap_or_default()),
+        Some(f) => f.to_string(),
+        None => git_in(dir, &["describe", "--tags", "--abbrev=0"]).unwrap_or_else(|_| {
+            git_in(dir, &["rev-list", "--max-parents=0", "HEAD"]).unwrap_or_default()
+        }),
     };
 
     let range = if from_ref.is_empty() {
@@ -308,61 +360,69 @@ fn changelog(from: Option<String>, ctx: &Context) -> Result<()> {
         format!("{from_ref}..HEAD")
     };
 
-    let log = git(&["log", &range, "--oneline", "--no-merges"])?;
+    let log = git_in(dir, &["log", &range, "--oneline", "--no-merges"])?;
 
-    if log.is_empty() {
+    let mut features = vec![];
+    let mut fixes = vec![];
+    let mut other = vec![];
+
+    for line in log.lines() {
+        let msg = line
+            .split_once(' ')
+            .map(|x| x.1)
+            .unwrap_or(line)
+            .to_string();
+        if msg.starts_with("feat") {
+            features.push(msg);
+        } else if msg.starts_with("fix") {
+            fixes.push(msg);
+        } else {
+            other.push(msg);
+        }
+    }
+
+    Ok(Changelog {
+        features,
+        fixes,
+        other,
+    })
+}
+
+fn changelog(from: Option<String>, ctx: &Context) -> Result<()> {
+    let c = compute_changelog(None, from.as_deref())?;
+
+    if c.features.is_empty() && c.fixes.is_empty() && c.other.is_empty() {
         if ctx.output == OutputFormat::Json {
-            println!(
-                "{}",
-                serde_json::json!({"features": [], "fixes": [], "other": []})
-            );
+            println!("{}", serde_json::to_string(&c)?);
             return Ok(());
         }
         println!("{}", "No commits since last tag.".dimmed());
         return Ok(());
     }
 
-    let mut feat: Vec<&str> = vec![];
-    let mut fix: Vec<&str> = vec![];
-    let mut other: Vec<&str> = vec![];
-
-    for line in log.lines() {
-        let msg = line.split_once(' ').map(|x| x.1).unwrap_or(line);
-        if msg.starts_with("feat") {
-            feat.push(msg);
-        } else if msg.starts_with("fix") {
-            fix.push(msg);
-        } else {
-            other.push(msg);
-        }
-    }
-
     if ctx.output == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::json!({"features": feat, "fixes": fix, "other": other})
-        );
+        println!("{}", serde_json::to_string(&c)?);
         return Ok(());
     }
 
     println!("## Changelog\n");
-    if !feat.is_empty() {
+    if !c.features.is_empty() {
         println!("### Features");
-        for m in &feat {
+        for m in &c.features {
             println!("- {m}");
         }
         println!();
     }
-    if !fix.is_empty() {
+    if !c.fixes.is_empty() {
         println!("### Bug Fixes");
-        for m in &fix {
+        for m in &c.fixes {
             println!("- {m}");
         }
         println!();
     }
-    if !other.is_empty() {
+    if !c.other.is_empty() {
         println!("### Other");
-        for m in &other {
+        for m in &c.other {
             println!("- {m}");
         }
     }
