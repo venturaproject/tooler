@@ -618,6 +618,9 @@ struct MailSendArgs {
     /// this tool only accepts profile-based, keychain-backed credentials; a mail password
     /// can never be passed as a tool argument.
     server: String,
+    /// Local file paths to attach
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1789,6 +1792,10 @@ impl ToolerMcp {
         push_opt(&mut argv, "--bcc", &args.bcc);
         push_opt(&mut argv, "--from", &args.from);
         push_flag(&mut argv, "--html", args.html);
+        for path in &args.attachments {
+            argv.push("--attach".to_string());
+            argv.push(path.clone());
+        }
         self.exec_self(argv, &None).await
     }
 

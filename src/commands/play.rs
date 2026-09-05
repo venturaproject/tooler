@@ -221,6 +221,10 @@ struct Task {
     /// {from: "{{reg}}"}`-chainable convention `db_query:`/`scrape:`/`mail_check:` all
     /// use. See `ReadCsvSpec`.
     read_csv: Option<ReadCsvSpec>,
+    /// Write a registered JSON array (from db_query:/read_csv:/http:+`| json:` filter) to
+    /// a local CSV file at `path` (relative to this playbook's own directory) — the
+    /// inverse of `read_csv:`. See `WriteCsvSpec`.
+    write_csv: Option<WriteCsvSpec>,
     /// Run a read-only SQL query against a database over SSH and capture the rows.
     /// `register:` (if set) captures a JSON array of row objects, same convention as
     /// `scrape:` — directly chainable into `loop: {from: "{{reg}}"}` or `report:`. See
@@ -453,6 +457,15 @@ struct HttpSpec {
     /// `<reg>.status` decide instead. Default false, matching check_url:'s fail-fast.
     #[serde(default)]
     ignore_status: bool,
+    /// Save the response body to this local file (relative to the playbook's own
+    /// directory, confined via `join_confined`) instead of capturing it as a string —
+    /// binary-safe, unlike the default `resp.text()` path. Combine with `register:` to
+    /// capture the (still-relative) rendered `download:` path — not its bytes — for
+    /// chaining straight into a later path-taking task, e.g.
+    /// `mail: {attachments: ["{{reg}}"]}`, since every such task resolves its path the
+    /// same way, relative to this same playbook directory.
+    #[serde(default)]
+    download: Option<String>,
 }
 
 /// Poll one of `check_url`/`check_port`/`ssh` (exactly one — validated upfront in
@@ -560,6 +573,39 @@ struct ReadCsvSpec {
     delimiter: Option<String>,
 }
 
+/// `write_csv:` — the write-side counterpart to `read_csv:`. `path` is confined to the
+/// playbook's own directory the same way. `data` is rendered and must parse as a JSON
+/// array: an array of objects writes a header row from the *first* object's keys (unless
+/// `headers: false`) followed by one row per object in that key order — since this crate
+/// builds `serde_json::Value::Object` without the `preserve_order` feature, that key
+/// order is alphabetical, not YAML/JSON source order; an array of plain values/arrays is
+/// written as raw rows (`headers:` has no effect — there are no field names to derive a
+/// header from).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteCsvSpec {
+    path: String,
+    /// Rendered, then parsed as a JSON array — typically `"{{a_registered_var}}"`.
+    data: String,
+    #[serde(default = "default_true")]
+    headers: bool,
+    /// Single character. Defaults to ','.
+    #[serde(default)]
+    delimiter: Option<String>,
+}
+
+/// Renders one JSON value as a CSV cell for `write_csv:`: a string is used as-is (not
+/// re-quoted with JSON escaping), a number/bool uses its plain display form, and
+/// null/missing becomes an empty cell — matching how `render()` already stringifies
+/// values elsewhere in this DSL.
+fn json_cell_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
 /// `db_query:` — mirrors `commands::db::DbSubcommand::Query`'s fields exactly, so the
 /// mental model transfers 1:1 from the standalone `tooler db query` command.
 #[derive(Debug, Deserialize)]
@@ -660,6 +706,11 @@ struct MailSpec {
     /// port-based inference in `resolve_mail_creds`.
     #[serde(default)]
     tls: Option<String>,
+    /// Local file paths to attach, relative to the playbook's own directory (confined
+    /// via `join_confined`) — typically a `report:` output or an `http: {download:
+    /// ...}` result.
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 /// `mail_check:` — reads a `server:` mail profile's inbox over IMAP. Profile-only (no
@@ -1122,6 +1173,7 @@ const REPL_COMPLETIONS: &[&str] = &[
     "sync_files: ",
     "write_file: ",
     "read_csv: ",
+    "write_csv: ",
     "db_query: ",
     "db_exec: ",
     "mail: ",
@@ -2227,19 +2279,46 @@ fn run_task_once(
 
     if let Some(spec) = &task.http {
         let url = render(&spec.url, vars);
+        // Kept as the rendered *relative* string (not the resolved absolute path) so a
+        // `register:`ed value composes directly with any other path-taking task
+        // (`mail: {attachments: [...]}`, `read_csv:`, ...) — all of which resolve their
+        // own paths relative to this same playbook directory via `join_confined`, which
+        // rejects absolute paths outright.
+        let download_rel = spec.download.as_ref().map(|d| render(d, vars));
+        let download_path = download_rel
+            .as_ref()
+            .map(|d| join_confined(&env.playbook_dir, d))
+            .transpose()?;
         if !env.quiet {
-            println!(
-                "  {} {} {}",
-                spec.method.to_uppercase().bold(),
-                "→".bold(),
-                url.dimmed()
-            );
+            match &download_path {
+                Some(p) => println!(
+                    "  {} {} {} → {}",
+                    spec.method.to_uppercase().bold(),
+                    "→".bold(),
+                    url.dimmed(),
+                    p.display().to_string().dimmed()
+                ),
+                None => println!(
+                    "  {} {} {}",
+                    spec.method.to_uppercase().bold(),
+                    "→".bold(),
+                    url.dimmed()
+                ),
+            }
         }
         if !env.dry {
-            let (body, status) = http_request(spec, &url, vars)?;
-            if let Some(reg) = &task.register {
-                vars.insert(format!("{reg}.status"), status.to_string());
-                vars.insert(reg.clone(), body);
+            if let Some(out_path) = &download_path {
+                let (_bytes_written, status) = http_download(spec, &url, vars, out_path)?;
+                if let Some(reg) = &task.register {
+                    vars.insert(format!("{reg}.status"), status.to_string());
+                    vars.insert(reg.clone(), download_rel.clone().unwrap_or_default());
+                }
+            } else {
+                let (body, status) = http_request(spec, &url, vars)?;
+                if let Some(reg) = &task.register {
+                    vars.insert(format!("{reg}.status"), status.to_string());
+                    vars.insert(reg.clone(), body);
+                }
             }
         }
         return Ok(());
@@ -2525,6 +2604,85 @@ fn run_task_once(
                     reg.clone(),
                     serde_json::to_string(&rows).unwrap_or_default(),
                 );
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.write_csv {
+        let out_path = join_confined(&env.playbook_dir, &render(&spec.path, vars))?;
+        if !env.quiet {
+            println!(
+                "  {} {}",
+                "→ write".bold(),
+                out_path.display().to_string().dimmed()
+            );
+        }
+        if !env.dry {
+            let delimiter = match &spec.delimiter {
+                Some(d) if d.len() == 1 => d.as_bytes()[0],
+                Some(d) => bail!("write_csv: delimiter must be a single character, got '{d}'"),
+                None => b',',
+            };
+            let rendered = render(&spec.data, vars);
+            let value: serde_json::Value = serde_json::from_str(&rendered)
+                .with_context(|| format!("write_csv: '{}' data is not valid JSON", task.name))?;
+            let serde_json::Value::Array(elements) = value else {
+                bail!(
+                    "write_csv: task '{}' data must be a JSON array, got {}",
+                    task.name,
+                    rendered.chars().take(60).collect::<String>()
+                );
+            };
+
+            let mut writer = csv::WriterBuilder::new()
+                .delimiter(delimiter)
+                .from_writer(Vec::new());
+            let row_count = elements.len();
+            if let Some(serde_json::Value::Object(first)) = elements.first() {
+                let cols: Vec<String> = first.keys().cloned().collect();
+                if spec.headers {
+                    writer
+                        .write_record(&cols)
+                        .context("writing CSV header row")?;
+                }
+                for el in &elements {
+                    let obj = el.as_object();
+                    let record: Vec<String> = cols
+                        .iter()
+                        .map(|c| {
+                            obj.and_then(|o| o.get(c))
+                                .map(json_cell_to_string)
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    writer.write_record(&record).context("writing CSV row")?;
+                }
+            } else {
+                for el in &elements {
+                    let record: Vec<String> = match el {
+                        serde_json::Value::Array(items) => {
+                            items.iter().map(json_cell_to_string).collect()
+                        }
+                        other => vec![json_cell_to_string(other)],
+                    };
+                    writer.write_record(&record).context("writing CSV row")?;
+                }
+            }
+            let bytes = writer.into_inner().context("finalizing CSV output")?;
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("creating parent directory for {}", out_path.display())
+                })?;
+            }
+            std::fs::write(&out_path, &bytes)
+                .with_context(|| format!("writing {}", out_path.display()))?;
+
+            if !env.quiet {
+                println!("  {} {} row(s)", "✓ ok".green().bold(), row_count);
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), row_count.to_string());
             }
         }
         return Ok(());
@@ -2841,6 +2999,11 @@ fn run_task_once(
                 from.as_deref(),
                 spec.tls.as_deref(),
             )?;
+            let attachments = spec
+                .attachments
+                .iter()
+                .map(|p| join_confined(&env.playbook_dir, &render(p, vars)))
+                .collect::<Result<Vec<_>>>()?;
             let count = send_mail(
                 &creds,
                 &to,
@@ -2849,6 +3012,7 @@ fn run_task_once(
                 &subject,
                 &body,
                 spec.html,
+                &attachments,
             )?;
             if !env.quiet {
                 println!("  {} sent to {} recipient(s)", "✓ ok".green().bold(), count);
@@ -2996,8 +3160,8 @@ fn run_task_once(
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
          report, env_check, ssh, fleet, include, assert, block, debug, confirm, set_fact, \
-         state_set, sync_db, sync_files, write_file, read_csv, db_query, db_exec, mail, \
-         mail_check)",
+         state_set, sync_db, sync_files, write_file, read_csv, write_csv, db_query, db_exec, \
+         mail, mail_check)",
         task.name
     );
 }
@@ -3241,6 +3405,10 @@ pub(crate) fn resolve_imap_creds(ctx: &Context, server: &str) -> Result<ImapCred
 /// an unencrypted connection, port 587 territory), "tls" -> `relay` (implicit/wrapper TLS,
 /// port 465 territory), "none" -> `builder_dangerous` (no TLS at all — an escape hatch for
 /// a local, unauthenticated relay only). Returns the number of recipients (to+cc+bcc).
+// One parameter per distinct email field (to/cc/bcc/subject/body/html/attachments) plus
+// creds -- splitting this into a builder/options struct wouldn't reduce real complexity,
+// just move the same 8 fields into a different shape.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_mail(
     creds: &MailCreds,
     to: &str,
@@ -3249,10 +3417,26 @@ pub(crate) fn send_mail(
     subject: &str,
     body: &str,
     html: bool,
+    attachments: &[PathBuf],
 ) -> Result<usize> {
-    use lettre::message::{Mailbox, SinglePart};
+    use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
     use lettre::transport::smtp::authentication::Credentials;
     use lettre::{Message, SmtpTransport, Transport};
+
+    // Read every attachment up front, before opening any network connection, so a typo'd
+    // path fails fast and clearly instead of after a (possibly slow) SMTP handshake.
+    let attachment_bytes: Vec<(String, Vec<u8>, &'static str)> = attachments
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading attachment '{}'", path.display()))?;
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "attachment".to_string());
+            Ok((filename, bytes, guess_mime(path)))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut builder = Message::builder()
         .from(
@@ -3296,7 +3480,19 @@ pub(crate) fn send_mail(
     } else {
         SinglePart::plain(body.to_string())
     };
-    let message = builder.singlepart(part).context("building email message")?;
+    let message = if attachment_bytes.is_empty() {
+        builder.singlepart(part).context("building email message")?
+    } else {
+        let mut multipart = MultiPart::mixed().singlepart(part);
+        for (filename, bytes, mime) in attachment_bytes {
+            let content_type = lettre::message::header::ContentType::parse(mime)
+                .with_context(|| format!("invalid content type '{mime}' for '{filename}'"))?;
+            multipart = multipart.singlepart(Attachment::new(filename).body(bytes, content_type));
+        }
+        builder
+            .multipart(multipart)
+            .context("building email message")?
+    };
 
     let transport = match creds.tls.as_str() {
         "starttls" => SmtpTransport::starttls_relay(&creds.host)?.port(creds.port),
@@ -3309,6 +3505,32 @@ pub(crate) fn send_mail(
 
     transport.send(&message).context("sending email")?;
     Ok(recipient_count)
+}
+
+/// Best-effort content type from a file extension, for `mail:` attachments. Unknown or
+/// missing extensions fall back to a generic binary type — attachments still work, mail
+/// clients just won't show a specific icon/preview for them.
+fn guess_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("pdf") => "application/pdf",
+        Some("csv") => "text/csv",
+        Some("txt") => "text/plain",
+        Some("json") => "application/json",
+        Some("html") | Some("htm") => "text/html",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("zip") => "application/zip",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Spawns `cmd`, optionally capturing stdout (draining it on a concurrent reader thread
@@ -3380,11 +3602,14 @@ fn check_url(url: &str, quiet: bool) -> Result<()> {
 /// returns the response's (body text, status code) — mirrors `check_url`'s
 /// client-builder pattern. Bails on a network error, or (unless `spec.ignore_status`) a
 /// non-2xx status, with the response body (truncated) in the error message.
-fn http_request(
+/// Builds the request (method, headers, body — all rendered) shared by `http_request`
+/// and `http_download`. Neither `.send()`s it nor decides how to read the response body,
+/// since that differs between the two (text vs. binary-safe bytes).
+fn build_http_request(
     spec: &HttpSpec,
     url: &str,
     vars: &HashMap<String, String>,
-) -> Result<(String, u16)> {
+) -> Result<reqwest::blocking::RequestBuilder> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(spec.timeout))
         .build()?;
@@ -3397,7 +3622,15 @@ fn http_request(
     if let Some(body) = &spec.body {
         req = req.body(render(body, vars));
     }
-    let resp = req
+    Ok(req)
+}
+
+fn http_request(
+    spec: &HttpSpec,
+    url: &str,
+    vars: &HashMap<String, String>,
+) -> Result<(String, u16)> {
+    let resp = build_http_request(spec, url, vars)?
         .send()
         .with_context(|| format!("http request failed: {url}"))?;
     let status = resp.status();
@@ -3410,6 +3643,41 @@ fn http_request(
         bail!("HTTP {}: {snippet}", status.as_u16());
     }
     Ok((body, status.as_u16()))
+}
+
+/// `http: {download: ...}`'s engine — same request as `http_request`, but reads the
+/// response as raw bytes (`resp.bytes()`, never `.text()`) and writes them straight to
+/// `out_path`, so a binary response (PDF/zip/image) survives intact instead of being
+/// mangled through lossy UTF-8 decoding. On a non-2xx status, still surfaces a
+/// best-effort text snippet in the error (lossy-decoded, for diagnostics only) without
+/// writing anything to disk.
+fn http_download(
+    spec: &HttpSpec,
+    url: &str,
+    vars: &HashMap<String, String>,
+    out_path: &Path,
+) -> Result<(u64, u16)> {
+    let resp = build_http_request(spec, url, vars)?
+        .send()
+        .with_context(|| format!("http request failed: {url}"))?;
+    let status = resp.status();
+    let bytes = resp
+        .bytes()
+        .with_context(|| format!("reading response body: {url}"))?;
+    if !spec.ignore_status && !status.is_success() {
+        let snippet = String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).into_owned();
+        if snippet.trim().is_empty() {
+            bail!("HTTP {}", status.as_u16());
+        }
+        bail!("HTTP {}: {snippet}", status.as_u16());
+    }
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory for {}", out_path.display()))?;
+    }
+    std::fs::write(out_path, &bytes)
+        .with_context(|| format!("writing downloaded file: {}", out_path.display()))?;
+    Ok((bytes.len() as u64, status.as_u16()))
 }
 
 /// Executes a `scrape:` task: GETs `scrape_spec.url`, parses the HTML, and extracts one
@@ -4067,6 +4335,13 @@ mod tests {
     }
 
     #[test]
+    fn http_spec_deserializes_download_field() {
+        let spec: HttpSpec =
+            serde_yaml::from_str("url: https://example.com/f.pdf\ndownload: out/f.pdf\n").unwrap();
+        assert_eq!(spec.download.as_deref(), Some("out/f.pdf"));
+    }
+
+    #[test]
     fn write_file_spec_deserializes_with_default_append() {
         let spec: WriteFileSpec = serde_yaml::from_str("path: out.txt\ncontent: hello\n").unwrap();
         assert_eq!(spec.path, "out.txt");
@@ -4095,6 +4370,52 @@ mod tests {
             serde_yaml::from_str("path: data.tsv\nheaders: false\ndelimiter: \"\\t\"\n").unwrap();
         assert!(!spec.headers);
         assert_eq!(spec.delimiter.as_deref(), Some("\t"));
+    }
+
+    #[test]
+    fn write_csv_spec_deserializes_with_defaults() {
+        let spec: WriteCsvSpec =
+            serde_yaml::from_str("path: out.csv\ndata: \"{{rows}}\"\n").unwrap();
+        assert_eq!(spec.path, "out.csv");
+        assert!(spec.headers);
+        assert!(spec.delimiter.is_none());
+    }
+
+    #[test]
+    fn write_csv_spec_deserializes_explicit_fields() {
+        let spec: WriteCsvSpec = serde_yaml::from_str(
+            "path: out.tsv\ndata: \"{{rows}}\"\nheaders: false\ndelimiter: \"\\t\"\n",
+        )
+        .unwrap();
+        assert!(!spec.headers);
+        assert_eq!(spec.delimiter.as_deref(), Some("\t"));
+    }
+
+    #[test]
+    fn json_cell_to_string_unwraps_strings_and_stringifies_others() {
+        assert_eq!(
+            json_cell_to_string(&serde_json::Value::String("hi".to_string())),
+            "hi"
+        );
+        assert_eq!(
+            json_cell_to_string(&serde_json::Value::Number(3.into())),
+            "3"
+        );
+        assert_eq!(json_cell_to_string(&serde_json::Value::Null), "");
+    }
+
+    #[test]
+    fn guess_mime_covers_common_extensions_and_falls_back() {
+        assert_eq!(guess_mime(Path::new("report.pdf")), "application/pdf");
+        assert_eq!(guess_mime(Path::new("data.CSV")), "text/csv");
+        assert_eq!(
+            guess_mime(Path::new("mystery.xyz")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            guess_mime(Path::new("noextension")),
+            "application/octet-stream"
+        );
     }
 
     #[test]
@@ -4142,6 +4463,24 @@ mod tests {
         assert_eq!(spec.port, Some(465));
         assert!(spec.html);
         assert_eq!(spec.tls.as_deref(), Some("tls"));
+    }
+
+    #[test]
+    fn mail_spec_deserializes_attachments() {
+        let spec: MailSpec = serde_yaml::from_str(
+            "server: notif\nto: a@example.com\nsubject: hi\nbody: hello\n\
+             attachments:\n  - report.pdf\n  - data.csv\n",
+        )
+        .unwrap();
+        assert_eq!(spec.attachments, vec!["report.pdf", "data.csv"]);
+    }
+
+    #[test]
+    fn mail_spec_attachments_default_to_empty() {
+        let spec: MailSpec =
+            serde_yaml::from_str("server: notif\nto: a@example.com\nsubject: hi\nbody: hello\n")
+                .unwrap();
+        assert!(spec.attachments.is_empty());
     }
 
     #[test]

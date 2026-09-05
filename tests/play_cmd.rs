@@ -17,6 +17,29 @@ fn last_line_json(out: &str) -> serde_json::Value {
         .expect("last line was not valid JSON")
 }
 
+/// Spawns a one-shot local HTTP server that replies with `body` verbatim (arbitrary
+/// bytes, not necessarily valid UTF-8) and returns the port it's listening on. Used by
+/// the `http: {download: ...}` tests to prove the response is written byte-for-byte,
+/// unlike the string-capturing `http_request` path.
+fn serve_once_with_bytes(body: Vec<u8>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+        }
+    });
+    port
+}
+
 #[test]
 fn init_creates_a_playbook_in_the_playbooks_dir() {
     let (mut cmd, dir) = tooler();
@@ -1225,6 +1248,24 @@ fn mail_task_against_an_unconfigured_profile_fails_clearly() {
 }
 
 #[test]
+fn mail_task_with_a_missing_attachment_fails_before_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Mail\ntasks:\n  - name: notify\n    mail:\n      \
+         host: 127.0.0.1\n      port: 1\n      user: u\n      password: p\n      \
+         to: a@example.com\n      subject: hi\n      body: hello\n      \
+         attachments:\n        - missing.pdf\n",
+    )
+    .unwrap();
+
+    // Attachments are read (and must exist) before send_mail ever opens the SMTP
+    // transport -- port 1 would fail to connect too, but that's not what fails here.
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("reading attachment"), "stdout was: {out}");
+}
+
+#[test]
 fn mail_task_dry_run_previews_without_connecting() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1262,6 +1303,75 @@ fn write_file_task_rejects_a_path_that_escapes_the_playbook_directory() {
         "stdout was: {out}"
     );
     assert!(!dir.path().parent().unwrap().join("outside.txt").exists());
+}
+
+#[test]
+fn http_download_saves_binary_response_bytes_and_register_captures_the_path() {
+    let (mut cmd, dir) = tooler();
+    let body: Vec<u8> = vec![0x25, 0x50, 0x44, 0x46, 0x00, 0xFF, 0x10, 0x0A];
+    let port = serve_once_with_bytes(body.clone());
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        format!(
+            "name: Download\ntasks:\n  - name: fetch\n    http:\n      \
+             url: http://127.0.0.1:{port}/f.bin\n      download: out/f.bin\n    \
+             register: saved\n  - name: show\n    debug: \"{{{{saved}}}}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    let saved_path = dir.path().join("out/f.bin");
+    assert!(saved_path.exists());
+    assert_eq!(std::fs::read(&saved_path).unwrap(), body);
+    assert!(out.contains("out/f.bin"), "stdout was: {out}");
+}
+
+#[test]
+fn http_download_rejects_a_path_that_escapes_the_playbook_directory() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Escape\ntasks:\n  - name: t\n    http:\n      \
+         url: https://example.com\n      download: \"../outside.bin\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("escapes the playbook directory"),
+        "stdout was: {out}"
+    );
+    assert!(!dir.path().parent().unwrap().join("outside.bin").exists());
+}
+
+#[test]
+fn http_download_path_chains_into_mail_attachments_without_absolute_path_rejection() {
+    // `register:` on `download:` must capture the rendered *relative* path, not the
+    // resolved absolute one -- `join_confined` (used by both `http: {download}` and
+    // `mail: {attachments}`) rejects absolute paths outright, so an absolute registered
+    // value would break exactly the "download then attach" chain this feature exists for.
+    let (mut cmd, dir) = tooler();
+    let port = serve_once_with_bytes(b"hello attachment".to_vec());
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        format!(
+            "name: Chain\ntasks:\n  - name: fetch\n    http:\n      \
+             url: http://127.0.0.1:{port}/f.txt\n      download: out/f.txt\n    \
+             register: saved\n  - name: mail it\n    mail:\n      \
+             host: 127.0.0.1\n      port: 1\n      user: u\n      password: p\n      \
+             to: a@example.com\n      subject: hi\n      body: hello\n      \
+             attachments:\n        - \"{{{{saved}}}}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        !out.contains("must be relative to the playbook directory"),
+        "stdout was: {out}"
+    );
+    assert!(!out.contains("reading attachment"), "stdout was: {out}");
 }
 
 #[test]
@@ -1383,6 +1493,64 @@ fn read_csv_task_rejects_a_path_that_escapes_the_playbook_directory() {
         out.contains("escapes the playbook directory"),
         "stdout was: {out}"
     );
+}
+
+#[test]
+fn write_csv_and_read_csv_round_trip_the_same_rows() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: CSV round trip\ntasks:\n  \
+         - name: seed rows\n    set_fact:\n      \
+         rows: '[{\"name\":\"Alice\",\"age\":\"30\"},{\"name\":\"Bob\",\"age\":\"25\"}]'\n  \
+         - name: write it\n    write_csv:\n      path: out.csv\n      data: \"{{rows}}\"\n    \
+         register: written\n  \
+         - name: read it back\n    read_csv:\n      path: out.csv\n    register: back\n  \
+         - name: show\n    debug: \"{{back}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    assert!(out.contains("2 row(s)"), "stdout was: {out}");
+    assert!(out.contains("\"name\":\"Alice\""), "stdout was: {out}");
+    assert!(out.contains("\"age\":\"25\""), "stdout was: {out}");
+
+    // Column order is alphabetical (serde_json::Value::Object isn't built with the
+    // preserve_order feature in this crate), not the source YAML's field order.
+    let written = std::fs::read_to_string(dir.path().join("out.csv")).unwrap();
+    assert_eq!(written, "age,name\n30,Alice\n25,Bob\n");
+}
+
+#[test]
+fn write_csv_task_rejects_a_path_that_escapes_the_playbook_directory() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Escape\ntasks:\n  - name: t\n    write_csv:\n      \
+         path: \"../outside.csv\"\n      data: \"[]\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("escapes the playbook directory"),
+        "stdout was: {out}"
+    );
+    assert!(!dir.path().parent().unwrap().join("outside.csv").exists());
+}
+
+#[test]
+fn write_csv_task_rejects_data_that_is_not_a_json_array() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Bad data\ntasks:\n  - name: t\n    write_csv:\n      \
+         path: out.csv\n      data: '{\"not\": \"an array\"}'\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("must be a JSON array"), "stdout was: {out}");
 }
 
 #[test]

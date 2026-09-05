@@ -3,6 +3,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;
+use std::path::PathBuf;
 
 #[derive(Args)]
 pub struct MailArgs {
@@ -63,6 +64,9 @@ pub enum MailSubcommand {
         /// "starttls" | "tls" | "none" — overrides the profile's tls / the port-based default
         #[arg(long)]
         tls: Option<String>,
+        /// Local file path to attach (repeatable)
+        #[arg(long = "attach")]
+        attach: Vec<String>,
     },
     /// Read a mail profile's inbox over IMAP (defaults to unseen messages only)
     Check {
@@ -103,6 +107,7 @@ pub fn run(args: MailArgs, ctx: &Context) -> Result<()> {
             user,
             password,
             tls,
+            attach,
         } => {
             if server.is_some() && host.is_some() {
                 bail!("--server and --host are mutually exclusive");
@@ -127,6 +132,7 @@ pub fn run(args: MailArgs, ctx: &Context) -> Result<()> {
                 from.as_deref(),
                 tls.as_deref(),
             )?;
+            let attachments: Vec<PathBuf> = attach.iter().map(PathBuf::from).collect();
             let count = crate::commands::play::send_mail(
                 &creds,
                 &to,
@@ -135,6 +141,7 @@ pub fn run(args: MailArgs, ctx: &Context) -> Result<()> {
                 &subject,
                 &body,
                 html,
+                &attachments,
             )?;
 
             if ctx.output == OutputFormat::Json {

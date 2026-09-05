@@ -404,7 +404,7 @@ Every task's fields (and every action's own `{...}` spec, like `mail: {...}`/`db
 | `run: <cmd>` | Execute a shell command |
 | `check_url: <url>` | HTTP health check (expects 2xx) |
 | `check_port: {host, port}` | TCP connectivity check |
-| `http: {method, url, headers, body, timeout, ignore_status}` | Make an HTTP request |
+| `http: {method, url, headers, body, timeout, ignore_status, download}` | Make an HTTP request; `download:` saves the (binary-safe) body to a local file instead of capturing it as a string |
 | `scrape: {url, headers, each, fields, timeout}` | Extract data from a page with CSS selectors |
 | `wait_for: {check_url/check_port/ssh, interval, timeout}` | Poll a check until it succeeds or times out |
 | `report: {format, title, sources, out}` | Generate a PDF/Excel/HTML report from inline data |
@@ -421,10 +421,11 @@ Every task's fields (and every action's own `{...}` spec, like `mail: {...}`/`db
 | `sync_files: {server, from, to, delete}` | Rsync a directory from one path to another on the same server |
 | `write_file: {path, content, append}` | Write (or append) rendered text to a local file |
 | `read_csv: {path, headers, delimiter}` | Parse a local CSV file and capture the rows |
+| `write_csv: {path, data, headers, delimiter}` | Write a registered JSON array to a local CSV file — the inverse of `read_csv:` |
 | `state_set: {key: "<expr>", ...}` | Like `set_fact:`, but persisted to disk — readable via `{{state.<key>}}` in later runs |
 | `db_query: {server, sql, env/engine/host/port/database/user/password, max_rows}` | Run a read-only SQL query over SSH and capture the rows |
 | `db_exec: {server, sql, env/engine/host/port/database/user/password, confirm}` | Run a single guarded INSERT/UPDATE/DELETE — requires `confirm: true` |
-| `mail: {server/host/port/user/password, to, cc, bcc, subject, body, html}` | Send an email over SMTP |
+| `mail: {server/host/port/user/password, to, cc, bcc, subject, body, html, attachments}` | Send an email over SMTP, optionally with local file attachments |
 | `mail_check: {server, folder, unseen_only, limit, include_body, mark_seen}` | Read a mail profile's inbox over IMAP and capture the messages |
 
 ```yaml
@@ -577,7 +578,11 @@ tasks:
 
 `read_csv:` is `write_file:`'s read-side counterpart — parses a local CSV at `path:` (same directory confinement) and, with `register:`, captures the rows as a JSON array: one object per row keyed by the header row's column names (`headers: true`, the default), or a plain array of cells per row (`headers: false`, when the file has no header row). Every cell comes back as a string, no type guessing — same convention `db_query:`'s row objects already use. `delimiter:` overrides the default `,` for TSV/other-delimited files. Same `loop: {from: "{{reg}}"}`-chainable convention as `db_query:`/`scrape:`/`mail_check:`; only the row count is ever printed, never the content.
 
-`mail:` sends an email over SMTP — see [`tooler mail`](#tooler-mail) for the underlying config/keychain setup. `server:` names a `config.mail.<name>` profile, or set `host:`/`port:`/`user:`/`password:` inline; every field renders through `{{var}}`/`{{secret.*}}` like any other task. `register:` (if set) captures `"true"`.
+`write_csv:` is `read_csv:`'s write-side counterpart — renders `data:` (typically `"{{a_registered_var}}"` from `db_query:`/`read_csv:`/`http:` + the `| json:` filter), parses it as a JSON array, and writes it to a local CSV at `path:` (same directory confinement). An array of objects writes a header row from the first object's keys followed by one row per object (`headers: false` to skip the header line only); an array of plain values/arrays is written as raw rows. `register:` (if set) captures the row count written.
+
+`mail:` sends an email over SMTP — see [`tooler mail`](#tooler-mail) for the underlying config/keychain setup. `server:` names a `config.mail.<name>` profile, or set `host:`/`port:`/`user:`/`password:` inline; every field renders through `{{var}}`/`{{secret.*}}` like any other task. `attachments:` is a list of local file paths (same directory confinement as `write_file:`/`read_csv:`) — typically a `report:` output or an `http: {download: ...}` result, so "generate a report → attach it → email it" is a single small playbook. `register:` (if set) captures `"true"`.
+
+`http:`'s `download:` field saves the response body to a local file (same directory confinement) instead of capturing it as a string — binary-safe (`resp.bytes()`, not `resp.text()`), so a real PDF/zip/image survives intact. Combine with `register:` to capture the *saved file's path* (not its bytes, which would be useless — and dangerous — to carry around as a rendered string) for chaining into a later task, e.g. straight into `mail: {attachments: ["{{reg}}"]}`.
 
 `mail_check:` reads a mail profile's inbox over IMAP — unseen messages by default. `register:` (if set) captures a JSON array of `{uid, from, subject, date}` (plus `body` if `include_body: true`) — the same `loop: {from: "{{reg}}"}`-chainable convention `db_query:`/`scrape:` already use. `mark_seen: true` flags fetched messages `\Seen` afterward, so a later run's unseen-only search doesn't reprocess them — the idempotency primitive for "check inbox → act → don't act twice". Profile-only: `server:` is required, no inline host/user/password.
 
@@ -1001,7 +1006,9 @@ instead of (or on top of) a profile — `--host`/`--port`/`--user`/`--password` 
 `TOOLER_MAIL_PASSWORD` in the environment) — for one-off sends without touching config.
 TLS mode is inferred from the port (587 → STARTTLS, 465 → implicit TLS) unless overridden
 with `--tls starttls|tls|none`. `--to`/`--cc`/`--bcc` each accept a comma-separated list;
-`--body-file` reads the message body from a local file instead of `--body`.
+`--body-file` reads the message body from a local file instead of `--body`. `--attach
+<path>` (repeatable) attaches local files — content type is guessed from the extension,
+falling back to a generic binary type for anything unrecognized.
 
 The `tooler_mail_send` MCP tool only accepts `server` (never raw host/user/password) — a
 mail password can never be passed as a tool argument, same rule `tooler_db_query` already
@@ -1362,4 +1369,4 @@ Builds for: `linux/x86_64`, `linux/aarch64`, `macos/x86_64`, `macos/aarch64`, `w
 | `rustyline` | Line editor for `tooler play --repl` (history, tab-completion) |
 | `lettre` (`rustls-tls`) | SMTP client (`tooler mail send`, `mail:` playbook task) |
 | `imap` + `imap-proto` (`rustls-tls`) | IMAP client (`tooler mail check`, `mail_check:` playbook task) |
-| `csv` | CSV parsing (`read_csv:` playbook task) |
+| `csv` | CSV parsing/writing (`read_csv:`/`write_csv:` playbook tasks) |
