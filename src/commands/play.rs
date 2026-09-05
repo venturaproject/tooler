@@ -2041,18 +2041,44 @@ fn execute_playbook(
 }
 
 /// A minimal condition language over `render()`-substituted strings: "<a> == <b>",
-/// "<a> != <b>", or a bare truthy check. Not a full expression language — matches
-/// tooler's existing plain `{{var}}` templating rather than adding a new one.
+/// "<a> != <b>", "<a> >= <b>", "<a> <= <b>", "<a> > <b>", "<a> < <b>", or a bare truthy
+/// check. Not a full expression language — matches tooler's existing plain `{{var}}`
+/// templating rather than adding a new one. `>=`/`<=` are checked before the
+/// single-character `>`/`<` so `"5 >= 3"` doesn't get wrongly split on the bare `>` into
+/// `"5 "`/`"= 3"`.
 fn eval_when(expr: &str, vars: &HashMap<String, String>) -> bool {
     let rendered = render(expr, vars);
     let rendered = rendered.trim();
+    if let Some((lhs, rhs)) = rendered.split_once(">=") {
+        return compare_numeric(lhs, rhs, |a, b| a >= b);
+    }
+    if let Some((lhs, rhs)) = rendered.split_once("<=") {
+        return compare_numeric(lhs, rhs, |a, b| a <= b);
+    }
     if let Some((lhs, rhs)) = rendered.split_once("!=") {
         return lhs.trim() != rhs.trim();
     }
     if let Some((lhs, rhs)) = rendered.split_once("==") {
         return lhs.trim() == rhs.trim();
     }
+    if let Some((lhs, rhs)) = rendered.split_once('>') {
+        return compare_numeric(lhs, rhs, |a, b| a > b);
+    }
+    if let Some((lhs, rhs)) = rendered.split_once('<') {
+        return compare_numeric(lhs, rhs, |a, b| a < b);
+    }
     !rendered.is_empty() && rendered != "false" && rendered != "0"
+}
+
+/// Backs `eval_when`'s numeric operators. Parses both sides as `f64`; if either isn't a
+/// number, the comparison is `false` rather than a guess — the same "don't pretend to
+/// know" default this DSL already uses elsewhere (e.g. a `scrape:` field that doesn't
+/// match becomes `""`, not an error or a wrong answer).
+fn compare_numeric(lhs: &str, rhs: &str, op: impl Fn(f64, f64) -> bool) -> bool {
+    match (lhs.trim().parse::<f64>(), rhs.trim().parse::<f64>()) {
+        (Ok(a), Ok(b)) => op(a, b),
+        _ => false,
+    }
 }
 
 /// Expands `loop:` (if present) into one retried-`run_task_once` call per item, with
@@ -4504,16 +4530,27 @@ fn split_filter(inner: &str) -> (&str, Option<&str>) {
 
 /// Applies a `json:<path>` filter to `value` (parsed as JSON), walking dot-separated
 /// `path` segments, each optionally suffixed with one or more `[N]` array indices (e.g.
-/// `data.items[0].title`, `[2]`). A string leaf renders raw (unquoted); any other JSON
-/// value (number/bool/object/array/null) renders via its JSON text form. Returns `None`
-/// on invalid JSON or a path that doesn't match — `render_with` then leaves the whole
-/// `{{...}}` token literal, same as any other unresolvable token.
+/// `data.items[0].title`, `[2]`). A final segment of exactly `length` returns the
+/// current value's element/key/char count instead of doing a field lookup (arrays have
+/// no literal `"length"` field to `.get()`) — e.g. `{{prs | json:length}}`,
+/// `{{resp | json:data.items.length}}`. A string leaf renders raw (unquoted); any other
+/// JSON value (number/bool/object/array/null) renders via its JSON text form. Returns
+/// `None` on invalid JSON, a path that doesn't match, or `length` on a value that has no
+/// length (number/bool/null) — `render_with` then leaves the whole `{{...}}` token
+/// literal, same as any other unresolvable token.
 fn apply_json_filter(value: &str, path: &str) -> Option<String> {
     let root: serde_json::Value = serde_json::from_str(value).ok()?;
     let mut cur = &root;
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            continue;
+    let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    for (i, segment) in segments.iter().enumerate() {
+        if *segment == "length" && i == segments.len() - 1 {
+            let len = match cur {
+                serde_json::Value::Array(a) => a.len(),
+                serde_json::Value::Object(o) => o.len(),
+                serde_json::Value::String(s) => s.chars().count(),
+                _ => return None,
+            };
+            return Some(len.to_string());
         }
         let (field, indices) = parse_path_segment(segment);
         if !field.is_empty() {
@@ -4781,6 +4818,49 @@ mod tests {
     }
 
     #[test]
+    fn eval_when_greater_than() {
+        let v = vars(&[("count", "3")]);
+        assert!(!eval_when("{{count}} > 5", &v));
+        let v = vars(&[("count", "9")]);
+        assert!(eval_when("{{count}} > 5", &v));
+    }
+
+    #[test]
+    fn eval_when_less_than() {
+        let v = vars(&[("count", "3")]);
+        assert!(eval_when("{{count}} < 5", &v));
+        let v = vars(&[("count", "9")]);
+        assert!(!eval_when("{{count}} < 5", &v));
+    }
+
+    #[test]
+    fn eval_when_greater_or_equal() {
+        let v = vars(&[("count", "5")]);
+        assert!(eval_when("{{count}} >= 5", &v));
+        let v = vars(&[("count", "4")]);
+        assert!(!eval_when("{{count}} >= 5", &v));
+    }
+
+    #[test]
+    fn eval_when_less_or_equal() {
+        let v = vars(&[("count", "5")]);
+        assert!(eval_when("{{count}} <= 5", &v));
+        let v = vars(&[("count", "6")]);
+        assert!(!eval_when("{{count}} <= 5", &v));
+    }
+
+    #[test]
+    fn eval_when_comparison_is_false_when_either_side_is_not_numeric() {
+        // The exact bug this fix closes: a non-numeric comparison must not silently
+        // fall through to "truthy" (which would make it always true).
+        let v = vars(&[("count", "not-a-number")]);
+        assert!(!eval_when("{{count}} > 5", &v));
+        assert!(!eval_when("{{count}} < 5", &v));
+        assert!(!eval_when("{{count}} >= 5", &v));
+        assert!(!eval_when("{{count}} <= 5", &v));
+    }
+
+    #[test]
     fn notes_path_swaps_yml_extension_for_md() {
         assert_eq!(
             notes_path(Path::new("playbooks/deploy.yml")),
@@ -4906,6 +4986,39 @@ mod tests {
         let v = vars(&[("resp", r#"{"data":{"id":42,"items":["a","b","c"]}}"#)]);
         assert_eq!(render("{{resp | json:data.id}}", &v), "42");
         assert_eq!(render("{{resp | json:data.items[1]}}", &v), "b");
+    }
+
+    #[test]
+    fn json_filter_length_of_array() {
+        let v = vars(&[("resp", r#"["a","b","c"]"#)]);
+        assert_eq!(render("{{resp | json:length}}", &v), "3");
+    }
+
+    #[test]
+    fn json_filter_length_of_object() {
+        let v = vars(&[("resp", r#"{"a":1,"b":2}"#)]);
+        assert_eq!(render("{{resp | json:length}}", &v), "2");
+    }
+
+    #[test]
+    fn json_filter_length_of_string() {
+        let v = vars(&[("resp", r#""hello""#)]);
+        assert_eq!(render("{{resp | json:length}}", &v), "5");
+    }
+
+    #[test]
+    fn json_filter_length_after_a_nested_path() {
+        let v = vars(&[("resp", r#"{"data":{"items":["a","b"]}}"#)]);
+        assert_eq!(render("{{resp | json:data.items.length}}", &v), "2");
+    }
+
+    #[test]
+    fn json_filter_length_on_a_scalar_stays_literal() {
+        let v = vars(&[("resp", "42")]);
+        assert_eq!(
+            render("{{resp | json:length}}", &v),
+            "{{resp | json:length}}"
+        );
     }
 
     #[test]

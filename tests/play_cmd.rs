@@ -172,6 +172,56 @@ fn when_skips_or_runs_based_on_var() {
 }
 
 #[test]
+fn when_with_a_numeric_comparison_correctly_skips_below_threshold() {
+    // Regression test for a live-demonstrated bug: when: "{{count}} > 5" used to always
+    // evaluate true (any non-empty rendered string fell through to the truthy branch),
+    // running the task even though count is only 3.
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Threshold\ntasks:\n  - name: set a small count\n    set_fact:\n      \
+         count: \"3\"\n  - name: only if over threshold\n    when: \"{{count}} > 5\"\n    \
+         debug: \"should not print\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][1]["status"], "skipped");
+}
+
+#[test]
+fn assert_with_a_greater_or_equal_comparison_passes() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Assert\ntasks:\n  - name: set n\n    set_fact:\n      n: \"3\"\n  - \
+         name: check threshold\n    assert: \"{{n}} >= 3\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn json_length_filter_counts_a_registered_array() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Length\ntasks:\n  - name: seed an array\n    set_fact:\n      \
+         arr: '[1,2,3,4]'\n  - name: show its length\n    debug: \"{{arr | json:length}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    assert!(out.lines().any(|l| l.trim() == "ℹ 4"), "stdout was: {out}");
+}
+
+#[test]
 fn loop_runs_once_per_item_in_order() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
