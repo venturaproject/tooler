@@ -68,11 +68,11 @@ fn fail(json: bool, message: String) -> Result<()> {
     bail!(message);
 }
 
-fn status_cmd(unit: &str) -> String {
+pub(crate) fn status_cmd(unit: &str) -> String {
     format!("systemctl status {} --no-pager", db::shell_quote(unit))
 }
 
-fn restart_cmd(unit: &str, sudo: bool, sudo_pass: Option<&str>) -> String {
+pub(crate) fn restart_cmd(unit: &str, sudo: bool, sudo_pass: Option<&str>) -> String {
     format!(
         "{}systemctl restart {}",
         db::sudo_prefix(sudo, sudo_pass),
@@ -92,7 +92,7 @@ fn logs_cmd(unit: &str, lines: u32, sudo: bool) -> String {
 /// launch it (e.g. `systemctl: command not found` on a non-systemd host like FreeBSD)
 /// lands on stderr instead, with empty stdout -- fall back to stderr in that case so
 /// the caller sees *why* the unit looks inactive rather than a silently empty output.
-fn merge_output(stdout: String, stderr: String) -> String {
+pub(crate) fn merge_output(stdout: String, stderr: String) -> String {
     if stdout.trim().is_empty() && !stderr.trim().is_empty() {
         stderr
     } else {

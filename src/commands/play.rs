@@ -159,6 +159,24 @@ struct Task {
     env_check: Option<EnvCheckSpec>,
     ssh: Option<SshSpec>,
     fleet: Option<FleetSpec>,
+    /// Read a remote file over SSH — the same `commands::fs::cat_cmd` `tooler fs cat`
+    /// uses. See `FsCatSpec`.
+    fs_cat: Option<FsCatSpec>,
+    /// Overwrite a remote file over SSH — the same `commands::fs::write_cmd` `tooler fs
+    /// write` uses. See `FsWriteSpec`.
+    fs_write: Option<FsWriteSpec>,
+    /// Restart a remote systemd unit — the same `commands::systemd::restart_cmd` `tooler
+    /// systemd restart` uses. See `SystemdRestartSpec`.
+    systemd_restart: Option<SystemdRestartSpec>,
+    /// Check a remote systemd unit's status — the same `commands::systemd::status_cmd`
+    /// `tooler systemd status` uses. See `SystemdStatusSpec`.
+    systemd_status: Option<SystemdStatusSpec>,
+    /// Tail a remote file over SSH — the same `commands::logs::tail_cmd` `tooler logs
+    /// tail` uses. See `LogsTailSpec`.
+    logs_tail: Option<LogsTailSpec>,
+    /// Search a remote file over SSH — the same `commands::logs::grep_cmd` `tooler logs
+    /// grep` uses. See `LogsGrepSpec`.
+    logs_grep: Option<LogsGrepSpec>,
     /// Run another whole playbook (by bare playbooks/ name, or a path relative to this
     /// playbook's own directory) as a single task — either bare (`include: sub.yml`) or
     /// with per-call var overrides (`include: {file: sub.yml, vars: {...}}`). See
@@ -379,6 +397,94 @@ struct FleetSpec {
     /// Run on all targeted servers concurrently instead of one at a time
     #[serde(default)]
     parallel: bool,
+}
+
+/// `fs_cat:` — reads a remote file over SSH via `commands::fs::cat_cmd`, the same
+/// command builder `tooler fs cat` uses.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FsCatSpec {
+    /// Server profile name (see: tooler server list)
+    server: String,
+    /// Remote file path
+    path: String,
+}
+
+/// `fs_write:` — overwrites a remote file over SSH via `commands::fs::write_cmd`.
+/// Deliberately requires `confirm: true` in the YAML itself, same non-negotiable gate
+/// `db_exec:` uses — overwriting a remote file is just as destructive/hard-to-reverse as
+/// a DML write, and a playbook has no interactive `--confirm` re-run step the way the
+/// standalone `tooler fs write` command does.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FsWriteSpec {
+    server: String,
+    /// Remote file path
+    path: String,
+    content: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `systemd_restart:` — restarts a remote systemd unit via `commands::systemd::restart_cmd`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemdRestartSpec {
+    server: String,
+    /// Unit name, e.g. nginx or myapp.service
+    unit: String,
+    #[serde(default)]
+    sudo: bool,
+    /// Sudo password (only used with sudo: true; omit to rely on NOPASSWD)
+    #[serde(default)]
+    sudo_pass: Option<String>,
+}
+
+/// `systemd_status:` — checks a remote systemd unit via `commands::systemd::status_cmd`.
+/// Never fails the task on an inactive unit — same query-not-control behavior
+/// `tooler systemd status` already has; use `assert:`/`when:` on the registered
+/// `<reg>.active` to decide what an inactive unit means for the playbook.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemdStatusSpec {
+    server: String,
+    unit: String,
+}
+
+/// `logs_tail:` — tails a remote file over SSH via `commands::logs::tail_cmd`. Only the
+/// line count is ever printed (never the content, which could contain sensitive data) —
+/// `register:` (if set) captures a JSON array of lines, same `loop: {from: "{{reg}}"}`
+/// -chainable convention as `db_query:`/`scrape:`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogsTailSpec {
+    server: String,
+    /// Remote file path
+    path: String,
+    #[serde(default = "default_tail_lines")]
+    lines: u32,
+}
+
+fn default_tail_lines() -> u32 {
+    100
+}
+
+/// `logs_grep:` — searches a remote file over SSH via `commands::logs::grep_cmd` (a
+/// fixed-substring match, not a regex). Same content-hiding convention as `logs_tail:`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogsGrepSpec {
+    server: String,
+    /// Remote file path
+    path: String,
+    /// Fixed substring to match (not a regex)
+    pattern: String,
+    #[serde(default = "default_grep_max_lines")]
+    max_lines: usize,
+}
+
+fn default_grep_max_lines() -> usize {
+    200
 }
 
 #[derive(Debug, Deserialize)]
@@ -1162,6 +1268,12 @@ const REPL_COMPLETIONS: &[&str] = &[
     "env_check: ",
     "ssh: ",
     "fleet: ",
+    "fs_cat: ",
+    "fs_write: ",
+    "systemd_restart: ",
+    "systemd_status: ",
+    "logs_tail: ",
+    "logs_grep: ",
     "include: ",
     "assert: ",
     "block:",
@@ -2796,6 +2908,210 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.fs_cat {
+        let server_name = render(&spec.server, vars);
+        let path = render(&spec.path, vars);
+        if !env.quiet {
+            println!(
+                "  {} {} on {}",
+                "→ cat".bold(),
+                path.dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let content =
+                crate::db::ssh_exec_capture(&server, &crate::commands::fs::cat_cmd(&path))?;
+            if !env.quiet {
+                println!("  {} {} byte(s)", "✓ ok".green().bold(), content.len());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), content);
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.fs_write {
+        let server_name = render(&spec.server, vars);
+        let path = render(&spec.path, vars);
+        if !env.quiet {
+            println!(
+                "  {} {} on {}",
+                "→ write".bold(),
+                path.dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            if !spec.confirm {
+                bail!(
+                    "fs_write: refused to run without confirm: true (task '{}') — this is a \
+                     deliberate write, add confirm: true to the task once you've reviewed it",
+                    task.name
+                );
+            }
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let content = render(&spec.content, vars);
+            let (_, stderr, success) = crate::db::ssh_exec_with_stdin(
+                &server,
+                &crate::commands::fs::write_cmd(&path),
+                content.as_bytes(),
+            )?;
+            if !success {
+                let err = stderr.trim();
+                bail!("{}", if err.is_empty() { "write failed" } else { err });
+            }
+            if !env.quiet {
+                println!("  {} {} byte(s)", "✓ ok".green().bold(), content.len());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), content.len().to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.systemd_restart {
+        let server_name = render(&spec.server, vars);
+        let unit = render(&spec.unit, vars);
+        let sudo_pass = spec.sudo_pass.as_deref().map(|s| render(s, vars));
+        if !env.quiet {
+            println!(
+                "  {} restart {} on {}",
+                "→".bold(),
+                unit.dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            crate::db::ssh_exec_capture(
+                &server,
+                &crate::commands::systemd::restart_cmd(&unit, spec.sudo, sudo_pass.as_deref()),
+            )?;
+            if !env.quiet {
+                println!("  {} {} restarted", "✓ ok".green().bold(), unit);
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), "true".to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.systemd_status {
+        let server_name = render(&spec.server, vars);
+        let unit = render(&spec.unit, vars);
+        if !env.quiet {
+            println!(
+                "  {} status {} on {}",
+                "→".bold(),
+                unit.dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let (stdout, stderr, active) = crate::db::ssh_exec_capture_lenient(
+                &server,
+                &crate::commands::systemd::status_cmd(&unit),
+            )?;
+            let output = crate::commands::systemd::merge_output(stdout, stderr);
+            if !env.quiet {
+                let marker = if active {
+                    "●".green().bold()
+                } else {
+                    "●".red().bold()
+                };
+                println!("{marker} {unit}");
+                print!("{output}");
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(format!("{reg}.active"), active.to_string());
+                vars.insert(reg.clone(), output);
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.logs_tail {
+        let server_name = render(&spec.server, vars);
+        let path = render(&spec.path, vars);
+        if !env.quiet {
+            println!(
+                "  {} {} on {}",
+                "→ tail".bold(),
+                path.dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let output = crate::db::ssh_exec_capture(
+                &server,
+                &crate::commands::logs::tail_cmd(&path, spec.lines),
+            )?;
+            let lines: Vec<&str> = output.lines().collect();
+            if !env.quiet {
+                println!("  {} {} line(s)", "✓ ok".green().bold(), lines.len());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    reg.clone(),
+                    serde_json::to_string(&lines).unwrap_or_default(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.logs_grep {
+        let server_name = render(&spec.server, vars);
+        let path = render(&spec.path, vars);
+        let pattern = render(&spec.pattern, vars);
+        if !env.quiet {
+            println!(
+                "  {} '{}' in {} on {}",
+                "→ grep".bold(),
+                pattern.dimmed(),
+                path.dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+            let (stdout, stderr, success) = crate::db::ssh_exec_capture_lenient(
+                &server,
+                &crate::commands::logs::grep_cmd(&path, &pattern),
+            )?;
+            let output = if success {
+                stdout
+            } else if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                bail!("{}", stderr.trim());
+            };
+            let (lines, truncated) = crate::commands::logs::cap_lines(output, spec.max_lines);
+            if !env.quiet {
+                let suffix = if truncated { ", truncated" } else { "" };
+                println!(
+                    "  {} {} match(es){suffix}",
+                    "✓ ok".green().bold(),
+                    lines.len()
+                );
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    reg.clone(),
+                    serde_json::to_string(&lines).unwrap_or_default(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.sync_db {
         let server_name = render(&spec.server, vars);
         let describe_side = |side: &DbSyncSide| -> String {
@@ -3159,7 +3475,8 @@ fn run_task_once(
 
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
-         report, env_check, ssh, fleet, include, assert, block, debug, confirm, set_fact, \
+         report, env_check, ssh, fleet, fs_cat, fs_write, systemd_restart, systemd_status, \
+         logs_tail, logs_grep, include, assert, block, debug, confirm, set_fact, \
          state_set, sync_db, sync_files, write_file, read_csv, write_csv, db_query, db_exec, \
          mail, mail_check)",
         task.name
@@ -4416,6 +4733,59 @@ mod tests {
             guess_mime(Path::new("noextension")),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn fs_cat_spec_deserializes() {
+        let spec: FsCatSpec = serde_yaml::from_str("server: web1\npath: /etc/app/.env\n").unwrap();
+        assert_eq!(spec.server, "web1");
+        assert_eq!(spec.path, "/etc/app/.env");
+    }
+
+    #[test]
+    fn fs_write_spec_deserializes_with_default_confirm() {
+        let spec: FsWriteSpec =
+            serde_yaml::from_str("server: web1\npath: /tmp/x\ncontent: hi\n").unwrap();
+        assert!(!spec.confirm);
+    }
+
+    #[test]
+    fn fs_write_spec_rejects_an_unknown_field_instead_of_silently_dropping_it() {
+        let err = serde_yaml::from_str::<FsWriteSpec>(
+            "server: web1\npath: /tmp/x\ncontent: hi\nconfrim: true\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `confrim`"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn systemd_restart_spec_deserializes_with_defaults() {
+        let spec: SystemdRestartSpec = serde_yaml::from_str("server: web1\nunit: nginx\n").unwrap();
+        assert!(!spec.sudo);
+        assert!(spec.sudo_pass.is_none());
+    }
+
+    #[test]
+    fn systemd_status_spec_deserializes() {
+        let spec: SystemdStatusSpec = serde_yaml::from_str("server: web1\nunit: nginx\n").unwrap();
+        assert_eq!(spec.unit, "nginx");
+    }
+
+    #[test]
+    fn logs_tail_spec_deserializes_with_default_lines() {
+        let spec: LogsTailSpec =
+            serde_yaml::from_str("server: web1\npath: /var/log/app.log\n").unwrap();
+        assert_eq!(spec.lines, 100);
+    }
+
+    #[test]
+    fn logs_grep_spec_deserializes_with_default_max_lines() {
+        let spec: LogsGrepSpec =
+            serde_yaml::from_str("server: web1\npath: /var/log/app.log\npattern: ERROR\n").unwrap();
+        assert_eq!(spec.max_lines, 200);
     }
 
     #[test]

@@ -57,11 +57,11 @@ fn fail(json: bool, message: String) -> Result<()> {
     bail!(message);
 }
 
-fn tail_cmd(path: &str, lines: u32) -> String {
+pub(crate) fn tail_cmd(path: &str, lines: u32) -> String {
     format!("tail -n {lines} {}", db::shell_quote(path))
 }
 
-fn grep_cmd(path: &str, pattern: &str) -> String {
+pub(crate) fn grep_cmd(path: &str, pattern: &str) -> String {
     format!(
         "grep -F -- {} {}",
         db::shell_quote(pattern),
@@ -69,7 +69,7 @@ fn grep_cmd(path: &str, pattern: &str) -> String {
     )
 }
 
-fn cap_lines(output: String, max_lines: usize) -> (Vec<String>, bool) {
+pub(crate) fn cap_lines(output: String, max_lines: usize) -> (Vec<String>, bool) {
     let all: Vec<String> = output.lines().map(str::to_string).collect();
     let truncated = all.len() > max_lines;
     (all.into_iter().take(max_lines).collect(), truncated)

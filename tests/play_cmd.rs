@@ -1427,6 +1427,217 @@ fn db_exec_against_an_unconfigured_server_fails_clearly() {
 }
 
 #[test]
+fn fs_cat_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Cat\ntasks:\n  - name: read it\n    fs_cat:\n      \
+         server: ghost\n      path: /etc/app/.env\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("/etc/app/.env"), "stdout was: {out}");
+}
+
+#[test]
+fn fs_cat_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Cat\ntasks:\n  - name: read it\n    fs_cat:\n      \
+         server: ghost\n      path: /etc/app/.env\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn fs_write_without_confirm_fails_clearly_and_makes_no_connection() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Write\ntasks:\n  - name: overwrite it\n    fs_write:\n      \
+         server: ghost\n      path: /etc/app/.env\n      content: FOO=1\n",
+    )
+    .unwrap();
+
+    // Fails on the missing `confirm: true` before ever resolving `server` -- same gate
+    // db_exec: uses, proven the same way.
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn fs_write_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Write\ntasks:\n  - name: overwrite it\n    fs_write:\n      \
+         server: ghost\n      path: /etc/app/.env\n      content: FOO=1\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("/etc/app/.env"), "stdout was: {out}");
+}
+
+#[test]
+fn fs_write_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Write\ntasks:\n  - name: overwrite it\n    fs_write:\n      \
+         server: ghost\n      path: /etc/app/.env\n      content: FOO=1\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn systemd_restart_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Restart\ntasks:\n  - name: bounce it\n    systemd_restart:\n      \
+         server: ghost\n      unit: nginx\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("nginx"), "stdout was: {out}");
+}
+
+#[test]
+fn systemd_restart_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Restart\ntasks:\n  - name: bounce it\n    systemd_restart:\n      \
+         server: ghost\n      unit: nginx\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn systemd_status_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Status\ntasks:\n  - name: check it\n    systemd_status:\n      \
+         server: ghost\n      unit: nginx\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("nginx"), "stdout was: {out}");
+}
+
+#[test]
+fn systemd_status_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Status\ntasks:\n  - name: check it\n    systemd_status:\n      \
+         server: ghost\n      unit: nginx\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn logs_tail_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Tail\ntasks:\n  - name: tail it\n    logs_tail:\n      \
+         server: ghost\n      path: /var/log/app.log\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("/var/log/app.log"), "stdout was: {out}");
+}
+
+#[test]
+fn logs_tail_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Tail\ntasks:\n  - name: tail it\n    logs_tail:\n      \
+         server: ghost\n      path: /var/log/app.log\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn logs_grep_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Grep\ntasks:\n  - name: search it\n    logs_grep:\n      \
+         server: ghost\n      path: /var/log/app.log\n      pattern: ERROR\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("/var/log/app.log"), "stdout was: {out}");
+}
+
+#[test]
+fn logs_grep_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Grep\ntasks:\n  - name: search it\n    logs_grep:\n      \
+         server: ghost\n      path: /var/log/app.log\n      pattern: ERROR\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
 fn mail_check_against_an_unconfigured_profile_fails_clearly() {
     let (mut cmd, dir) = tooler();
     std::fs::write(

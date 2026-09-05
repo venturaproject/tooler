@@ -76,11 +76,11 @@ fn fail(json: bool, message: String) -> Result<()> {
     bail!(message);
 }
 
-fn cat_cmd(path: &str) -> String {
+pub(crate) fn cat_cmd(path: &str) -> String {
     format!("cat {}", db::shell_quote(path))
 }
 
-fn write_cmd(path: &str) -> String {
+pub(crate) fn write_cmd(path: &str) -> String {
     format!("cat > {}", db::shell_quote(path))
 }
 
