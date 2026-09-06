@@ -139,11 +139,27 @@ pub struct MailServer {
     pub imap_port: Option<u16>,
 }
 
-pub fn config_path() -> PathBuf {
+/// Where tooler's own state lives — `config.toml`, `--repl`'s history file, and (once
+/// `--resume`/`--audit-log`/etc. write relative to it) anything else under `.tooler/`.
+/// `TOOLER_HOME`, if set, overrides this directly (the directory itself, not a home
+/// directory to append `.tooler` to) — useful for relocating tooler's config wholesale,
+/// and the only reliable way to isolate it in a test: `dirs::home_dir()` respects `$HOME`
+/// on Unix, but on Windows it resolves via `SHGetKnownFolderPath` directly and never
+/// consults `HOME`/`USERPROFILE` at all, so a test that only overrides those env vars
+/// silently falls through to the real profile directory there. Falls back to
+/// `dirs::home_dir()/.tooler` (or `./.tooler` if even that can't be resolved) otherwise,
+/// unchanged from before `TOOLER_HOME` existed.
+pub fn tooler_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("TOOLER_HOME") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".tooler")
-        .join("config.toml")
+}
+
+pub fn config_path() -> PathBuf {
+    tooler_dir().join("config.toml")
 }
 
 pub fn load() -> Result<Config> {

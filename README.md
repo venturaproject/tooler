@@ -899,7 +899,7 @@ Templates substitute `{{name}}`, `{{name_snake}}`, `{{author}}` and `{{year}}` a
 
 ### tooler config
 
-Manage tooler's configuration stored at `~/.tooler/config.toml`.
+Manage tooler's configuration stored at `~/.tooler/config.toml`. `TOOLER_HOME` (if set) overrides the whole `~/.tooler` directory — `config.toml`, `--repl`'s history file, and anything else tooler keeps there — for relocating it or running an isolated instance without touching the real one.
 
 ```sh
 tooler config show                          # show full config

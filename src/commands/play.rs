@@ -2115,11 +2115,12 @@ impl rustyline::validate::Validator for ReplHelper {}
 impl rustyline::Helper for ReplHelper {}
 
 /// `--repl`'s history file (arrow-key recall within a session, persisted across them) —
-/// `~/.tooler/repl_history`, the same `~/.tooler/` directory `config::config_path()`
-/// already uses. `None` if the home directory can't be resolved; history then still works
-/// for the current session, it just isn't persisted.
+/// `<tooler_dir>/repl_history`, the same directory `config::config_path()`/`TOOLER_HOME`
+/// resolve. Always `Some` in practice (`config::tooler_dir()` always resolves to
+/// something, falling back to `./.tooler`) — kept as `Option` for callers that already
+/// treat "can't persist history" as a non-fatal, current-session-only degradation.
 fn repl_history_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".tooler").join("repl_history"))
+    Some(crate::config::tooler_dir().join("repl_history"))
 }
 
 /// The `--repl` loop: reads one line at a time (a task action, minus `name:` — see
