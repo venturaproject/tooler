@@ -59,6 +59,43 @@ pub(crate) fn ssh_exec_capture_lenient(
     ))
 }
 
+/// Puts `cmd` in its own process group on Unix (a no-op elsewhere) so a later
+/// `kill_process_group` can take out the whole subtree, not just the immediate child --
+/// e.g. `sh -c "sleep 5"`, where the shell doesn't always exec-replace itself, leaving
+/// `sleep` as its own child rather than the same process. Killing only the shell's pid
+/// would otherwise orphan `sleep`, which keeps any inherited stdout/stderr pipe open --
+/// a piped caller (`assert_cmd`, or this crate's own `capture: true` path) then blocks
+/// on EOF until the orphan finishes on its own, defeating the whole point of a timeout.
+pub(crate) fn isolate_process_group(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+}
+
+/// Kills `child`'s entire process group on Unix; falls back to killing just the one
+/// process elsewhere (a job-object-based tree-kill on Windows would be a separate,
+/// larger undertaking, and nothing observed there needs it yet). See
+/// `isolate_process_group`. Declares `kill(2)` itself rather than adding a `libc`
+/// dependency for one syscall.
+pub(crate) fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        unsafe {
+            kill(-(child.id() as i32), SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
 /// Spawns `cmd`, killing it if `timeout` (seconds) elapses first, and returns
 /// (stdout, stderr, exit_success) — the same poll+kill mechanism `run:`'s own
 /// `commands::play::run_with_timeout` uses, generalized here (both streams captured via
@@ -70,6 +107,7 @@ fn run_with_deadline(
     timeout: Option<u64>,
 ) -> Result<(String, String, bool)> {
     use std::time::{Duration, Instant};
+    isolate_process_group(&mut cmd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     let mut child = cmd
@@ -98,7 +136,7 @@ fn run_with_deadline(
         if let Some(dl) = deadline
             && Instant::now() >= dl
         {
-            let _ = child.kill();
+            kill_process_group(&mut child);
             let _ = child.wait();
             bail!("ssh command timed out after {}s", timeout.unwrap());
         }

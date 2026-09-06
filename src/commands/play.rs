@@ -5315,6 +5315,7 @@ fn run_with_timeout(
     capture: bool,
     timeout: Option<u64>,
 ) -> Result<(bool, Option<i32>, Option<String>)> {
+    crate::db::isolate_process_group(&mut cmd);
     if capture {
         cmd.stdout(std::process::Stdio::piped());
     }
@@ -5337,7 +5338,7 @@ fn run_with_timeout(
         if let Some(dl) = deadline
             && Instant::now() >= dl
         {
-            let _ = child.kill();
+            crate::db::kill_process_group(&mut child);
             let _ = child.wait();
             bail!("command timed out after {}s", timeout.unwrap());
         }

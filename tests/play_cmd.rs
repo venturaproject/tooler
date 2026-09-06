@@ -1373,6 +1373,42 @@ fn timeout_kills_a_hung_command() {
 }
 
 #[test]
+fn timeout_kills_a_hung_command_and_its_orphaned_children() {
+    // `sleep 5 & wait` forces sh to fork a real background child and then block on it,
+    // guaranteeing sh does NOT exec-replace itself the way a bare `sleep 5` might on
+    // some shells -- reproducing, unconditionally, the exact "killing the immediate
+    // child orphans a grandchild that keeps the inherited stdout/stderr pipe open"
+    // shape that let a hung command run to completion on at least one real shell (see
+    // db::kill_process_group's doc comment). Without process-group killing, the
+    // orphaned `sleep` keeps this test's own piped stdout open and assert_cmd blocks on
+    // EOF for the full 5s, exactly like the failure this test guards against.
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Timeout orphan test\n\
+         tasks:\n\
+         \x20\x20- name: hangs via a background child\n\
+         \x20\x20\x20\x20run: \"sleep 5 & wait\"\n\
+         \x20\x20\x20\x20timeout: 1\n",
+    )
+    .unwrap();
+
+    let start = std::time::Instant::now();
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml"])
+            .timeout(std::time::Duration::from_secs(10))
+            .assert()
+            .failure(),
+    );
+    let elapsed = start.elapsed();
+    assert!(out.to_lowercase().contains("timed out"));
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "expected the timeout to cut this short (including the orphaned child), took {elapsed:?}"
+    );
+}
+
+#[test]
 fn timeout_without_run_is_rejected() {
     let (mut cmd, dir) = tooler();
     std::fs::write(

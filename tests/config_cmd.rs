@@ -106,6 +106,15 @@ fn profiles_reports_none_configured_when_empty() {
 
 #[test]
 fn path_prints_the_config_file_location_inside_home() {
+    if cfg!(windows) {
+        eprintln!(
+            "skipping path_prints_the_config_file_location_inside_home: dirs::home_dir() \
+             on Windows resolves via SHGetKnownFolderPath directly, ignoring HOME/ \
+             USERPROFILE env var overrides -- this suite's isolated-HOME technique (see \
+             tests/common::tooler_in) can't redirect it there"
+        );
+        return;
+    }
     let dir = tempdir().unwrap();
     let out = stdout_of(
         tooler_in(dir.path())
@@ -119,6 +128,15 @@ fn path_prints_the_config_file_location_inside_home() {
 
 #[test]
 fn show_reflects_a_value_that_was_set() {
+    if cfg!(windows) {
+        eprintln!(
+            "skipping show_reflects_a_value_that_was_set: dirs::home_dir() on Windows \
+             resolves via SHGetKnownFolderPath directly, ignoring HOME/USERPROFILE env \
+             var overrides -- this suite's isolated-HOME technique (see \
+             tests/common::tooler_in) can't redirect it there"
+        );
+        return;
+    }
     let dir = tempdir().unwrap();
     tooler_in(dir.path())
         .args(["config", "set", "default.color", "false"])
