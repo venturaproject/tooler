@@ -67,6 +67,14 @@ pub struct PlayArgs {
     /// are never run.
     #[arg(long)]
     pub repl: bool,
+
+    /// Append a JSON line per task attempt (timestamp, task, action, status, duration,
+    /// error) to this file — a persistent execution trail, the same mechanism `tooler
+    /// mcp --audit-log` uses for MCP tool calls. Covers every concrete attempt (top-level,
+    /// inside block:/rescue:/always:/include:, each loop: iteration); a task skipped via
+    /// `when:` is not logged, since it never touched anything.
+    #[arg(long, env = "TOOLER_PLAY_AUDIT_LOG")]
+    pub audit_log: Option<PathBuf>,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
@@ -447,6 +455,9 @@ struct FsWriteSpec {
 }
 
 /// `systemd_restart:` — restarts a remote systemd unit via `commands::systemd::restart_cmd`.
+/// Deliberately requires `confirm: true` in the YAML itself, same non-negotiable gate
+/// `fs_write:`/`ps_kill:`/`db_exec:` use — restarting a live service is just as
+/// disruptive as a write or a kill.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SystemdRestartSpec {
@@ -458,6 +469,8 @@ struct SystemdRestartSpec {
     /// Sudo password (only used with sudo: true; omit to rely on NOPASSWD)
     #[serde(default)]
     sudo_pass: Option<String>,
+    #[serde(default)]
+    confirm: bool,
 }
 
 /// `systemd_status:` — checks a remote systemd unit via `commands::systemd::status_cmd`.
@@ -1088,6 +1101,17 @@ fn print_notes_only(file_path: &Path, ctx: &Context) -> Result<()> {
 /// readable as positional args once `register:`/`include:` needed threading through too.
 struct RunEnv<'a> {
     playbook_dir: PathBuf,
+    /// This playbook's `name:` (the outer one's, for `--repl` without a file: `"repl"`).
+    /// Copied into an `include:`'s `sub_env` as *that* sub-playbook's own name — unlike
+    /// `start_at`/`state_path`/`data_path`, an `--audit-log` entry for a task inside an
+    /// `include:` should say which playbook it actually belongs to. See
+    /// `write_audit_entry`.
+    playbook_name: String,
+    /// From `--audit-log`/`TOOLER_PLAY_AUDIT_LOG` — appends one JSON line per task
+    /// attempt to this file if set (see `write_audit_entry`). Propagated into `include:`'s
+    /// `sub_env` (like `dry`/`quiet`/`auto_yes`), so nested tasks are captured in the same
+    /// trail.
+    audit_log: Option<PathBuf>,
     project_root: PathBuf,
     dry: bool,
     quiet: bool,
@@ -1161,7 +1185,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     }
 
     if args.repl {
-        let (mut vars, playbook_dir) = match args.file.as_deref() {
+        let (mut vars, playbook_dir, playbook_name) = match args.file.as_deref() {
             Some(file) => {
                 let file_path = resolve_playbook_file(file, &project_root)?;
                 let dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -1169,13 +1193,16 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
                     .with_context(|| format!("Cannot read playbook: {file}"))?;
                 let playbook: Playbook = serde_yaml::from_str(&content)
                     .with_context(|| format!("Invalid YAML in {file}"))?;
-                (load_playbook_vars(&playbook, &dir)?, dir)
+                let vars = load_playbook_vars(&playbook, &dir)?;
+                (vars, dir, playbook.name)
             }
-            None => (HashMap::new(), PathBuf::from(".")),
+            None => (HashMap::new(), PathBuf::from("."), "repl".to_string()),
         };
         apply_var_overrides(&mut vars, &args.vars)?;
         let env = RunEnv {
             playbook_dir,
+            playbook_name,
+            audit_log: args.audit_log.clone(),
             project_root,
             dry: args.dry,
             quiet: false,
@@ -1273,6 +1300,8 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     let mut include_stack: Vec<PathBuf> = vec![file_path];
     let env = RunEnv {
         playbook_dir,
+        playbook_name: playbook.name.clone(),
+        audit_log: args.audit_log.clone(),
         project_root,
         dry: args.dry,
         quiet: ctx.output == OutputFormat::Json,
@@ -2209,17 +2238,25 @@ fn run_loop_parallel(
 /// Retries a single (non-loop-expanded) task invocation up to `task.retries` extra times,
 /// waiting `task.delay` (default 1s) between attempts. A no-op wrapper when `retries:`
 /// isn't set (attempts=1) or in `--dry` (nothing ever fails in dry mode, since every
-/// action's real work is itself gated on `!env.dry`).
+/// action's real work is itself gated on `!env.dry`). Also the single funnel every
+/// concrete task attempt passes through regardless of nesting (top-level, `block:`/
+/// `rescue:`/`always:`, `include:`, each `loop:` iteration — sequential or parallel) —
+/// see `write_audit_entry`, called here so `--audit-log` covers all of them uniformly.
 fn run_task_once_with_retries(
     task: &Task,
     vars: &mut HashMap<String, String>,
     include_stack: &mut Vec<PathBuf>,
     env: &RunEnv,
 ) -> Result<()> {
+    let start = Instant::now();
     let attempts = task.retries.unwrap_or(0) + 1;
     for attempt in 1..=attempts {
         match run_task_once(task, vars, include_stack, env) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                let status = if env.dry { "dry" } else { "ok" };
+                write_audit_entry(env, task, status, None, start.elapsed());
+                return Ok(());
+            }
             Err(e) if attempt < attempts && !env.dry => {
                 let delay = task.delay.unwrap_or(1);
                 if !env.quiet {
@@ -2230,7 +2267,10 @@ fn run_task_once_with_retries(
                 }
                 std::thread::sleep(Duration::from_secs(delay));
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                write_audit_entry(env, task, "failed", Some(&e.to_string()), start.elapsed());
+                return Err(e);
+            }
         }
     }
     unreachable!("loop always returns on the last attempt")
@@ -3230,6 +3270,14 @@ fn run_task_once(
             );
         }
         if !env.dry {
+            if !spec.confirm {
+                bail!(
+                    "systemd_restart: refused to run without confirm: true (task '{}') — \
+                     this is a deliberate write, add confirm: true to the task once you've \
+                     reviewed it",
+                    task.name
+                );
+            }
             let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
             crate::db::ssh_exec_capture(
                 &server,
@@ -3763,6 +3811,8 @@ fn run_task_once(
             let sub_notes = read_notes(&include_path);
             let sub_env = RunEnv {
                 playbook_dir: sub_playbook_dir,
+                playbook_name: sub_playbook.name.clone(),
+                audit_log: env.audit_log.clone(),
                 project_root: env.project_root.clone(),
                 dry: env.dry,
                 quiet: env.quiet,
@@ -3811,6 +3861,103 @@ fn run_task_once(
          gh_prs)",
         task.name
     );
+}
+
+/// Best-effort action label for a task, used only by `--audit-log` entries (see
+/// `write_audit_entry`) — not for dispatch, that's `run_task_once`'s own if-chain above.
+/// Same field list its "no action" error enumerates, checked in the same order; a task
+/// with no action field set never reaches here in practice (`run_task_once` rejects it
+/// first), so `"unknown"` is just a safe fallback, not an expected case.
+fn task_action_label(task: &Task) -> &'static str {
+    macro_rules! check {
+        ($($field:ident),+ $(,)?) => {
+            $(if task.$field.is_some() { return stringify!($field); })+
+        };
+    }
+    check!(
+        run,
+        check_url,
+        check_port,
+        http,
+        scrape,
+        wait_for,
+        report,
+        env_check,
+        ssh,
+        fleet,
+        fs_cat,
+        fs_write,
+        systemd_restart,
+        systemd_status,
+        logs_tail,
+        logs_grep,
+        ps_list,
+        ps_kill,
+        stat,
+        include,
+        assert,
+        block,
+        debug,
+        confirm,
+        set_fact,
+        state_set,
+        sync_db,
+        sync_files,
+        write_file,
+        read_csv,
+        write_csv,
+        db_query,
+        db_exec,
+        mail,
+        mail_check,
+        git_summary,
+        git_changelog,
+        gh_prs,
+    );
+    "unknown"
+}
+
+/// Appends one JSON line per task attempt to `env.audit_log`, if set — see
+/// `RunEnv::audit_log`/`PlayArgs::audit_log`. Called from `run_task_once_with_retries`,
+/// the single funnel every concrete attempt passes through, so this covers top-level
+/// tasks, `block:`/`rescue:`/`always:`, `include:`, and each `loop:` iteration
+/// uniformly — but not a task skipped via `when:` (that check happens one level up,
+/// before `run_task_once_with_retries` is ever called), since a skipped task never
+/// touched anything. A plain blocking append is intentional, same reasoning as
+/// `commands::mcp::ToolerMcp::write_audit`: one line per task attempt isn't a hot path,
+/// and a write failure here must never fail the task itself — it's only reported to
+/// stderr.
+fn write_audit_entry(
+    env: &RunEnv,
+    task: &Task,
+    status: &str,
+    error: Option<&str>,
+    duration: Duration,
+) {
+    let Some(path) = &env.audit_log else {
+        return;
+    };
+    let line = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "playbook": env.playbook_name,
+        "task": task.name,
+        "action": task_action_label(task),
+        "status": status,
+        "duration_ms": duration.as_millis(),
+        "error": error,
+    });
+    use std::io::Write;
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    if let Err(e) = result {
+        eprintln!(
+            "tooler play: failed to write audit log {}: {e}",
+            path.display()
+        );
+    }
 }
 
 /// Builds `Credentials` for one side of a `sync_db:` task, rendering each field through
@@ -4483,11 +4630,12 @@ fn resolve_token(token: &str, vars: &HashMap<String, String>) -> Option<String> 
 
 /// Single-pass `{{token}}` substitution shared by `render()` and `render_for_display()` —
 /// the scan is identical, only how a resolved *token* (post `split_filter`) is turned into
-/// a replacement string differs (real value vs. masked). A trailing `| json:<path>` filter
-/// (see `split_filter`/`apply_json_filter`) is applied uniformly regardless of `resolve`,
-/// so `render_for_display` masks-then-would-filter too, but the mask token `***` never
-/// parses as JSON, so a masked secret piped through `| json:...` just stays unresolved —
-/// never leaks. Unresolvable tokens (unknown name, bad filter) are left exactly as
+/// a replacement string differs (real value vs. masked). A trailing `| json:<path>` or
+/// `| quote` filter (see `split_filter`/`apply_json_filter`/`shell_quote`) is applied
+/// uniformly regardless of `resolve`, so `render_for_display` masks-then-filters too: a
+/// masked secret piped through `| json:...` never parses as JSON and just stays
+/// unresolved, while one piped through `| quote` becomes `'***'` — either way the real
+/// value never leaks. Unresolvable tokens (unknown name, bad filter) are left exactly as
 /// written, same as the old known-vars-only replace loop this superseded.
 fn render_with(s: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
@@ -4503,7 +4651,8 @@ fn render_with(s: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
         let inner = after[..end].trim();
         let (token, filter) = split_filter(inner);
         let resolved = resolve(token).and_then(|v| match filter {
-            Some(path) => apply_json_filter(&v, path),
+            Some(Filter::Json(path)) => apply_json_filter(&v, path),
+            Some(Filter::Quote) => Some(shell_quote(&v)),
             None => Some(v),
         });
         out.push_str(&resolved.unwrap_or_else(|| format!("{{{{{inner}}}}}")));
@@ -4513,19 +4662,47 @@ fn render_with(s: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
     out
 }
 
+/// A `{{token | ...}}` render filter — see `split_filter`. Only one filter is recognized
+/// per token (no chaining `json:` into `quote`); a value that needs both goes through
+/// `set_fact:` first to compute an intermediate var, same two-step workaround the DSL
+/// already uses for anything else that needs more than one transform.
+enum Filter<'a> {
+    /// `| json:<path>` — see `apply_json_filter`.
+    Json(&'a str),
+    /// `| quote` — see `shell_quote`.
+    Quote,
+}
+
 /// Splits a `{{...}}` token's trimmed inner text on an optional trailing `| json:<path>`
-/// filter — e.g. `"resp | json:data.id"` -> `("resp", Some("data.id"))`. Only the `json:`
-/// filter is recognized; anything else after a `|` is left as part of the token name (so a
-/// stray `|` doesn't silently vanish) and will simply fail to resolve like any unknown
-/// token.
-fn split_filter(inner: &str) -> (&str, Option<&str>) {
+/// or `| quote` filter — e.g. `"resp | json:data.id"` -> `("resp", Some(Filter::Json("data.id")))`,
+/// `"item | quote"` -> `("item", Some(Filter::Quote))`. Only these two filters are
+/// recognized; anything else after a `|` is left as part of the token name (so a stray
+/// `|` doesn't silently vanish) and will simply fail to resolve like any unknown token.
+fn split_filter(inner: &str) -> (&str, Option<Filter<'_>>) {
     if let Some((token, filter)) = inner.split_once('|') {
         let filter = filter.trim();
         if let Some(path) = filter.strip_prefix("json:") {
-            return (token.trim(), Some(path.trim()));
+            return (token.trim(), Some(Filter::Json(path.trim())));
+        }
+        if filter == "quote" {
+            return (token.trim(), Some(Filter::Quote));
         }
     }
     (inner, None)
+}
+
+/// POSIX single-quote escaping for a value about to be interpolated into a `run:`/`ssh:`/
+/// `fleet:` shell command line via `| quote`: wraps `value` in single quotes, escaping any
+/// embedded `'` as `'\''` (close the quote, emit an escaped literal quote, reopen it) —
+/// the standard shlex-safe technique. Targets the `sh -c` `run:` already shells out to
+/// (see `run_task_once`'s `task.run` branch), not a non-POSIX shell. Always succeeds
+/// (unlike `apply_json_filter`, there's no "doesn't match" case), so `| quote` never
+/// leaves a token unresolved the way a bad `json:` path can. See the README's "Trust
+/// model" section for why this exists: a `{{var}}` sourced from untrusted external data
+/// (`scrape:`, `http:` + `json:`, a `db_query:` row, a dynamic `loop: {from: ...}` item)
+/// can otherwise inject shell metacharacters straight into `run:`'s command line.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 /// Applies a `json:<path>` filter to `value` (parsed as JSON), walking dot-separated
@@ -4921,6 +5098,8 @@ mod tests {
     fn dry_env(ctx: &Context) -> RunEnv<'_> {
         RunEnv {
             playbook_dir: PathBuf::from("."),
+            playbook_name: "test".to_string(),
+            audit_log: None,
             project_root: PathBuf::from("."),
             dry: true,
             quiet: true,
@@ -4979,6 +5158,37 @@ mod tests {
         );
         // Plain vars are unaffected by render_for_display.
         assert_eq!(render_for_display("hello {{name}}", &v), "hello world");
+    }
+
+    #[test]
+    fn shell_quote_wraps_a_plain_value() {
+        assert_eq!(shell_quote("hello world"), "'hello world'");
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quotes() {
+        assert_eq!(shell_quote("it's here"), r"'it'\''s here'");
+    }
+
+    #[test]
+    fn quote_filter_resolves_a_var() {
+        let v = vars(&[("item", "; rm -rf /")]);
+        assert_eq!(render("echo {{item | quote}}", &v), "echo '; rm -rf /'");
+    }
+
+    #[test]
+    fn quote_filter_on_an_unknown_token_stays_literal() {
+        let v = vars(&[]);
+        assert_eq!(render("{{missing | quote}}", &v), "{{missing | quote}}");
+    }
+
+    #[test]
+    fn render_for_display_quotes_a_masked_secret_without_leaking() {
+        let v = vars(&[]);
+        // The real value never resolves (not stored), but the point stands even when
+        // it would: render_for_display masks to "***" before the filter runs, so the
+        // filtered result is always the masked placeholder, quoted -- never the secret.
+        assert_eq!(render_for_display("{{secret.p.k | quote}}", &v), "'***'");
     }
 
     #[test]
@@ -5153,6 +5363,24 @@ mod tests {
     }
 
     #[test]
+    fn task_action_label_identifies_run_and_debug_and_falls_back_to_unknown() {
+        let run_task = Task {
+            run: Some("echo hi".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(task_action_label(&run_task), "run");
+
+        let debug_task = Task {
+            debug: Some("hi".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(task_action_label(&debug_task), "debug");
+
+        let no_action_task = Task::default();
+        assert_eq!(task_action_label(&no_action_task), "unknown");
+    }
+
+    #[test]
     fn fs_cat_spec_deserializes() {
         let spec: FsCatSpec = serde_yaml::from_str("server: web1\npath: /etc/app/.env\n").unwrap();
         assert_eq!(spec.server, "web1");
@@ -5183,6 +5411,14 @@ mod tests {
         let spec: SystemdRestartSpec = serde_yaml::from_str("server: web1\nunit: nginx\n").unwrap();
         assert!(!spec.sudo);
         assert!(spec.sudo_pass.is_none());
+        assert!(!spec.confirm);
+    }
+
+    #[test]
+    fn systemd_restart_spec_deserializes_explicit_confirm() {
+        let spec: SystemdRestartSpec =
+            serde_yaml::from_str("server: web1\nunit: nginx\nconfirm: true\n").unwrap();
+        assert!(spec.confirm);
     }
 
     #[test]

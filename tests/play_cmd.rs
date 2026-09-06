@@ -222,6 +222,128 @@ fn json_length_filter_counts_a_registered_array() {
 }
 
 #[test]
+fn quote_filter_prevents_shell_injection_from_an_untrusted_value() {
+    // Regression test for the shell-injection gap `| quote` closes: run: shells out the
+    // fully rendered command via `sh -c`, so a {{var}} sourced from untrusted data (here
+    // simulated with set_fact:, standing in for scrape:/http:/db_query: output) could
+    // inject a second command if interpolated unquoted. `| quote` wraps it as one safe
+    // argument instead.
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Quote\ntasks:\n  - name: seed a hostile value\n    set_fact:\n      \
+         item: \"; touch pwned.txt\"\n  - name: echo it safely\n    \
+         run: \"echo {{item | quote}}\"\n    register: out\n  - name: show what ran\n    \
+         debug: \"{{out}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+
+    // The injected command never ran...
+    assert!(
+        !dir.path().join("pwned.txt").exists(),
+        "the quoted value was interpreted by the shell instead of staying one argument"
+    );
+    // ...and the literal string (semicolon included) reached echo intact.
+    assert!(out.contains("; touch pwned.txt"), "stdout was: {out}");
+}
+
+/// Parses `path` as JSON-lines (one `serde_json::Value` per non-empty line) — the shape
+/// `--audit-log` writes.
+fn read_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn audit_log_records_one_json_line_per_task_with_status_and_duration() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Audited\ntasks:\n  - name: say hi\n    run: echo hi\n",
+    )
+    .unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+
+    cmd.args([
+        "play",
+        "playbook.yml",
+        "--audit-log",
+        audit_path.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let entries = read_jsonl(&audit_path);
+    assert_eq!(entries.len(), 1, "entries were: {entries:?}");
+    assert_eq!(entries[0]["playbook"], "Audited");
+    assert_eq!(entries[0]["task"], "say hi");
+    assert_eq!(entries[0]["action"], "run");
+    assert_eq!(entries[0]["status"], "ok");
+    assert!(entries[0]["duration_ms"].is_number());
+    assert!(entries[0]["error"].is_null());
+    assert!(entries[0]["ts"].is_string());
+}
+
+#[test]
+fn audit_log_records_a_failed_task_with_its_error_message() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Audited\ntasks:\n  - name: boom\n    run: exit 1\n",
+    )
+    .unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+
+    cmd.args([
+        "play",
+        "playbook.yml",
+        "--audit-log",
+        audit_path.to_str().unwrap(),
+    ])
+    .assert()
+    .failure();
+
+    let entries = read_jsonl(&audit_path);
+    assert_eq!(entries.len(), 1, "entries were: {entries:?}");
+    assert_eq!(entries[0]["status"], "failed");
+    assert!(
+        entries[0]["error"].as_str().is_some(),
+        "entries were: {entries:?}"
+    );
+}
+
+#[test]
+fn audit_log_records_one_line_per_loop_iteration() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Audited\ntasks:\n  - name: greet each\n    loop: [a, b, c]\n    \
+         run: \"echo {{item}}\"\n",
+    )
+    .unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+
+    cmd.args([
+        "play",
+        "playbook.yml",
+        "--audit-log",
+        audit_path.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let entries = read_jsonl(&audit_path);
+    assert_eq!(entries.len(), 3, "entries were: {entries:?}");
+    assert!(entries.iter().all(|e| e["status"] == "ok"));
+}
+
+#[test]
 fn loop_runs_once_per_item_in_order() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1565,7 +1687,7 @@ fn systemd_restart_dry_run_previews_without_connecting() {
     std::fs::write(
         dir.path().join("playbook.yml"),
         "name: Restart\ntasks:\n  - name: bounce it\n    systemd_restart:\n      \
-         server: ghost\n      unit: nginx\n",
+         server: ghost\n      unit: nginx\n      confirm: true\n",
     )
     .unwrap();
 
@@ -1578,12 +1700,31 @@ fn systemd_restart_dry_run_previews_without_connecting() {
 }
 
 #[test]
-fn systemd_restart_against_an_unconfigured_server_fails_clearly() {
+fn systemd_restart_without_confirm_fails_clearly_and_makes_no_connection() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
         dir.path().join("playbook.yml"),
         "name: Restart\ntasks:\n  - name: bounce it\n    systemd_restart:\n      \
          server: ghost\n      unit: nginx\n",
+    )
+    .unwrap();
+
+    // Fails on the missing `confirm: true` before ever resolving `server` -- same gate
+    // fs_write:/ps_kill:/db_exec: use, proven the same way.
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn systemd_restart_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Restart\ntasks:\n  - name: bounce it\n    systemd_restart:\n      \
+         server: ghost\n      unit: nginx\n      confirm: true\n",
     )
     .unwrap();
 
