@@ -392,6 +392,101 @@ fn loop_failure_aborts_remaining_items_and_playbook() {
 }
 
 #[test]
+fn continue_on_error_attempts_every_item_and_fails_at_the_end_naming_the_failed_one() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ContinueOnError\ntasks:\n  - name: touch each unless b\n    \
+         loop: [a, b, c]\n    continue_on_error: true\n    \
+         run: \"test '{{item}}' != 'b' && touch ran-{{item}}.txt\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(dir.path().join("ran-a.txt").exists());
+    assert!(dir.path().join("ran-c.txt").exists());
+    assert!(
+        out.contains("1 of 3 loop item(s) failed") && out.contains("item 2 (b)"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn without_continue_on_error_a_loop_still_aborts_on_the_first_failure() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: NoContinueOnError\ntasks:\n  - name: touch each unless b\n    \
+         loop: [a, b, c]\n    \
+         run: \"test '{{item}}' != 'b' && touch ran-{{item}}.txt\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().failure();
+    assert!(dir.path().join("ran-a.txt").exists());
+    assert!(
+        !dir.path().join("ran-c.txt").exists(),
+        "item c should never have been attempted"
+    );
+}
+
+#[test]
+fn continue_on_error_under_max_parallel_still_runs_every_chunk() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ContinueOnErrorParallel\ntasks:\n  - name: touch each unless b\n    \
+         loop: [a, b, c, d]\n    max_parallel: 2\n    continue_on_error: true\n    \
+         run: \"test '{{item}}' != 'b' && touch ran-{{item}}.txt\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    // b is in the first chunk (a, b); c and d are the second chunk -- both must still
+    // run even though the first chunk had a failure.
+    assert!(dir.path().join("ran-a.txt").exists());
+    assert!(dir.path().join("ran-c.txt").exists());
+    assert!(dir.path().join("ran-d.txt").exists());
+    assert!(
+        out.contains("1 of 4 loop item(s) failed"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn continue_on_error_without_loop_is_rejected_upfront() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: BadContinueOnError\ntasks:\n  - name: no loop here\n    \
+         continue_on_error: true\n    run: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("continue_on_error: is only supported combined with loop:"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn continue_on_error_combined_with_ignore_errors_continues_the_playbook() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ContinueOnErrorIgnored\ntasks:\n  - name: touch each unless b\n    \
+         loop: [a, b, c]\n    continue_on_error: true\n    ignore_errors: true\n    \
+         run: \"test '{{item}}' != 'b' && touch ran-{{item}}.txt\"\n  - name: still runs\n    \
+         run: touch reached.txt\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    assert!(dir.path().join("reached.txt").exists());
+}
+
+#[test]
 fn dry_run_reports_skipped_without_executing() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1487,6 +1582,133 @@ fn later_vars_file_overrides_an_earlier_one() {
     ])
     .assert()
     .success();
+}
+
+#[test]
+fn include_vars_task_makes_the_file_s_vars_usable_by_later_tasks() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("extra.yml"), "greeting: hi-from-extra\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: IncludeVars\ntasks:\n  - name: load it\n    include_vars: extra.yml\n  - \
+         name: check it\n    assert: \"{{greeting}} == hi-from-extra\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn include_vars_transparently_decrypts_a_vault_encrypted_file() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("secrets.yml"), "api_key: super-secret\n").unwrap();
+    tooler_in(dir.path())
+        .env("TOOLER_VAULT_PASSWORD", "hunter2")
+        .args(["vault", "encrypt", "secrets.yml"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: IncludeVarsVault\ntasks:\n  - name: load it\n    include_vars: secrets.yml\n  - \
+         name: check it\n    assert: \"{{api_key}} == super-secret\"\n",
+    )
+    .unwrap();
+
+    cmd.env("TOOLER_VAULT_PASSWORD", "hunter2")
+        .args(["play", "playbook.yml"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn include_vars_is_a_no_op_in_a_dry_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("extra.yml"), "greeting: hi-from-extra\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: IncludeVarsDry\ntasks:\n  - name: load it\n    include_vars: extra.yml\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--dry"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn register_on_include_vars_is_rejected_upfront() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("extra.yml"), "greeting: hi\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: BadRegister\ntasks:\n  - name: load it\n    include_vars: extra.yml\n    \
+         register: oops\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("register: is not supported for"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn always_tagged_task_runs_even_when_not_selected_by_tags() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: AlwaysTag\ntasks:\n  - name: build step\n    tags: [build]\n    \
+         run: touch built.txt\n  - name: cleanup step\n    tags: [always]\n    \
+         run: touch cleaned.txt\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--tags", "something-else"])
+        .assert()
+        .success();
+    assert!(!dir.path().join("built.txt").exists());
+    assert!(dir.path().join("cleaned.txt").exists());
+}
+
+#[test]
+fn skip_tags_always_still_excludes_an_always_tagged_task() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: SkipAlwaysTag\ntasks:\n  - name: cleanup step\n    tags: [always]\n    \
+         run: touch cleaned.txt\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--skip-tags", "always"])
+        .assert()
+        .success();
+    assert!(!dir.path().join("cleaned.txt").exists());
+}
+
+#[test]
+fn list_tasks_still_shows_an_always_tagged_task_under_a_narrower_tags_filter() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: AlwaysTagListing\ntasks:\n  - name: build step\n    tags: [build]\n    \
+         run: echo build\n  - name: cleanup step\n    tags: [always]\n    run: echo cleanup\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args([
+            "play",
+            "playbook.yml",
+            "--tags",
+            "something-else",
+            "--list-tasks",
+        ])
+        .assert()
+        .success(),
+    );
+    assert!(out.contains("cleanup step"), "stdout was: {out}");
 }
 
 #[test]

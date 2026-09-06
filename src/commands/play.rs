@@ -348,6 +348,25 @@ struct Task {
     /// `run_loop_parallel`.
     #[serde(default)]
     max_parallel: Option<usize>,
+    /// Only valid combined with `loop:`: attempt every item regardless of an earlier one
+    /// failing (each item still respects its own `retries:`/`until:`/`failed_when:`),
+    /// instead of aborting on the first failure and leaving the rest untried. The task
+    /// itself still fails at the end (respecting `ignore_errors:`, same as any other
+    /// failure) if any item failed, with a summary naming which ones. `register:`'s
+    /// `.results` keeps one entry per item either way — a failed item's slot is an empty
+    /// string, so positions still line up with the original item order. See `run_task`,
+    /// `run_loop_parallel`.
+    #[serde(default)]
+    continue_on_error: bool,
+    /// Loads a flat `key: value` vars file mid-playbook (same file shape and loader as
+    /// `vars_files:`/`--vars-file`, including transparent decryption of a `tooler
+    /// vault`-encrypted file) — for loading vars based on something computed during this
+    /// run, rather than only ever upfront via `vars_files:`. Path resolves relative to
+    /// this playbook's own directory, same as `vars_files:` (also unconfined, same as
+    /// `vars_files:` — this is an author-time path, not untrusted input). No `register:`
+    /// support — like `set_fact:`, its job is setting vars directly.
+    #[serde(default)]
+    include_vars: Option<String>,
     /// Run any handlers `notify:`ed so far, right now, instead of waiting for them to run
     /// once at the very end of the playbook — Ansible's `meta: flush_handlers`. Only
     /// meaningful as a direct task in the top-level playbook's own `tasks:` (or an
@@ -2062,14 +2081,20 @@ fn validate_handlers(playbook: &Playbook) -> Result<()> {
 /// (see `execute_playbook`), not nested `block:`/`rescue:`/`always:`/`include:` tasks.
 /// Shared by `execute_playbook`'s task selection and `--list-tasks`/`--list-tags` so the
 /// two stay consistent.
+/// A task tagged `always` is included even when `--tags` wouldn't otherwise select it —
+/// an escape hatch for a cleanup/logging task that should never be skipped by tag
+/// filtering, the same special tag real Ansible has. It's still excluded by an explicit
+/// `--skip-tags always` (or any other tag it also carries that's in `--skip-tags`) —
+/// `always` only ever widens what `--tags` selects, it never overrides `--skip-tags`.
 fn task_matches_tags(
     task: &Task,
     tag_filter: &Option<Vec<&str>>,
     skip_tag_filter: &Option<Vec<&str>>,
 ) -> bool {
+    let always = task.tags.iter().any(|t| t == "always");
     let included = match tag_filter {
         None => true,
-        Some(tags) => task.tags.iter().any(|t| tags.contains(&t.as_str())),
+        Some(tags) => always || task.tags.iter().any(|t| tags.contains(&t.as_str())),
     };
     let excluded = match skip_tag_filter {
         None => false,
@@ -2505,6 +2530,9 @@ fn run_task(
     if task.max_parallel.is_some() && task.loop_spec.is_none() {
         bail!("max_parallel: is only supported combined with loop:");
     }
+    if task.continue_on_error && task.loop_spec.is_none() {
+        bail!("continue_on_error: is only supported combined with loop:");
+    }
     let Some(spec) = &task.loop_spec else {
         return run_task_once_with_retries(task, vars, include_stack, env);
     };
@@ -2522,14 +2550,25 @@ fn run_task(
     }
 
     let mut results: Vec<String> = Vec::new();
-    for item in &items {
+    let mut failures: Vec<String> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
         let mut loop_vars = vars.clone();
         apply_loop_item(item, &mut loop_vars, env.quiet);
-        run_task_once_with_retries(task, &mut loop_vars, include_stack, env)?;
-        if let Some(reg) = &task.register {
-            let val = loop_vars.get(reg).cloned().unwrap_or_default();
-            vars.insert(reg.clone(), val.clone());
-            results.push(val);
+        match run_task_once_with_retries(task, &mut loop_vars, include_stack, env) {
+            Ok(()) => {
+                if let Some(reg) = &task.register {
+                    let val = loop_vars.get(reg).cloned().unwrap_or_default();
+                    vars.insert(reg.clone(), val.clone());
+                    results.push(val);
+                }
+            }
+            Err(e) if task.continue_on_error => {
+                failures.push(format!("{}: {e}", loop_item_label(index + 1, item)));
+                if task.register.is_some() {
+                    results.push(String::new());
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
     if let Some(reg) = &task.register {
@@ -2537,7 +2576,26 @@ fn run_task(
             serde_json::to_string(&results).expect("serializing a Vec<String> to JSON cannot fail");
         vars.insert(format!("{reg}.results"), json);
     }
+    if !failures.is_empty() {
+        bail!(
+            "{} of {} loop item(s) failed: {}",
+            failures.len(),
+            items.len(),
+            failures.join("; ")
+        );
+    }
     Ok(())
+}
+
+/// A short label for a loop item in a `continue_on_error:` failure summary — the item's
+/// own value for a scalar, or just its position for a map (whose fields vary task to
+/// task, so there's no one obviously-right field to show). Shared by `run_task`/
+/// `run_loop_parallel`.
+fn loop_item_label(index: usize, item: &LoopItem) -> String {
+    match item {
+        LoopItem::Scalar(s) => format!("item {index} ({s})"),
+        LoopItem::Map(_) => format!("item {index}"),
+    }
 }
 
 /// Inserts one `loop:` item's `{{item}}`/`{{item.<field>}}` var(s) into `loop_vars` and
@@ -2592,6 +2650,8 @@ fn run_loop_parallel(
 ) -> Result<()> {
     let mut last_registered: Option<String> = None;
     let mut all_registered: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut index = 0usize;
     for chunk in items.chunks(chunk_size) {
         let results: Vec<Result<Option<String>>> = std::thread::scope(|scope| {
             let handles: Vec<_> = chunk
@@ -2611,13 +2671,24 @@ fn run_loop_parallel(
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        for r in results {
-            let val = r?;
-            if let Some(v) = &val {
-                all_registered.push(v.clone());
-            }
-            if val.is_some() {
-                last_registered = val;
+        for (item, r) in chunk.iter().zip(results) {
+            index += 1;
+            match r {
+                Ok(val) => {
+                    if let Some(v) = &val {
+                        all_registered.push(v.clone());
+                    }
+                    if val.is_some() {
+                        last_registered = val;
+                    }
+                }
+                Err(e) if task.continue_on_error => {
+                    failures.push(format!("{}: {e}", loop_item_label(index, item)));
+                    if task.register.is_some() {
+                        all_registered.push(String::new());
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -2628,6 +2699,14 @@ fn run_loop_parallel(
         let json = serde_json::to_string(&all_registered)
             .expect("serializing a Vec<String> to JSON cannot fail");
         vars.insert(format!("{reg}.results"), json);
+    }
+    if !failures.is_empty() {
+        bail!(
+            "{} of {} loop item(s) failed: {}",
+            failures.len(),
+            items.len(),
+            failures.join("; ")
+        );
     }
     Ok(())
 }
@@ -2861,10 +2940,11 @@ fn run_task_once(
             || task.debug.is_some()
             || task.set_fact.is_some()
             || task.wait_for.is_some()
-            || task.confirm.is_some())
+            || task.confirm.is_some()
+            || task.include_vars.is_some())
     {
         bail!(
-            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug/set_fact/wait_for/confirm tasks"
+            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug/set_fact/wait_for/confirm/include_vars tasks"
         );
     }
 
@@ -2940,6 +3020,27 @@ fn run_task_once(
                 println!("  {} {} = {}", "ƒ".cyan().bold(), k, rendered.dimmed());
             }
             vars.insert(k.clone(), rendered);
+        }
+        return Ok(());
+    }
+
+    if let Some(path) = &task.include_vars {
+        let rendered = render(path, vars);
+        let resolved = env.playbook_dir.join(&rendered);
+        if !env.quiet {
+            println!(
+                "  {} {}",
+                "→ vars".bold(),
+                resolved.display().to_string().dimmed()
+            );
+        }
+        if !env.dry {
+            let loaded = load_vars_file(&resolved)?;
+            let count = loaded.len();
+            vars.extend(loaded);
+            if !env.quiet {
+                println!("  {} {count} var(s) loaded", "✓ ok".green().bold());
+            }
         }
         return Ok(());
     }
@@ -4351,9 +4452,9 @@ fn run_task_once(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
          report, env_check, ssh, fleet, fs_cat, fs_write, systemd_restart, systemd_status, \
          logs_tail, logs_grep, ps_list, ps_kill, stat, include, assert, block, debug, \
-         confirm, set_fact, state_set, sync_db, sync_files, write_file, read_csv, \
-         write_csv, db_query, db_exec, mail, mail_check, git_summary, git_changelog, \
-         gh_prs)",
+         confirm, set_fact, include_vars, state_set, sync_db, sync_files, write_file, \
+         read_csv, write_csv, db_query, db_exec, mail, mail_check, git_summary, \
+         git_changelog, gh_prs)",
         task.name
     );
 }
@@ -4399,6 +4500,7 @@ fn task_action_label(task: &Task) -> &'static str {
         debug,
         confirm,
         set_fact,
+        include_vars,
         state_set,
         sync_db,
         sync_files,

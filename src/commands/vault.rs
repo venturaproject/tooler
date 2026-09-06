@@ -51,6 +51,18 @@ pub enum VaultSubcommand {
         #[arg(long, default_value = "TOOLER_VAULT_PASSWORD")]
         password_env: String,
     },
+    /// Rotate a vault-encrypted file's passphrase in place -- decrypts with the old one
+    /// and re-encrypts with a new one; the plaintext only ever exists in memory, never
+    /// written to disk in between. Fails if the file isn't already vault-encrypted.
+    Rekey {
+        file: PathBuf,
+        /// Env var holding the current passphrase
+        #[arg(long, default_value = "TOOLER_VAULT_PASSWORD")]
+        old_password_env: String,
+        /// Env var holding the new passphrase
+        #[arg(long)]
+        new_password_env: String,
+    },
 }
 
 pub fn run(args: VaultArgs, ctx: &Context) -> Result<()> {
@@ -59,6 +71,11 @@ pub fn run(args: VaultArgs, ctx: &Context) -> Result<()> {
         VaultSubcommand::Encrypt { file, password_env } => encrypt_file(&file, &password_env, json),
         VaultSubcommand::Decrypt { file, password_env } => decrypt_file(&file, &password_env, json),
         VaultSubcommand::View { file, password_env } => view_file(&file, &password_env, json),
+        VaultSubcommand::Rekey {
+            file,
+            old_password_env,
+            new_password_env,
+        } => rekey_file(&file, &old_password_env, &new_password_env, json),
     }
 }
 
@@ -121,6 +138,36 @@ fn view_file(path: &Path, password_env: &str, json: bool) -> Result<()> {
         );
     } else {
         print!("{text}");
+    }
+    Ok(())
+}
+
+fn rekey_file(
+    path: &Path,
+    old_password_env: &str,
+    new_password_env: &str,
+    json: bool,
+) -> Result<()> {
+    let content = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if !is_vault_encrypted(&content) {
+        bail!(
+            "{} is not vault-encrypted (nothing to rekey)",
+            path.display()
+        );
+    }
+    let old_password = read_password(old_password_env)?;
+    let plaintext = decrypt(&content, &old_password)?;
+    let new_password = read_password(new_password_env)?;
+    let reencrypted = encrypt(&plaintext, &new_password)?;
+    std::fs::write(path, reencrypted.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "path": path.display().to_string(), "rekeyed": true })
+        );
+    } else {
+        println!("{} {}", "✓ rekeyed".green().bold(), path.display());
     }
     Ok(())
 }
@@ -203,6 +250,28 @@ mod tests {
         let file = encrypt(plaintext, "correct horse battery staple").unwrap();
         let recovered = decrypt(file.as_bytes(), "correct horse battery staple").unwrap();
         assert_eq!(recovered, plaintext);
+    }
+
+    /// Exercises the same decrypt-then-re-encrypt sequence `rekey_file` performs (tested
+    /// here at the pure-function level rather than through `rekey_file`/env vars, since
+    /// `std::env::var` is process-wide state that unit tests running in parallel
+    /// shouldn't share -- the CLI-level round trip is covered in `tests/vault_cmd.rs`).
+    #[test]
+    fn rekeying_changes_the_passphrase_while_preserving_the_plaintext() {
+        let plaintext = b"api_key: rotate-me\n";
+        let encrypted_a = encrypt(plaintext, "password-a").unwrap();
+        let recovered = decrypt(encrypted_a.as_bytes(), "password-a").unwrap();
+        let encrypted_b = encrypt(&recovered, "password-b").unwrap();
+
+        assert_eq!(
+            decrypt(encrypted_b.as_bytes(), "password-b").unwrap(),
+            plaintext
+        );
+        let err = decrypt(encrypted_b.as_bytes(), "password-a").unwrap_err();
+        assert!(
+            err.to_string().contains("wrong password"),
+            "error was: {err}"
+        );
     }
 
     #[test]

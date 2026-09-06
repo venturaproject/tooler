@@ -665,6 +665,17 @@ fn vault_argv(action: &str, args: &VaultFileArgs) -> Vec<String> {
     argv
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct VaultRekeyArgs {
+    /// File to rekey
+    file: String,
+    /// Env var holding the current passphrase (defaults to TOOLER_VAULT_PASSWORD)
+    old_password_env: Option<String>,
+    /// Env var holding the new passphrase
+    new_password_env: String,
+    cwd: Option<String>,
+}
+
 // ── ps ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
@@ -1887,6 +1898,29 @@ impl ToolerMcp {
         Parameters(args): Parameters<VaultFileArgs>,
     ) -> Result<CallToolResult, McpError> {
         let argv = vault_argv("view", &args);
+        self.exec_self(argv, &args.cwd).await
+    }
+
+    #[tool(
+        description = "Rotate a vault-encrypted file's passphrase in place -- decrypts with \
+                        the old one and re-encrypts with a new one, the plaintext never \
+                        touching disk in between. Fails if the file isn't already \
+                        vault-encrypted",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_vault_rekey(
+        &self,
+        Parameters(args): Parameters<VaultRekeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["vault".to_string(), "rekey".to_string(), args.file.clone()];
+        push_opt(&mut argv, "--old-password-env", &args.old_password_env);
+        argv.push("--new-password-env".to_string());
+        argv.push(args.new_password_env.clone());
         self.exec_self(argv, &args.cwd).await
     }
 
