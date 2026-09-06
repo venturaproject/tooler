@@ -165,6 +165,16 @@ fn exec_on_server(ctx: &Context, name: &str, full_cmd: &str) -> ExecResult {
 /// runs all targets concurrently (`std::thread::scope` — `Context` is plain owned data,
 /// safe to share by reference across threads); output order matches `resolve_targets`'
 /// (already sorted) either way.
+///
+/// `batch_size` (only meaningful combined with `parallel: true`) splits the targets into
+/// chunks of that size, running each chunk fully before starting the next — a
+/// canary/rolling pattern (e.g. restart 3 servers at a time across a 20-server fleet)
+/// instead of either strictly one-at-a-time or all-at-once. `None` (or `Some(0)`,
+/// tolerated the same way a `0`/`1` batch elsewhere in this codebase degrades rather than
+/// erroring) reproduces the original all-in-one-batch behavior exactly. `tooler fleet
+/// exec` doesn't expose this yet — it always passes `None` — but every caller goes
+/// through this one function, so wiring a CLI flag for it later is a one-line change.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_on_targets(
     ctx: &Context,
     servers: Option<&str>,
@@ -173,6 +183,7 @@ pub(crate) fn run_on_targets(
     command: &str,
     sudo: bool,
     parallel: bool,
+    batch_size: Option<usize>,
 ) -> Result<Vec<ExecResult>> {
     let names = resolve_targets(ctx, servers, all, group)?;
     if names.is_empty() {
@@ -182,13 +193,22 @@ pub(crate) fn run_on_targets(
     let full_cmd = exec_command(command, sudo);
 
     if parallel {
-        Ok(std::thread::scope(|scope| {
-            let handles: Vec<_> = names
-                .iter()
-                .map(|name| scope.spawn(|| exec_on_server(ctx, name, &full_cmd)))
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        }))
+        let chunk_size = batch_size.filter(|&n| n > 0).unwrap_or(names.len());
+        Ok(names
+            .chunks(chunk_size)
+            .flat_map(|chunk| {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = chunk
+                        .iter()
+                        .map(|name| scope.spawn(|| exec_on_server(ctx, name, &full_cmd)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect())
     } else {
         Ok(names
             .iter()
@@ -209,7 +229,7 @@ fn exec(
     let json = ctx.output == OutputFormat::Json;
 
     let full_cmd = exec_command(command, sudo);
-    let results = match run_on_targets(ctx, servers, all, group, command, sudo, parallel) {
+    let results = match run_on_targets(ctx, servers, all, group, command, sudo, parallel, None) {
         Ok(r) => r,
         Err(e) => return fail(json, format!("{e:#}")),
     };

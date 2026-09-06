@@ -23,6 +23,13 @@ pub struct PlayArgs {
     #[arg(long = "var", short = 'e')]
     pub vars: Vec<String>,
 
+    /// Load vars from a flat `key: value` YAML/JSON file (repeatable; a later file and
+    /// --var both override an earlier one) — for handing a whole computed set of vars to
+    /// one invocation without editing the playbook's own vars_files:/vars:. Paths resolve
+    /// relative to the current directory, not the playbook's.
+    #[arg(long = "vars-file")]
+    pub vars_file: Vec<PathBuf>,
+
     /// Run only tasks matching these tags (comma-separated)
     #[arg(long)]
     pub tags: Option<String>,
@@ -141,7 +148,9 @@ struct Task {
     loop_spec: Option<LoopSpec>,
     /// Capture this task's output into a variable, usable by later tasks via
     /// `{{name}}`. Supported on run/ssh/fleet only (see `run_task_once`). Inside a
-    /// `loop:`, only the last iteration's value persists.
+    /// `loop:`, `<name>` still holds only the last iteration's value, but `<name>.results`
+    /// is also set to a JSON array of every iteration's value in order — see
+    /// `run_task`/`run_loop_parallel`.
     #[serde(default)]
     register: Option<String>,
     /// Retry this task up to N times (total attempts = retries + 1) before giving up.
@@ -453,6 +462,13 @@ struct FleetSpec {
     /// Run on all targeted servers concurrently instead of one at a time
     #[serde(default)]
     parallel: bool,
+    /// Only meaningful combined with `parallel: true` — runs targets in chunks of this
+    /// size (one chunk fully finishes before the next starts) instead of all-at-once, a
+    /// canary/rolling pattern (e.g. restart nginx 3 servers at a time across a
+    /// 20-server fleet) rather than either strictly one-at-a-time or all-at-once.
+    /// Ignored when `parallel` isn't set.
+    #[serde(default)]
+    batch_size: Option<usize>,
 }
 
 /// `fs_cat:` — reads a remote file over SSH via `commands::fs::cat_cmd`, the same
@@ -1303,15 +1319,34 @@ struct RunEnv<'a> {
 fn load_playbook_vars(playbook: &Playbook, dir: &Path) -> Result<HashMap<String, String>> {
     let mut merged: HashMap<String, String> = HashMap::new();
     for vf in &playbook.vars_files {
-        let path = dir.join(vf);
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Cannot read vars_files entry: {}", path.display()))?;
-        let file_vars: HashMap<String, String> = serde_yaml::from_str(&content)
-            .with_context(|| format!("Invalid YAML in vars_files entry: {}", path.display()))?;
-        merged.extend(file_vars);
+        merged.extend(load_vars_file(&dir.join(vf))?);
     }
     merged.extend(playbook.vars.clone());
     Ok(merged)
+}
+
+/// Reads one flat `key: value` vars file (YAML, or JSON since it's valid YAML) — shared
+/// by a playbook's own `vars_files:` entries (`load_playbook_vars`) and the CLI's
+/// `--vars-file` (`apply_vars_file_overrides`).
+fn load_vars_file(path: &Path) -> Result<HashMap<String, String>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Cannot read vars file: {}", path.display()))?;
+    serde_yaml::from_str(&content)
+        .with_context(|| format!("Invalid YAML in vars file: {}", path.display()))
+}
+
+/// Applies `--vars-file <path>` CLI overrides (repeatable, in order — a later file wins
+/// on an overlapping key) on top of `vars`. Resolves paths relative to the current
+/// directory (not the playbook's), same as any other CLI-supplied path. Applied *before*
+/// `apply_var_overrides` at every call site, so a single `--var key=value` still wins
+/// over anything a `--vars-file` set — the most specific override stays the strongest,
+/// same precedence the playbook's own `vars_files:`/`vars:` already establish relative to
+/// each other.
+fn apply_vars_file_overrides(vars: &mut HashMap<String, String>, paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        vars.extend(load_vars_file(path)?);
+    }
+    Ok(())
 }
 
 /// Applies `--var key=value` CLI overrides (repeatable) on top of `vars`, in order —
@@ -1356,6 +1391,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
             }
             None => (HashMap::new(), PathBuf::from("."), "repl".to_string()),
         };
+        apply_vars_file_overrides(&mut vars, &args.vars_file)?;
         apply_var_overrides(&mut vars, &args.vars)?;
         let env = RunEnv {
             playbook_dir,
@@ -1461,9 +1497,10 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         )
     };
 
-    // --var overrides apply on top either way — on a fresh run as always, and on a
-    // resumed run so a bad value can be fixed before retrying (the whole point of
+    // --vars-file, then --var, apply on top either way — on a fresh run as always, and on
+    // a resumed run so a bad value can be fixed before retrying (the whole point of
     // resuming rather than restarting from scratch).
+    apply_vars_file_overrides(&mut vars, &args.vars_file)?;
     apply_var_overrides(&mut vars, &args.vars)?;
 
     // Independent of --resume/--start-at-task's checkpoint mechanism -- durable memory
@@ -2322,8 +2359,9 @@ fn compare_numeric(lhs: &str, rhs: &str, op: impl Fn(f64, f64) -> bool) -> bool 
 /// Expands `loop:` (if present) into one retried-`run_task_once` call per item, with
 /// `{{item}}` added to that iteration's vars. The first failing iteration (after its own
 /// retries are exhausted) fails the whole task — remaining items are not attempted. If
-/// `register:` is set, only the *last* iteration's captured value persists into the
-/// outer `vars` (simplest well-defined rule for a loop+register combination).
+/// `register:` is set, `<reg>` gets the *last* iteration's captured value (simplest
+/// well-defined rule for a loop+register combination) and `<reg>.results` gets a JSON
+/// array of every iteration's value, in order — see `Task::register`.
 fn run_task(
     task: &Task,
     vars: &mut HashMap<String, String>,
@@ -2349,15 +2387,21 @@ fn run_task(
         );
     }
 
+    let mut results: Vec<String> = Vec::new();
     for item in &items {
         let mut loop_vars = vars.clone();
         apply_loop_item(item, &mut loop_vars, env.quiet);
         run_task_once_with_retries(task, &mut loop_vars, include_stack, env)?;
-        if let Some(reg) = &task.register
-            && let Some(val) = loop_vars.get(reg)
-        {
+        if let Some(reg) = &task.register {
+            let val = loop_vars.get(reg).cloned().unwrap_or_default();
             vars.insert(reg.clone(), val.clone());
+            results.push(val);
         }
+    }
+    if let Some(reg) = &task.register {
+        let json =
+            serde_json::to_string(&results).expect("serializing a Vec<String> to JSON cannot fail");
+        vars.insert(format!("{reg}.results"), json);
     }
     Ok(())
 }
@@ -2397,7 +2441,8 @@ fn apply_loop_item(item: &LoopItem, loop_vars: &mut HashMap<String, String>, qui
 /// shouldn't share) the others' mutable state.
 ///
 /// Results are consumed in **original item order**, not completion order, so the
-/// `register:`-captures-the-last-iteration's-value rule stays deterministic despite
+/// `register:`-captures-the-last-iteration's-value rule (and `<reg>.results`, the JSON
+/// array of every iteration's value — see `Task::register`) stays deterministic despite
 /// concurrent execution, and the *first* error in original order fails the task — matching
 /// the sequential loop's "first failing iteration fails the task" contract as closely as
 /// concurrency allows. One narrowing of that guarantee: within a chunk that contains a
@@ -2412,6 +2457,7 @@ fn run_loop_parallel(
     env: &RunEnv,
 ) -> Result<()> {
     let mut last_registered: Option<String> = None;
+    let mut all_registered: Vec<String> = Vec::new();
     for chunk in items.chunks(chunk_size) {
         let results: Vec<Result<Option<String>>> = std::thread::scope(|scope| {
             let handles: Vec<_> = chunk
@@ -2433,13 +2479,21 @@ fn run_loop_parallel(
         });
         for r in results {
             let val = r?;
+            if let Some(v) = &val {
+                all_registered.push(v.clone());
+            }
             if val.is_some() {
                 last_registered = val;
             }
         }
     }
-    if let (Some(reg), Some(val)) = (&task.register, last_registered) {
-        vars.insert(reg.clone(), val);
+    if let Some(reg) = &task.register {
+        if let Some(val) = last_registered {
+            vars.insert(reg.clone(), val);
+        }
+        let json = serde_json::to_string(&all_registered)
+            .expect("serializing a Vec<String> to JSON cannot fail");
+        vars.insert(format!("{reg}.results"), json);
     }
     Ok(())
 }
@@ -3403,6 +3457,7 @@ fn run_task_once(
                 &command,
                 spec.sudo,
                 spec.parallel,
+                spec.batch_size,
             )?;
             let ok_count = results.iter().filter(|r| r.success).count();
             let total = results.len();

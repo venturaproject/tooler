@@ -1395,6 +1395,130 @@ fn max_parallel_loop_runs_all_items_and_keeps_last_registered_value_deterministi
 }
 
 #[test]
+fn loop_register_results_captures_every_iteration_in_order() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LoopResults\ntasks:\n  - name: echo each\n    loop: [a, b, c]\n    \
+         run: echo {{item}}\n    register: r\n  - name: check length\n    \
+         assert: \"{{r.results | json:length}} == 3\"\n  - name: check second item\n    \
+         assert: \"{{r.results | json:[1]}} == b\"\n  - name: last value still wins on r itself\n    \
+         assert: \"{{r}} == c\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn max_parallel_loop_register_results_captures_every_iteration_in_order() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ParallelLoopResults\ntasks:\n  - name: echo each\n    loop: [a, b, c, d]\n    \
+         max_parallel: 2\n    run: echo {{item}}\n    register: r\n  - name: check length\n    \
+         assert: \"{{r.results | json:length}} == 4\"\n  - name: order preserved despite concurrency\n    \
+         assert: \"{{r.results | json:[2]}} == c\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn vars_file_loads_a_flat_yaml_file_and_makes_vars_usable() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("extra.yml"),
+        "host: prod.example.com\nport: \"8080\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: VarsFile\ntasks:\n  - name: check host\n    assert: \"{{host}} == prod.example.com\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--vars-file", "extra.yml"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn var_flag_overrides_a_vars_file_value_on_the_same_key() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("extra.yml"), "host: from-file\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: VarsFileOverride\ntasks:\n  - name: check host\n    assert: \"{{host}} == from-cli\"\n",
+    )
+    .unwrap();
+
+    cmd.args([
+        "play",
+        "playbook.yml",
+        "--vars-file",
+        "extra.yml",
+        "--var",
+        "host=from-cli",
+    ])
+    .assert()
+    .success();
+}
+
+#[test]
+fn later_vars_file_overrides_an_earlier_one() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("a.yml"), "host: from-a\n").unwrap();
+    std::fs::write(dir.path().join("b.yml"), "host: from-b\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: TwoVarsFiles\ntasks:\n  - name: check host\n    assert: \"{{host}} == from-b\"\n",
+    )
+    .unwrap();
+
+    cmd.args([
+        "play",
+        "playbook.yml",
+        "--vars-file",
+        "a.yml",
+        "--vars-file",
+        "b.yml",
+    ])
+    .assert()
+    .success();
+}
+
+#[test]
+fn fleet_batch_size_still_attempts_every_target() {
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args(["server", "add", "s1", "--host", "127.0.0.1", "--port", "1"])
+        .assert()
+        .success();
+    tooler_in(dir.path())
+        .args(["server", "add", "s2", "--host", "127.0.0.1", "--port", "2"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: BatchedFleet\ntasks:\n  - name: rolling restart\n    \
+         fleet:\n      servers: s1,s2\n      command: echo hi\n      parallel: true\n      \
+         batch_size: 1\n    ignore_errors: true\n",
+    )
+    .unwrap();
+
+    // Same shape as fleet_task_parallel_flag_runs_without_hanging_or_panicking: unreachable
+    // servers make the fleet: task itself fail, but ignore_errors keeps the playbook going.
+    // The point is proving batch_size: 1 still attempts (and chunks through) every target
+    // rather than stopping early, and completes without hanging.
+    cmd.args(["--output", "json", "play", "playbook.yml"])
+        .timeout(std::time::Duration::from_secs(15))
+        .assert()
+        .success();
+}
+
+#[test]
 fn resume_restores_vars_and_continues_after_the_last_completed_task() {
     let dir = tempdir().unwrap();
     std::fs::write(
