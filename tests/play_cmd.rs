@@ -553,6 +553,186 @@ fn retries_exhausted_fails_the_task_with_a_retry_log_line() {
 }
 
 #[test]
+fn until_retries_a_successful_task_until_its_registered_value_satisfies_the_condition() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Until test\ntasks:\n  - name: poll until three\n    \
+         run: \"printf x >> counter && wc -c < counter\"\n    register: n\n    \
+         until: \"{{n}} == 3\"\n    retries: 5\n    delay: 0\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    let len = std::fs::metadata(dir.path().join("counter")).unwrap().len();
+    assert_eq!(
+        len, 3,
+        "task should have stopped exactly at the 3rd attempt"
+    );
+}
+
+#[test]
+fn until_fails_the_task_once_retries_are_exhausted_without_satisfying_the_condition() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Until exhaustion\ntasks:\n  - name: never satisfied\n    \
+         run: echo hi\n    register: out\n    until: \"{{out}} == impossible\"\n    \
+         retries: 2\n    delay: 0\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("was still false after 3 attempt(s)"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn until_is_ignored_in_a_dry_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Until dry\ntasks:\n  - name: poll\n    run: echo hi\n    register: n\n    \
+         until: \"{{n}} == never\"\n    retries: 2\n    delay: 0\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--dry"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn skip_tags_excludes_matching_tasks() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: SkipTags\ntasks:\n  - name: build step\n    tags: [build]\n    \
+         run: echo build\n  - name: deploy step\n    tags: [deploy]\n    \
+         run: touch deployed\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--skip-tags", "deploy"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("build step"), "stdout was: {out}");
+    assert!(!out.contains("deploy step"), "stdout was: {out}");
+    assert!(!dir.path().join("deployed").exists());
+}
+
+#[test]
+fn tags_and_skip_tags_together_skip_wins_on_overlap() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: TagsAndSkip\ntasks:\n  - name: build step\n    tags: [build]\n    \
+         run: echo build\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args([
+            "play",
+            "playbook.yml",
+            "--tags",
+            "build",
+            "--skip-tags",
+            "build",
+        ])
+        .assert()
+        .success(),
+    );
+    assert!(!out.contains("build step"), "stdout was: {out}");
+}
+
+#[test]
+fn list_tasks_shows_the_tree_without_running_or_connecting_anything() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ListMe\ntasks:\n  - name: outer block\n    block:\n      - name: inner db\n        \
+         db_exec:\n          server: ghost\n          sql: \"DELETE FROM x\"\n          \
+         confirm: true\n    rescue:\n      - name: cleanup\n        debug: oops\n  - name: pull in sub\n    \
+         include: sub.yml\n    tags: [deploy]\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--list-tasks"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["playbook"], "ListMe");
+    assert_eq!(value["tasks"][0]["name"], "outer block");
+    assert_eq!(value["tasks"][0]["block"][0]["name"], "inner db");
+    assert_eq!(value["tasks"][0]["block"][0]["action"], "db_exec");
+    assert_eq!(value["tasks"][0]["rescue"][0]["name"], "cleanup");
+    assert_eq!(value["tasks"][1]["name"], "pull in sub");
+    assert_eq!(value["tasks"][1]["include"], "sub.yml");
+    assert_eq!(value["tasks"][1]["tags"][0], "deploy");
+    // No sub.yml exists on disk and the db_exec: task targets an unconfigured server --
+    // both would error immediately if --list-tasks executed anything.
+}
+
+#[test]
+fn list_tasks_respects_skip_tags() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ListFiltered\ntasks:\n  - name: build step\n    tags: [build]\n    \
+         run: echo build\n  - name: deploy step\n    tags: [deploy]\n    run: echo deploy\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args([
+            "--output",
+            "json",
+            "play",
+            "playbook.yml",
+            "--list-tasks",
+            "--skip-tags",
+            "deploy",
+        ])
+        .assert()
+        .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let names: Vec<&str> = value["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["build step"]);
+}
+
+#[test]
+fn list_tags_prints_a_sorted_deduplicated_tag_list() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Tags\ntasks:\n  - name: a\n    tags: [zeta, build]\n    run: echo a\n  - \
+         name: b\n    block:\n      - name: c\n        tags: [build]\n        run: echo c\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--list-tags"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["tags"], serde_json::json!(["build", "zeta"]));
+}
+
+#[test]
 fn include_runs_a_sub_playbook_and_shares_vars() {
     let (mut cmd, dir) = tooler();
     std::fs::write(

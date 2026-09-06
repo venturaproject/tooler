@@ -27,6 +27,11 @@ pub struct PlayArgs {
     #[arg(long)]
     pub tags: Option<String>,
 
+    /// Skip tasks matching these tags (comma-separated) — the complement of --tags. A
+    /// task must match --tags (if given) and not match any --skip-tags entry to run.
+    #[arg(long = "skip-tags")]
+    pub skip_tags: Option<String>,
+
     /// Generate a sample playbook.yml in the current directory
     #[arg(long)]
     pub init: bool,
@@ -75,6 +80,19 @@ pub struct PlayArgs {
     /// `when:` is not logged, since it never touched anything.
     #[arg(long, env = "TOOLER_PLAY_AUDIT_LOG")]
     pub audit_log: Option<PathBuf>,
+
+    /// List every task (name, action, tags) in the playbook, including tasks nested in
+    /// block:/rescue:/always: — an include: task shows its target file but isn't
+    /// recursed into. Parses the YAML and exits without resolving vars_files/secrets or
+    /// running anything. Respects --tags/--skip-tags (top-level tasks only, same scoping
+    /// those flags already have) so the listing matches what a real run would attempt.
+    #[arg(long = "list-tasks")]
+    pub list_tasks: bool,
+
+    /// List every distinct tag used anywhere in the playbook (sorted, deduplicated).
+    /// Same zero-side-effect parsing as --list-tasks.
+    #[arg(long = "list-tags")]
+    pub list_tags: bool,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
@@ -133,6 +151,16 @@ struct Task {
     /// Seconds to wait between retry attempts (default 1 if `retries:` is set).
     #[serde(default)]
     delay: Option<u64>,
+    /// Retry this task (same syntax as `when:`) until this condition on its current vars
+    /// (typically its own `register:`ed value) is true, or `retries:` attempts are
+    /// exhausted — unlike plain `retries:`, which only retries on *failure*, `until:`
+    /// also retries a *successful* task whose result doesn't satisfy the condition yet
+    /// (e.g. polling a `run:`/`http:` result for "ready"). Only meaningful combined with
+    /// `retries:` — without it, it's checked once, same as an `assert:` right after the
+    /// task. Ignored in `--dry`, same as `retries:` (a dry run never really registers a
+    /// value to check).
+    #[serde(default)]
+    until: Option<String>,
     /// Handler names (matching an entry in the playbook's `handlers:`) to trigger when
     /// this task succeeds and is considered "changed" (see `changed_when`). Deduplicated
     /// and run at most once each, after all regular tasks succeed.
@@ -1095,6 +1123,136 @@ fn print_notes_only(file_path: &Path, ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+/// One node of the `--list-tasks` tree — see `build_task_list`/`print_task_list`. Only
+/// ever built from a parsed `Playbook`, never executed against; the point is to describe
+/// a playbook's shape with zero side effects.
+#[derive(Serialize)]
+struct TaskListEntry {
+    name: String,
+    action: &'static str,
+    tags: Vec<String>,
+    /// An `include:` task's target file — shown, but not recursed into (a separate file,
+    /// possibly not resolvable without the full project context `--list-tasks` deliberately
+    /// skips).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    block: Vec<TaskListEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rescue: Vec<TaskListEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    always: Vec<TaskListEntry>,
+}
+
+/// Builds the `--list-tasks` tree from a task list, recursing into `block:`/`rescue:`/
+/// `always:` (which are real tasks of this same playbook) but not `include:` (a separate
+/// file — see `TaskListEntry::include`). Generic over the iterator so both a filtered
+/// `&[&Task]` (the top-level call) and an owned `&[Task]` (`block:`'s own `Vec<Task>`)
+/// work without cloning a `Task`.
+fn build_task_list<'a>(tasks: impl IntoIterator<Item = &'a Task>) -> Vec<TaskListEntry> {
+    tasks
+        .into_iter()
+        .map(|t| TaskListEntry {
+            name: t.name.clone(),
+            action: task_action_label(t),
+            tags: t.tags.clone(),
+            include: t.include.as_ref().map(|s| s.file().to_string()),
+            block: t.block.as_deref().map(build_task_list).unwrap_or_default(),
+            rescue: t.rescue.as_deref().map(build_task_list).unwrap_or_default(),
+            always: t.always.as_deref().map(build_task_list).unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// `--list-tasks`: prints the playbook's task tree (name, action, tags, and nested
+/// `block:`/`rescue:`/`always:`) with zero side effects — no `vars_files:`/secrets
+/// resolution, no connections, no execution. `tasks` is already `--tags`/`--skip-tags`
+/// filtered (see `task_matches_tags`) so the listing matches what a real run would
+/// attempt.
+fn print_task_list(playbook_name: &str, tasks: &[&Task], ctx: &Context) -> Result<()> {
+    let entries = build_task_list(tasks.iter().copied());
+    if ctx.output == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({"playbook": playbook_name, "tasks": entries})
+        );
+        return Ok(());
+    }
+    println!(
+        "{} {}",
+        "PLAY".bold().cyan(),
+        format!("[{playbook_name}]").bold()
+    );
+    fn print_entries(entries: &[TaskListEntry], depth: usize) {
+        let indent = "  ".repeat(depth + 1);
+        for e in entries {
+            let mut line = format!("{indent}{} {}", "-".dimmed(), e.name);
+            if let Some(file) = &e.include {
+                line.push_str(&format!(" {}", format!("(include: {file})").dimmed()));
+            } else {
+                line.push_str(&format!(" {}", format!("({})", e.action).dimmed()));
+            }
+            if !e.tags.is_empty() {
+                line.push_str(&format!(
+                    " {}",
+                    format!("tags: [{}]", e.tags.join(", ")).dimmed()
+                ));
+            }
+            println!("{line}");
+            for (label, sub) in [
+                ("block:", &e.block),
+                ("rescue:", &e.rescue),
+                ("always:", &e.always),
+            ] {
+                if !sub.is_empty() {
+                    println!("{}{}", "  ".repeat(depth + 2), label.dimmed());
+                    print_entries(sub, depth + 2);
+                }
+            }
+        }
+    }
+    print_entries(&entries, 0);
+    Ok(())
+}
+
+/// `--list-tags`: every distinct tag used anywhere in `tasks`, including nested
+/// `block:`/`rescue:`/`always:` (but not a separate `include:`d file), sorted and
+/// deduplicated. Same zero-side-effect parsing as `--list-tasks`.
+fn collect_tags<'a>(
+    tasks: impl IntoIterator<Item = &'a Task>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    for t in tasks {
+        out.extend(t.tags.iter().cloned());
+        if let Some(b) = &t.block {
+            collect_tags(b, out);
+        }
+        if let Some(r) = &t.rescue {
+            collect_tags(r, out);
+        }
+        if let Some(a) = &t.always {
+            collect_tags(a, out);
+        }
+    }
+}
+
+fn print_tag_list(tasks: &[&Task], ctx: &Context) -> Result<()> {
+    let mut tags = std::collections::BTreeSet::new();
+    collect_tags(tasks.iter().copied(), &mut tags);
+    if ctx.output == OutputFormat::Json {
+        println!("{}", serde_json::json!({"tags": tags}));
+        return Ok(());
+    }
+    if tags.is_empty() {
+        println!("{}", "No tags used in this playbook.".dimmed());
+    } else {
+        for tag in tags {
+            println!("{tag}");
+        }
+    }
+    Ok(())
+}
+
 /// Mostly-static, per-run execution context threaded through the dispatch chain —
 /// bundled into one struct because the parameter list (playbook_dir, project_root, dry,
 /// quiet, ctx, plus mutable vars/include_stack passed alongside) got too long to stay
@@ -1228,6 +1386,32 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     if args.notes {
         return print_notes_only(&file_path, ctx);
     }
+
+    if args.list_tasks || args.list_tags {
+        let content = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("Cannot read playbook: {file}"))?;
+        let playbook: Playbook =
+            serde_yaml::from_str(&content).with_context(|| format!("Invalid YAML in {file}"))?;
+        let tag_filter: Option<Vec<&str>> = args
+            .tags
+            .as_deref()
+            .map(|t| t.split(',').map(str::trim).collect());
+        let skip_tag_filter: Option<Vec<&str>> = args
+            .skip_tags
+            .as_deref()
+            .map(|t| t.split(',').map(str::trim).collect());
+        let tasks: Vec<&Task> = playbook
+            .tasks
+            .iter()
+            .filter(|t| task_matches_tags(t, &tag_filter, &skip_tag_filter))
+            .collect();
+        return if args.list_tasks {
+            print_task_list(&playbook.name, &tasks, ctx)
+        } else {
+            print_tag_list(&tasks, ctx)
+        };
+    }
+
     let notes = read_notes(&file_path);
 
     let playbook_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -1296,6 +1480,10 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         .tags
         .as_deref()
         .map(|t| t.split(',').map(str::trim).collect());
+    let skip_tag_filter: Option<Vec<&str>> = args
+        .skip_tags
+        .as_deref()
+        .map(|t| t.split(',').map(str::trim).collect());
 
     let mut include_stack: Vec<PathBuf> = vec![file_path];
     let env = RunEnv {
@@ -1315,6 +1503,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
     execute_playbook(
         &playbook,
         &tag_filter,
+        &skip_tag_filter,
         &notes,
         &mut vars,
         &mut include_stack,
@@ -1774,10 +1963,33 @@ fn validate_handlers(playbook: &Playbook) -> Result<()> {
     walk(&playbook.tasks, &handler_names)
 }
 
+/// Whether a task passes `--tags`/`--skip-tags` filtering: matches `--tags` (if set,
+/// needs at least one overlapping tag) and matches none of `--skip-tags`. Only ever
+/// applied to a playbook's own top-level tasks — same scoping `tag_filter` already has
+/// (see `execute_playbook`), not nested `block:`/`rescue:`/`always:`/`include:` tasks.
+/// Shared by `execute_playbook`'s task selection and `--list-tasks`/`--list-tags` so the
+/// two stay consistent.
+fn task_matches_tags(
+    task: &Task,
+    tag_filter: &Option<Vec<&str>>,
+    skip_tag_filter: &Option<Vec<&str>>,
+) -> bool {
+    let included = match tag_filter {
+        None => true,
+        Some(tags) => task.tags.iter().any(|t| tags.contains(&t.as_str())),
+    };
+    let excluded = match skip_tag_filter {
+        None => false,
+        Some(skip) => task.tags.iter().any(|t| skip.contains(&t.as_str())),
+    };
+    included && !excluded
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_playbook(
     playbook: &Playbook,
     tag_filter: &Option<Vec<&str>>,
+    skip_tag_filter: &Option<Vec<&str>>,
     notes: &Option<String>,
     vars: &mut HashMap<String, String>,
     include_stack: &mut Vec<PathBuf>,
@@ -1813,10 +2025,7 @@ fn execute_playbook(
     let mut tasks: Vec<&Task> = playbook
         .tasks
         .iter()
-        .filter(|t| match tag_filter {
-            None => true,
-            Some(tags) => t.tags.iter().any(|tag| tags.contains(&tag.as_str())),
-        })
+        .filter(|t| task_matches_tags(t, tag_filter, skip_tag_filter))
         .collect();
 
     // --start-at-task: only ever set on the top-level RunEnv (see RunEnv.start_at), so
@@ -2253,9 +2462,34 @@ fn run_task_once_with_retries(
     for attempt in 1..=attempts {
         match run_task_once(task, vars, include_stack, env) {
             Ok(()) => {
-                let status = if env.dry { "dry" } else { "ok" };
-                write_audit_entry(env, task, status, None, start.elapsed());
-                return Ok(());
+                let satisfied = match &task.until {
+                    None => true,
+                    Some(expr) => env.dry || eval_when(expr, vars),
+                };
+                if satisfied {
+                    let status = if env.dry { "dry" } else { "ok" };
+                    write_audit_entry(env, task, status, None, start.elapsed());
+                    return Ok(());
+                }
+                if attempt < attempts {
+                    let delay = task.delay.unwrap_or(1);
+                    if !env.quiet {
+                        println!(
+                            "  {} attempt {attempt}/{attempts}: until: '{}' not yet true — \
+                             retrying in {delay}s...",
+                            "!".yellow().bold(),
+                            task.until.as_deref().unwrap()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_secs(delay));
+                    continue;
+                }
+                let msg = format!(
+                    "until: '{}' was still false after {attempts} attempt(s)",
+                    task.until.as_deref().unwrap()
+                );
+                write_audit_entry(env, task, "failed", Some(&msg), start.elapsed());
+                bail!("{msg}");
             }
             Err(e) if attempt < attempts && !env.dry => {
                 let delay = task.delay.unwrap_or(1);
@@ -3825,6 +4059,7 @@ fn run_task_once(
             include_stack.push(include_path);
             let result = execute_playbook(
                 &sub_playbook,
+                &None,
                 &None,
                 &sub_notes,
                 vars,
@@ -6452,6 +6687,7 @@ mod tests {
         let mut include_stack = Vec::new();
         let err = execute_playbook(
             &playbook,
+            &None,
             &None,
             &None,
             &mut vars,
