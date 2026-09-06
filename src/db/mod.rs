@@ -74,11 +74,15 @@ pub(crate) fn isolate_process_group(cmd: &mut std::process::Command) {
     }
 }
 
-/// Kills `child`'s entire process group on Unix; falls back to killing just the one
-/// process elsewhere (a job-object-based tree-kill on Windows would be a separate,
-/// larger undertaking, and nothing observed there needs it yet). See
-/// `isolate_process_group`. Declares `kill(2)` itself rather than adding a `libc`
-/// dependency for one syscall.
+/// Kills `child`'s entire process tree: the whole process group via `kill(2)` on Unix
+/// (see `isolate_process_group`), or Windows' own built-in recursive process-tree killer
+/// (`taskkill /T /F`, present on every Windows install — no new dependency, the same
+/// "shell out to an OS-provided binary" pattern this crate already uses for `ssh`) on
+/// Windows — confirmed necessary there too: the same "kill only cuts the immediate `sh`/
+/// `cmd` child, orphaning a grandchild that keeps the inherited output pipe open" shape
+/// this fixes on Linux was observed intermittently on Windows CI as well. Falls back to
+/// the plain single-process `Child::kill()` on any other target. Declares `kill(2)`
+/// itself on Unix rather than adding a `libc` dependency for one syscall.
 pub(crate) fn kill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -90,7 +94,13 @@ pub(crate) fn kill_process_group(child: &mut std::process::Child) {
             kill(-(child.id() as i32), SIGKILL);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .output();
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = child.kill();
     }
