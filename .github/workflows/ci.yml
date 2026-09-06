@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,10 +18,49 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Test
         run: cargo test
 
       - name: Build
         run: cargo build --release
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+
+      # The --ignore entries below are transitive vulnerabilities pinned by an upstream
+      # crate's own dependency range, not something a `cargo update` within our own
+      # Cargo.toml constraints can move past. Tracked here instead of hidden -- removing
+      # an entry should mean the underlying crate actually got upgraded, not that the
+      # finding stopped mattering. Any NEW vulnerability not listed here still fails this
+      # job.
+      #   RUSTSEC-2026-0187 -- lopdf via printpdf 0.8.x (tooler report pdf): stack
+      #     overflow on deeply nested PDF objects. Fixed once printpdf ships a release
+      #     depending on lopdf >=0.42.0 (today means bumping printpdf past its 0.8 line).
+      #   RUSTSEC-2026-0104, -0098, -0099, -0049 -- rustls-webpki 0.102.8 via imap
+      #     3.0.0-alpha.15's own rustls-connector/rustls pin (tooler mail check): four
+      #     certificate-validation advisories. Fixed once imap ships a release built
+      #     against a current rustls.
+      - name: Audit
+        run: >
+          cargo audit
+          --ignore RUSTSEC-2026-0187
+          --ignore RUSTSEC-2026-0104
+          --ignore RUSTSEC-2026-0098
+          --ignore RUSTSEC-2026-0099
+          --ignore RUSTSEC-2026-0049
