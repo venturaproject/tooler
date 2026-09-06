@@ -423,6 +423,9 @@ struct PlayMcpArgs {
     vars: Vec<String>,
     /// Comma-separated list of tags to run
     tags: Option<String>,
+    /// Comma-separated list of tags to skip -- the complement of tags. A task must match
+    /// tags (if given) and not match any skip_tags entry to run.
+    skip_tags: Option<String>,
     /// Generate a sample playbook.yml instead of running one
     #[serde(default)]
     init: bool,
@@ -441,6 +444,31 @@ struct PlayMcpArgs {
     /// Mutually exclusive with start_at_task. Errors if no checkpoint exists.
     #[serde(default)]
     resume: bool,
+    /// Local vars files to load (repeatable; a later file and vars both override an
+    /// earlier one) -- for handing a whole computed set of vars to one run
+    #[serde(default)]
+    vars_file: Vec<String>,
+    /// Append a JSON line per task attempt (timestamp, task, action, status, duration,
+    /// error) to this file
+    audit_log: Option<String>,
+    /// Preview a colored diff of what fs_write:/write_file: are about to change, right
+    /// before each applies its write
+    #[serde(default)]
+    diff: bool,
+    /// List every task (name, action, tags) with zero side effects -- no vars_files:/
+    /// secrets resolution, no connections, nothing run
+    #[serde(default)]
+    list_tasks: bool,
+    /// List every distinct tag used anywhere in the playbook, sorted and deduplicated,
+    /// with the same zero-side-effect parsing as list_tasks
+    #[serde(default)]
+    list_tags: bool,
+    /// Static analysis with zero side effects: warns about a registered untrusted-source
+    /// result reaching run:/ssh:/fleet: without a quote filter, and a {{var}} reference
+    /// nothing earlier in the playbook defines. Heuristic, always succeeds -- findings
+    /// are advisory, not a hard failure
+    #[serde(default)]
+    lint: bool,
     cwd: Option<String>,
 }
 
@@ -1463,7 +1491,10 @@ impl ToolerMcp {
                         stdin — it fails fast unless yes=true is passed. If a previous call \
                         failed partway through, pass resume=true (optionally with vars \
                         overrides) to continue right after the last completed task instead \
-                        of starting over — start_at_task and resume are mutually exclusive",
+                        of starting over — start_at_task and resume are mutually exclusive. \
+                        list_tasks/list_tags/lint inspect a playbook with zero side effects \
+                        (no vars_files:/secrets resolution, no connections, nothing run) \
+                        instead of executing it — useful before committing to a real run",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1482,11 +1513,18 @@ impl ToolerMcp {
         push_flag(&mut argv, "--dry", args.dry);
         push_repeated(&mut argv, "--var", &args.vars);
         push_opt(&mut argv, "--tags", &args.tags);
+        push_opt(&mut argv, "--skip-tags", &args.skip_tags);
         push_flag(&mut argv, "--init", args.init);
         push_flag(&mut argv, "--yes", args.yes);
         push_flag(&mut argv, "--notes", args.notes);
         push_opt(&mut argv, "--start-at-task", &args.start_at_task);
         push_flag(&mut argv, "--resume", args.resume);
+        push_repeated(&mut argv, "--vars-file", &args.vars_file);
+        push_opt(&mut argv, "--audit-log", &args.audit_log);
+        push_flag(&mut argv, "--diff", args.diff);
+        push_flag(&mut argv, "--list-tasks", args.list_tasks);
+        push_flag(&mut argv, "--list-tags", args.list_tags);
+        push_flag(&mut argv, "--lint", args.lint);
         self.exec_self(argv, &args.cwd).await
     }
 
@@ -2687,6 +2725,57 @@ mod tests {
                 has_match,
                 "CLI command `{name}` has no matching MCP tool (expected `{prefix}` or `{prefix}_*`) \
                  -- add one in src/commands/mcp.rs, or add `{name}` to the `exempt` list above"
+            );
+        }
+    }
+
+    /// Guards against `tooler play`'s CLI flags and its `tooler_play` MCP tool's
+    /// arguments drifting apart the way they already did once (7 flags --
+    /// --skip-tags/--vars-file/--audit-log/--diff/--list-tasks/--list-tags/--lint --
+    /// landed on the CLI across several rounds with nobody updating `PlayMcpArgs` to
+    /// match, making every one of them unreachable from an agent driving `tooler` over
+    /// MCP instead of the raw CLI).
+    #[test]
+    fn every_play_cli_flag_has_a_matching_playmcpargs_field() {
+        // Flags with no meaningful single-call MCP equivalent (--repl is an interactive
+        // session), or that are global/handled elsewhere (--output/--profile).
+        let exempt = ["repl", "output", "profile"];
+
+        let cli = crate::cli::Cli::command();
+        let play = cli.find_subcommand("play").expect("play subcommand exists");
+        let mcp_fields = [
+            "file",
+            "dry",
+            "var",
+            "tags",
+            "skip_tags",
+            "init",
+            "notes",
+            "yes",
+            "start_at_task",
+            "resume",
+            "vars_file",
+            "audit_log",
+            "diff",
+            "list_tasks",
+            "list_tags",
+            "lint",
+            "cwd",
+        ];
+
+        for arg in play.get_arguments() {
+            let Some(long) = arg.get_long() else {
+                continue;
+            };
+            if exempt.contains(&long) {
+                continue;
+            }
+            let field = long.replace('-', "_");
+            assert!(
+                mcp_fields.contains(&field.as_str()),
+                "tooler play --{long} has no matching field on PlayMcpArgs (tooler_play \
+                 MCP tool) -- add one in src/commands/mcp.rs, or add \"{long}\" to the \
+                 exempt list above"
             );
         }
     }
