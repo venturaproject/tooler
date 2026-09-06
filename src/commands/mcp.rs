@@ -648,6 +648,23 @@ fn default_mail_folder() -> String {
     "INBOX".to_string()
 }
 
+// ── vault ─────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+struct VaultFileArgs {
+    /// File to operate on
+    file: String,
+    /// Env var holding the passphrase (defaults to TOOLER_VAULT_PASSWORD)
+    password_env: Option<String>,
+    cwd: Option<String>,
+}
+
+fn vault_argv(action: &str, args: &VaultFileArgs) -> Vec<String> {
+    let mut argv = vec!["vault".to_string(), action.to_string(), args.file.clone()];
+    push_opt(&mut argv, "--password-env", &args.password_env);
+    argv
+}
+
 // ── ps ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
@@ -1822,6 +1839,55 @@ impl ToolerMcp {
         push_opt_num(&mut argv, "--limit", args.limit);
         push_flag(&mut argv, "--mark-seen", args.mark_seen);
         self.exec_self(argv, &None).await
+    }
+
+    #[tool(
+        description = "Encrypt a file in place with a passphrase (AES-256-GCM) -- fails if \
+                        it's already vault-encrypted",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_vault_encrypt(
+        &self,
+        Parameters(args): Parameters<VaultFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vault_argv("encrypt", &args);
+        self.exec_self(argv, &args.cwd).await
+    }
+
+    #[tool(
+        description = "Decrypt a vault-encrypted file in place with a passphrase -- fails if \
+                        it isn't vault-encrypted",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_vault_decrypt(
+        &self,
+        Parameters(args): Parameters<VaultFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vault_argv("decrypt", &args);
+        self.exec_self(argv, &args.cwd).await
+    }
+
+    #[tool(
+        description = "Print a vault-encrypted file's decrypted contents without modifying \
+                        it on disk",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn tooler_vault_view(
+        &self,
+        Parameters(args): Parameters<VaultFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let argv = vault_argv("view", &args);
+        self.exec_self(argv, &args.cwd).await
     }
 
     #[tool(

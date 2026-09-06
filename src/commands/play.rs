@@ -1,5 +1,5 @@
 use crate::{context::Context, output::OutputFormat, project, report};
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use clap::Args;
 use colored::Colorize;
 use rustyline::{Editor, error::ReadlineError, history::DefaultHistory};
@@ -18,6 +18,14 @@ pub struct PlayArgs {
     /// Preview tasks without executing them
     #[arg(long)]
     pub dry: bool,
+
+    /// Print a colored unified diff of what fs_write:/write_file: are about to change,
+    /// right before each one applies its write. Reads the current content first — for
+    /// fs_write: this means an SSH read even on a real (non-dry) run; --dry never
+    /// connects, so --diff's remote preview only happens on a real run, as part of
+    /// applying it. A missing file diffs as all-added ("new file").
+    #[arg(long)]
+    pub diff: bool,
 
     /// Override a variable: --var key=value (repeatable)
     #[arg(long = "var", short = 'e')]
@@ -180,6 +188,15 @@ struct Task {
     /// matches how a plain shell command has no built-in idempotency signal.
     #[serde(default)]
     changed_when: Option<String>,
+    /// Condition (same syntax as `when:`) that overrides a task's outcome to failed even
+    /// though its exit code says otherwise — e.g. a `run:` that always exits 0 but whose
+    /// `register:`ed output contains an error marker. Evaluated independently of
+    /// `changed_when:` (a task can be both "changed" and "failed"); checked before
+    /// `until:`, so a `failed_when:`-triggered failure is retried by `retries:`/`delay:`
+    /// like any other failure, not treated as "succeeded but not yet satisfied." Ignored
+    /// in `--dry`, same as `until:` — a dry run never really registers a value to check.
+    #[serde(default)]
+    failed_when: Option<String>,
 
     // Actions — only one should be set per task
     run: Option<String>,
@@ -331,6 +348,16 @@ struct Task {
     /// `run_loop_parallel`.
     #[serde(default)]
     max_parallel: Option<usize>,
+    /// Run any handlers `notify:`ed so far, right now, instead of waiting for them to run
+    /// once at the very end of the playbook — Ansible's `meta: flush_handlers`. Only
+    /// meaningful as a direct task in the top-level playbook's own `tasks:` (or an
+    /// `include:`d sub-playbook's own `tasks:`, which has its own handler state); used
+    /// inside `block:`/`rescue:`/`always:` it fails clearly instead of silently doing
+    /// nothing, since those run outside `execute_playbook`'s handler bookkeeping. A no-op
+    /// (still counts as `ok`) when nothing is pending. See `execute_playbook`,
+    /// `run_notified_handlers`.
+    #[serde(default)]
+    flush_handlers: bool,
 }
 
 /// One `loop:` item — a plain scalar (`{{item}}`) or a map (`{{item.<field>}}` per key).
@@ -1288,6 +1315,10 @@ struct RunEnv<'a> {
     audit_log: Option<PathBuf>,
     project_root: PathBuf,
     dry: bool,
+    /// From `--diff` — print a unified diff of what fs_write:/write_file: are about to
+    /// change, right before each one applies its write. Propagated into `include:`'s
+    /// `sub_env` (like `dry`/`quiet`/`auto_yes`).
+    diff: bool,
     quiet: bool,
     /// From `--yes` — auto-confirms every `confirm:` task instead of prompting or (when
     /// `quiet`) failing fast.
@@ -1327,10 +1358,33 @@ fn load_playbook_vars(playbook: &Playbook, dir: &Path) -> Result<HashMap<String,
 
 /// Reads one flat `key: value` vars file (YAML, or JSON since it's valid YAML) — shared
 /// by a playbook's own `vars_files:` entries (`load_playbook_vars`) and the CLI's
-/// `--vars-file` (`apply_vars_file_overrides`).
+/// `--vars-file` (`apply_vars_file_overrides`). Transparently decrypts a file encrypted
+/// via `tooler vault encrypt` first (no new syntax — detected by its magic header, same
+/// as `tooler vault` itself), using the fixed `TOOLER_VAULT_PASSWORD` env var — always
+/// that one name at playbook-run time, unlike `tooler vault`'s own `--password-env`,
+/// which is only a convenience for encrypting/decrypting outside a playbook run.
 fn load_vars_file(path: &Path) -> Result<HashMap<String, String>> {
-    let content = std::fs::read_to_string(path)
+    let raw = std::fs::read(path)
         .with_context(|| format!("Cannot read vars file: {}", path.display()))?;
+    let content = if crate::commands::vault::is_vault_encrypted(&raw) {
+        let password = std::env::var("TOOLER_VAULT_PASSWORD").with_context(|| {
+            format!(
+                "vars file '{}' is vault-encrypted; set TOOLER_VAULT_PASSWORD to decrypt it",
+                path.display()
+            )
+        })?;
+        let plaintext = crate::commands::vault::decrypt(&raw, &password)
+            .with_context(|| format!("decrypting vars file: {}", path.display()))?;
+        String::from_utf8(plaintext).with_context(|| {
+            format!(
+                "vars file '{}' is not valid UTF-8 after decrypting",
+                path.display()
+            )
+        })?
+    } else {
+        String::from_utf8(raw)
+            .with_context(|| format!("vars file '{}' is not valid UTF-8", path.display()))?
+    };
     serde_yaml::from_str(&content)
         .with_context(|| format!("Invalid YAML in vars file: {}", path.display()))
 }
@@ -1399,6 +1453,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
             audit_log: args.audit_log.clone(),
             project_root,
             dry: args.dry,
+            diff: args.diff,
             quiet: false,
             auto_yes: false,
             start_at: None,
@@ -1529,6 +1584,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         audit_log: args.audit_log.clone(),
         project_root,
         dry: args.dry,
+        diff: args.diff,
         quiet: ctx.output == OutputFormat::Json,
         auto_yes: args.yes,
         start_at: start_at_task,
@@ -2121,6 +2177,46 @@ fn execute_playbook(
             continue;
         }
 
+        if task.flush_handlers {
+            if env.dry {
+                if !json {
+                    println!("  {}", "(dry run — skipped)".dimmed());
+                }
+                skipped += 1;
+                outcomes.push(TaskOutcome {
+                    name: task.name.clone(),
+                    status: "skipped",
+                    error: None,
+                });
+            } else {
+                run_notified_handlers(
+                    playbook,
+                    &mut notified,
+                    vars,
+                    include_stack,
+                    env,
+                    json,
+                    notes,
+                    &sep,
+                    is_top_level,
+                    &mut ok,
+                    &mut failed,
+                    skipped,
+                    &mut outcomes,
+                )?;
+                ok += 1;
+                outcomes.push(TaskOutcome {
+                    name: task.name.clone(),
+                    status: "ok",
+                    error: None,
+                });
+            }
+            if is_top_level && !env.dry {
+                write_checkpoint(env, &playbook.name, &task.name, vars);
+            }
+            continue;
+        }
+
         let result = run_task(task, vars, include_stack, env);
 
         match result {
@@ -2218,69 +2314,23 @@ fn execute_playbook(
     }
 
     // Reached only if every regular task above succeeded (or was skipped/ignored) —
-    // any unhandled failure already returned or exited above. Handlers use the same
-    // failure-reporting shape as a regular task failure, addressed to the handler
-    // instead of an indexed task.
-    for name in &notified {
-        let handler = playbook
-            .handlers
-            .iter()
-            .find(|h| &h.name == name)
-            .expect("validated by validate_handlers");
-
-        if !json {
-            println!("\n{} [{}]", "HANDLER".bold().magenta(), handler.name.bold());
-        }
-
-        match run_task(handler, vars, include_stack, env) {
-            Ok(()) => {
-                ok += 1;
-                outcomes.push(TaskOutcome {
-                    name: handler.name.clone(),
-                    status: "ok",
-                    error: None,
-                });
-            }
-            Err(e) => {
-                failed += 1;
-                outcomes.push(TaskOutcome {
-                    name: handler.name.clone(),
-                    status: "failed",
-                    error: Some(e.to_string()),
-                });
-
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "playbook": playbook.name,
-                            "dry": env.dry,
-                            "notes": notes,
-                            "tasks": outcomes,
-                            "ok": ok,
-                            "failed": failed,
-                            "skipped": skipped,
-                            "success": false,
-                        })
-                    );
-                    if is_top_level {
-                        std::process::exit(1);
-                    }
-                    bail!("playbook failed");
-                }
-
-                println!("  {} {}", "✗".red().bold(), e.to_string().red());
-                println!("\n{}", sep.dimmed());
-                println!(
-                    "\n{} failed at handler \"{}\".",
-                    "PLAY".bold().red(),
-                    handler.name.bold()
-                );
-                print_recap(ok, failed, skipped);
-                bail!("playbook failed");
-            }
-        }
-    }
+    // any unhandled failure already returned or exited above. Any handler a
+    // flush_handlers: task didn't already run mid-playbook runs now.
+    run_notified_handlers(
+        playbook,
+        &mut notified,
+        vars,
+        include_stack,
+        env,
+        json,
+        notes,
+        &sep,
+        is_top_level,
+        &mut ok,
+        &mut failed,
+        skipped,
+        &mut outcomes,
+    )?;
 
     // A fully-completed playbook has nothing left to resume — best-effort, never fails
     // the run over a stray delete error. Never touches the checkpoint in --dry: a dry
@@ -2312,6 +2362,90 @@ fn execute_playbook(
 
     println!("\n{}", sep.dimmed());
     print_recap(ok, failed, skipped);
+    Ok(())
+}
+
+/// Runs every currently-pending `notify:`ed handler and drains `notified` — shared by
+/// `execute_playbook`'s natural end-of-run flush and a mid-run `flush_handlers:` task
+/// (see its dispatch point above). A handler failure fails the whole playbook the same
+/// way a regular task failure does (same JSON/text reporting shape), addressed to the
+/// handler instead of an indexed task.
+#[allow(clippy::too_many_arguments)]
+fn run_notified_handlers(
+    playbook: &Playbook,
+    notified: &mut Vec<String>,
+    vars: &mut HashMap<String, String>,
+    include_stack: &mut Vec<PathBuf>,
+    env: &RunEnv,
+    json: bool,
+    notes: &Option<String>,
+    sep: &str,
+    is_top_level: bool,
+    ok: &mut usize,
+    failed: &mut usize,
+    skipped: usize,
+    outcomes: &mut Vec<TaskOutcome>,
+) -> Result<()> {
+    for name in notified.drain(..) {
+        let handler = playbook
+            .handlers
+            .iter()
+            .find(|h| h.name == name)
+            .expect("validated by validate_handlers");
+
+        if !json {
+            println!("\n{} [{}]", "HANDLER".bold().magenta(), handler.name.bold());
+        }
+
+        match run_task(handler, vars, include_stack, env) {
+            Ok(()) => {
+                *ok += 1;
+                outcomes.push(TaskOutcome {
+                    name: handler.name.clone(),
+                    status: "ok",
+                    error: None,
+                });
+            }
+            Err(e) => {
+                *failed += 1;
+                outcomes.push(TaskOutcome {
+                    name: handler.name.clone(),
+                    status: "failed",
+                    error: Some(e.to_string()),
+                });
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "playbook": playbook.name,
+                            "dry": env.dry,
+                            "notes": notes,
+                            "tasks": outcomes,
+                            "ok": *ok,
+                            "failed": *failed,
+                            "skipped": skipped,
+                            "success": false,
+                        })
+                    );
+                    if is_top_level {
+                        std::process::exit(1);
+                    }
+                    bail!("playbook failed");
+                }
+
+                println!("  {} {}", "✗".red().bold(), e.to_string().red());
+                println!("\n{}", sep.dimmed());
+                println!(
+                    "\n{} failed at handler \"{}\".",
+                    "PLAY".bold().red(),
+                    handler.name.bold()
+                );
+                print_recap(*ok, *failed, skipped);
+                bail!("playbook failed");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2514,7 +2648,27 @@ fn run_task_once_with_retries(
     let start = Instant::now();
     let attempts = task.retries.unwrap_or(0) + 1;
     for attempt in 1..=attempts {
-        match run_task_once(task, vars, include_stack, env) {
+        // failed_when: converts an otherwise-successful attempt into the same Err path
+        // a real failure takes, *before* the Ok/Err match below — so retry-on-error,
+        // the final "give up" bail, and the audit-log entry are all reused verbatim.
+        // until: (below) is only ever checked when failed_when: did NOT trigger, same
+        // precedence Ansible's failed_when/until interaction follows.
+        let outcome = match run_task_once(task, vars, include_stack, env) {
+            Ok(())
+                if !env.dry
+                    && task
+                        .failed_when
+                        .as_deref()
+                        .is_some_and(|expr| eval_when(expr, vars)) =>
+            {
+                Err(anyhow!(
+                    "failed_when: '{}' was true",
+                    task.failed_when.as_deref().unwrap()
+                ))
+            }
+            other => other,
+        };
+        match outcome {
             Ok(()) => {
                 let satisfied = match &task.until {
                     None => true,
@@ -2662,12 +2816,41 @@ fn run_block(
     result
 }
 
+/// Prints a colored unified line diff between `old` and `new` when `env.diff` (`--diff`)
+/// is set — a no-op otherwise, and a no-op when the two are identical. Shared by
+/// `fs_write:`/`write_file:`, called right before each applies its write.
+fn print_diff_if_enabled(env: &RunEnv, old: &str, new: &str) {
+    if !env.diff || old == new {
+        return;
+    }
+    use similar::{ChangeTag, TextDiff};
+    for change in TextDiff::from_lines(old, new).iter_all_changes() {
+        let line = change.to_string_lossy();
+        match change.tag() {
+            ChangeTag::Delete => print!("  {}{}", "-".red().bold(), line.red()),
+            ChangeTag::Insert => print!("  {}{}", "+".green().bold(), line.green()),
+            ChangeTag::Equal => {}
+        }
+    }
+}
+
 fn run_task_once(
     task: &Task,
     vars: &mut HashMap<String, String>,
     include_stack: &mut Vec<PathBuf>,
     env: &RunEnv,
 ) -> Result<()> {
+    // flush_handlers: only makes sense with access to execute_playbook's own
+    // notified/handlers bookkeeping — reaching here means it was used inside
+    // block:/rescue:/always:/run_task_sequence, which has no such state.
+    if task.flush_handlers {
+        bail!(
+            "flush_handlers: is only supported as a direct playbook task, not inside \
+             block:/rescue:/always: (task '{}')",
+            task.name
+        );
+    }
+
     if task.register.is_some()
         && (task.check_url.is_some()
             || task.check_port.is_some()
@@ -3087,6 +3270,19 @@ fn run_task_once(
         }
         if !env.dry {
             let content = render(&spec.content, vars);
+            if env.diff {
+                let old = std::fs::read(&out_path)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                // Appending only changes the tail — diff the resulting full content, not
+                // just the fragment, so it reads as "old" -> "old + new tail".
+                let new = if spec.append {
+                    format!("{old}{content}")
+                } else {
+                    content.clone()
+                };
+                print_diff_if_enabled(env, &old, &new);
+            }
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!("creating parent directory for {}", out_path.display())
@@ -3527,6 +3723,14 @@ fn run_task_once(
             }
             let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
             let content = render(&spec.content, vars);
+            if env.diff {
+                // A nonexistent remote file is a legitimate "new file" diff (all-added) —
+                // tolerate the cat failing rather than treat it as an error.
+                let old =
+                    crate::db::ssh_exec_capture(&server, &crate::commands::fs::cat_cmd(&path))
+                        .unwrap_or_default();
+                print_diff_if_enabled(env, &old, &content);
+            }
             let (_, stderr, success) = crate::db::ssh_exec_with_stdin(
                 &server,
                 &crate::commands::fs::write_cmd(&path),
@@ -4104,6 +4308,7 @@ fn run_task_once(
                 audit_log: env.audit_log.clone(),
                 project_root: env.project_root.clone(),
                 dry: env.dry,
+                diff: env.diff,
                 quiet: env.quiet,
                 auto_yes: env.auto_yes,
                 start_at: None,
@@ -4159,6 +4364,10 @@ fn run_task_once(
 /// with no action field set never reaches here in practice (`run_task_once` rejects it
 /// first), so `"unknown"` is just a safe fallback, not an expected case.
 fn task_action_label(task: &Task) -> &'static str {
+    // A plain bool, not an Option<T>, so it doesn't fit the check! macro below.
+    if task.flush_handlers {
+        return "flush_handlers";
+    }
     macro_rules! check {
         ($($field:ident),+ $(,)?) => {
             $(if task.$field.is_some() { return stringify!($field); })+
@@ -5392,6 +5601,7 @@ mod tests {
             audit_log: None,
             project_root: PathBuf::from("."),
             dry: true,
+            diff: false,
             quiet: true,
             auto_yes: false,
             start_at: None,

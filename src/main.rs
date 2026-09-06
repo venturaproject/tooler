@@ -58,5 +58,6 @@ fn main() -> Result<()> {
         Commands::Stat(args) => commands::stat::run(args, &ctx),
         Commands::Group(args) => commands::group::run(args, &ctx),
         Commands::Mail(args) => commands::mail::run(args, &ctx),
+        Commands::Vault(args) => commands::vault::run(args, &ctx),
     }
 }

@@ -25,6 +25,7 @@
   - [tooler report](#tooler-report)
   - [tooler db](#tooler-db)
   - [tooler mail](#tooler-mail)
+  - [tooler vault](#tooler-vault)
   - [tooler gh](#tooler-gh)
   - [tooler systemd](#tooler-systemd)
   - [tooler cron](#tooler-cron)
@@ -346,6 +347,7 @@ tooler play playbook.yml --vars-file vars.yml           # load a whole file of v
 tooler play playbook.yml --start-at-task "run tests"   # skip ahead, rerun after a fix
 tooler play playbook.yml --resume --var host=fixed.example.com  # resume after a failure
 tooler play playbook.yml --audit-log audit.jsonl               # log every task attempt to a file
+tooler play playbook.yml --diff             # preview fs_write:/write_file: changes as a diff
 ```
 
 `--start-at-task <name>` skips straight to the named **top-level** task, treating every earlier task as already done — not run, not counted, no output. It's a practical rerun-after-a-fix tool, not a full `--resume`: there's no persisted run state, so a task after the start point that reads `{{a_var}}` registered by a now-skipped earlier task sees it unresolved, same as any other unknown token. Has no effect inside `include:`/`block:` — it only ever applies to the outermost playbook's own task list. Mutually exclusive with `--resume`.
@@ -609,7 +611,7 @@ tasks:
 
 `db_query:` runs a read-only query (SELECT/SHOW/EXPLAIN/WITH/DESCRIBE only — the same enforcement `tooler db query` uses, which also rejects MySQL's `SELECT ... INTO OUTFILE`/`INTO DUMPFILE`, since those still start with `SELECT` but write a file on the database server) over SSH and, with `register:`, captures the rows as a JSON array — same convention as `scrape:`, so it plugs directly into `loop: {from: "{{reg}}"}` or `report:` with no temp file. Credentials resolve exactly like `sync_db:`'s `from:`/`to:` sides: either `env: <remote .env path>` or explicit `engine:`/`host:`/`port:`/`database:`/`user:`/`password:` fields. `max_rows:` caps the result (default 1000, same as `tooler db query --max-rows`).
 
-`write_file:` renders `content:` and writes it to `path:` (resolved relative to the playbook's own directory, parent directories created as needed) — `report:`'s counterpart for arbitrary text instead of structured data: a generated config, a `.env`, a one-line summary. `append: true` appends instead of overwriting. Unlike `run:`, only the destination path and byte count are ever printed — never the content — since it may itself resolve `{{secret.*}}` tokens. `register:` (if set) captures the byte count written.
+`write_file:` renders `content:` and writes it to `path:` (resolved relative to the playbook's own directory, parent directories created as needed) — `report:`'s counterpart for arbitrary text instead of structured data: a generated config, a `.env`, a one-line summary. `append: true` appends instead of overwriting. Unlike `run:`, only the destination path and byte count are ever printed — never the content — since it may itself resolve `{{secret.*}}` tokens. `register:` (if set) captures the byte count written. `tooler play --diff` previews the change as a colored unified line diff against the file's current content (all-added for a new file; only the appended tail for `append: true`) right before the write happens — off by default, since the diff isn't masked, unlike the always-hidden byte-count summary.
 
 `read_csv:` is `write_file:`'s read-side counterpart — parses a local CSV at `path:` (same directory confinement) and, with `register:`, captures the rows as a JSON array: one object per row keyed by the header row's column names (`headers: true`, the default), or a plain array of cells per row (`headers: false`, when the file has no header row). Every cell comes back as a string, no type guessing — same convention `db_query:`'s row objects already use. `delimiter:` overrides the default `,` for TSV/other-delimited files. Same `loop: {from: "{{reg}}"}`-chainable convention as `db_query:`/`scrape:`/`mail_check:`; only the row count is ever printed, never the content.
 
@@ -668,7 +670,7 @@ tooler play deploy.yml --yes    # auto-confirms every confirm: task, no promptin
 
 `ssh:`/`fleet:` are the native equivalent of `run: tooler ssh exec ...`/`run: tooler fleet exec ...` — same underlying SSH plumbing, but with structured per-server results and no shelling back into `tooler` itself. A `fleet:` task fails (and, without `ignore_errors: true`, stops the playbook) if any targeted server failed; `parallel: true` runs all targeted servers concurrently instead of one at a time (same flag as `tooler fleet exec/check --parallel`, see [`tooler fleet`](#tooler-fleet)). `batch_size: N` (only meaningful combined with `parallel: true`) runs targets in chunks of N instead of all-at-once — a canary/rolling pattern, e.g. `batch_size: 3` restarts a 20-server fleet three at a time rather than either strictly one-at-a-time or all 20 concurrently; every target still gets attempted regardless of chunking, same as today. Not yet exposed on the standalone `tooler fleet exec` CLI command, only the playbook task. `ssh:`'s `server:` and `fleet:`'s `servers:`/`group:` are all rendered through `{{var}}` like any other field, so the target can be chosen at invocation time — `fleet: {group: "{{target}}"}` plus `tooler play deploy --var target=web-canary` — instead of hardcoded in the YAML.
 
-`fs_cat:`/`fs_write:`, `systemd_restart:`/`systemd_status:`, and `logs_tail:`/`logs_grep:` are the native, structured equivalents of [`tooler fs`](#tooler-fs)/[`tooler systemd`](#tooler-systemd)/[`tooler logs`](#tooler-logs) — same SSH plumbing and command builders, but as proper task specs with `register:` instead of `ssh: {command: "..."}` string building. Like `db_query:`/`read_csv:`/`mail_check:`, `fs_cat:` and `logs_tail:`/`logs_grep:` only ever print a count (bytes/lines), never the content — a remote file or log line could be a secret or contain sensitive data; `register:` captures the full content for chaining into a later task. `fs_write:` and `systemd_restart:` both follow `db_exec:`'s exact gate: they require `confirm: true` literally in the YAML (checked before ever resolving the server, so a missing gate fails immediately, before a dry run would even need it) — overwriting a remote file or bouncing a live service is just as destructive as a DML write. `systemd_status:` never fails the task on an inactive unit (same query-not-control behavior as `tooler systemd status`); `register:` captures `<reg>.active` (`"true"`/`"false"`) alongside `<reg>` (the status text), so `when:`/`assert:` can decide what an inactive unit means for the rest of the playbook.
+`fs_cat:`/`fs_write:`, `systemd_restart:`/`systemd_status:`, and `logs_tail:`/`logs_grep:` are the native, structured equivalents of [`tooler fs`](#tooler-fs)/[`tooler systemd`](#tooler-systemd)/[`tooler logs`](#tooler-logs) — same SSH plumbing and command builders, but as proper task specs with `register:` instead of `ssh: {command: "..."}` string building. Like `db_query:`/`read_csv:`/`mail_check:`, `fs_cat:` and `logs_tail:`/`logs_grep:` only ever print a count (bytes/lines), never the content — a remote file or log line could be a secret or contain sensitive data; `register:` captures the full content for chaining into a later task. `fs_write:` and `systemd_restart:` both follow `db_exec:`'s exact gate: they require `confirm: true` literally in the YAML (checked before ever resolving the server, so a missing gate fails immediately, before a dry run would even need it) — overwriting a remote file or bouncing a live service is just as destructive as a DML write. `systemd_status:` never fails the task on an inactive unit (same query-not-control behavior as `tooler systemd status`); `register:` captures `<reg>.active` (`"true"`/`"false"`) alongside `<reg>` (the status text), so `when:`/`assert:` can decide what an inactive unit means for the rest of the playbook. `fs_write:` also honors `tooler play --diff` — it fetches the remote file's current content (over the same SSH connection, right after the `confirm:` gate and *before* the write) and previews a colored unified diff, the same preview `write_file:` gets for local writes; this is the one case where `--diff` makes a connection during a real run that plain `--dry` never would, since showing a *remote* diff needs to read the remote file first.
 
 `ps_list:`/`ps_kill:` and `stat:` are the same "native equivalent" treatment for [`tooler ps`](#tooler-ps)/[`tooler stat`](#tooler-stat). `ps_list:` follows `fs_cat:`'s content-hiding convention (count only, `register:` gets the full JSON array of processes); `ps_kill:` requires `confirm: true` literally in the YAML, same non-negotiable gate as `db_exec:`/`fs_write:` — sending a signal to a remote process is just as irreversible. `stat:` is a single small operational status blob (uptime/memory/disk), not row-shaped bulk data, so it prints directly like `systemd_status:`; `register:` captures `{uptime, memory, disk}` as JSON, handy as a `report:`/`mail:` source for a daily health-check playbook.
 
@@ -745,7 +747,7 @@ vars:
 tasks: [...]
 ```
 
-Useful for splitting environment-specific values (`defaults.yml`, `prod.yml`) out of the playbook itself instead of hardcoding them or passing every one as `--var`. Precedence, low to high: `vars_files:` entries (in listed order, a later file overrides an earlier one) → inline `vars:` → **`--vars-file <path>`** (repeatable, same flat `key: value` YAML/JSON shape as `vars_files:`, resolved relative to the current directory rather than the playbook's) → `--var` on the command line, which still overrides everything. `--vars-file` is the invocation-time counterpart to the playbook's own author-time `vars_files:` — for handing a whole computed set of vars (e.g. generated by an agent) to one run without editing the playbook itself.
+Useful for splitting environment-specific values (`defaults.yml`, `prod.yml`) out of the playbook itself instead of hardcoding them or passing every one as `--var`. Precedence, low to high: `vars_files:` entries (in listed order, a later file overrides an earlier one) → inline `vars:` → **`--vars-file <path>`** (repeatable, same flat `key: value` YAML/JSON shape as `vars_files:`, resolved relative to the current directory rather than the playbook's) → `--var` on the command line, which still overrides everything. `--vars-file` is the invocation-time counterpart to the playbook's own author-time `vars_files:` — for handing a whole computed set of vars (e.g. generated by an agent) to one run without editing the playbook itself. Either kind of vars file can be encrypted at rest with [`tooler vault`](#tooler-vault) — no new syntax, it's transparently decrypted (via `TOOLER_VAULT_PASSWORD`) the moment it's read, so a `vars_files:`/`--vars-file` entry works identically whether it's plaintext or vault-encrypted.
 
 **Per-task modifiers**, usable with any action above:
 
@@ -753,7 +755,8 @@ Useful for splitting environment-specific values (`defaults.yml`, `prod.yml`) ou
 - `loop: [a, b, c]` — run the task once per item, with `{{item}}` available to the action (e.g. `run: systemctl restart {{item}}`). The first failing iteration fails the task; remaining items aren't attempted. Items can also be maps — `loop: [{name: a, port: "1"}, {name: b, port: "2"}]` exposes `{{item.name}}`/`{{item.port}}` per iteration instead of a single `{{item}}`. `loop: {from: "{{var}}"}` is the dynamic form — resolved at run time instead of fixed in the YAML: if the rendered var parses as a JSON array (typically a `register:`ed `scrape:`/`http:` result), each element becomes an item (objects → `{{item.<field>}}`, same as a static map list); otherwise the rendered text is split on `split:` (default `"\n"`) into scalar items. This is what makes `scrape:`'s output directly loopable with no extra step. `max_parallel: N` (only valid combined with `loop:`) runs items concurrently in chunks of N instead of strictly one at a time — same `std::thread::scope` fan-out `fleet:`'s `parallel: true` uses, useful for a `loop:` over many URLs/servers/rows. `register:` still captures the *last item in original order*, deterministic despite the concurrent scheduling; a failing chunk's other already-started items still finish before the task is reported failed.
 - `register: <name>` — capture the task's output into a variable, usable by any later task via `{{name}}`. Supported on `run:`/`ssh:`/`fleet:` only (an upfront error otherwise). `run:` normally streams its subprocess's output live; it only switches to capturing (needed to register it) when `register:` is actually set on that task, so every other `run:` task is unaffected. Inside a `loop:`, `{{name}}` still holds only the last iteration's value, but `{{name.results}}` is also set — a JSON array of every iteration's value, in the same order the loop ran (deterministic even under `max_parallel:`) — so `{{name.results | json:length}}` and `{{name.results | json:[N]}}` (bracket indexing is required for a bare array index at the top of a path — a bare `json:N` looks for an object field named "N" instead and won't match) can inspect the whole set, e.g. after a `loop:` of health checks across several servers.
 - `retries: N` / `delay: S` — retry a failing task up to N extra times, waiting `delay` seconds (default 1) between attempts, before giving up. Applies per `loop:` iteration if combined with `loop:`; ignored entirely in `--dry`. `until: "<condition>"` (same syntax as `when:`) turns this into a poll: a *successful* task whose result doesn't satisfy `until:` yet (checked against its own `register:`ed value, typically) still counts as needing another attempt, not just an outright failure — e.g. `run: "curl -s .../health"` + `register: resp` + `until: "{{resp}} == ready"` + `retries: 10` keeps polling until the service reports ready or the attempts run out. Without `retries:`, `until:` is just checked once, same as an `assert:` right after the task; it's ignored entirely in `--dry`, same as `retries:` itself.
-- `notify: [handler, ...]` / `changed_when: "<condition>"` — trigger one or more `handlers:` (a playbook-level list of tasks, matched by name) when this task succeeds. Each notified handler runs **at most once**, after every regular task has succeeded, deduplicated across however many tasks notified it. Without `changed_when:`, a successful task always counts as "changed"; with it, only when the condition holds (typically checking a `register:`ed value). Notifying a handler name with no matching `handlers:` entry is rejected upfront, before any task runs — not silently ignored.
+- `notify: [handler, ...]` / `changed_when: "<condition>"` — trigger one or more `handlers:` (a playbook-level list of tasks, matched by name) when this task succeeds. Each notified handler runs **at most once**, after every regular task has succeeded, deduplicated across however many tasks notified it. Without `changed_when:`, a successful task always counts as "changed"; with it, only when the condition holds (typically checking a `register:`ed value). Notifying a handler name with no matching `handlers:` entry is rejected upfront, before any task runs — not silently ignored. `flush_handlers: true` — a small task of its own — runs every handler `notify:`ed so far **right now** instead of waiting for the natural end of the playbook, for when order matters (e.g. restart a service now, before a later task that depends on it already having restarted). Harmless (still counts as `ok`) when nothing is pending. Only valid as a direct task in the top-level (or an `include:`d sub-playbook's own) `tasks:` — inside `block:`/`rescue:`/`always:` it fails clearly instead of silently doing nothing.
+- `failed_when: "<condition>"` — override a task's outcome to failed even though its exit code says otherwise, same syntax as `when:`, checked against the task's own `register:`ed value — e.g. a `run:` that always exits 0 but whose captured output contains an error marker. Evaluated independently of `changed_when:` (a task can be both "changed" and "failed"); a `failed_when:`-triggered failure is retried by `retries:`/`delay:` and skipped by `ignore_errors:` exactly like any other failure — it's just another way to produce one. Checked before `until:`, so `failed_when:` decides pass/fail first. Ignored in `--dry`, same as `until:`/`retries:`.
 - `timeout: N` — kill the task if it's still running after N seconds. Only supported on `run:` for now — `ssh:`/`fleet:` route through a shared SSH helper with no process handle to actually kill, so they reject `timeout:` upfront rather than silently not honoring it.
 
 ```yaml
@@ -1077,6 +1080,37 @@ Profile-only (no inline `--host`/`--user`/`--password` the way `mail send` allow
 narrower and newer, and IMAP shares the exact same mailbox login `mail send` already
 uses. The `tooler_mail_check` MCP tool follows the same profile-only rule, `mark_seen`
 defaulting `false` even for an agent.
+
+---
+
+### tooler vault
+
+Encrypts/decrypts/views a file in place with a passphrase — AES-256-GCM with an
+Argon2id-derived key, both pure Rust (the `aes-gcm`/`argon2` crates), so committing a
+secrets file to a repo needs no `gpg`/`ansible-vault`/other external binary on either the
+control machine or a target, matching the same zero-runtime-dependency principle behind
+every SSH-based playbook task.
+
+```sh
+export TOOLER_VAULT_PASSWORD='a strong passphrase'
+tooler vault encrypt secrets.yml   # rewrites the file in place
+tooler vault view secrets.yml      # prints the decrypted content, doesn't touch the file
+tooler vault decrypt secrets.yml   # rewrites the file in place, back to plaintext
+```
+
+An encrypted file starts with a `TOOLERVAULT;1;AES256GCM` header line followed by one
+base64 line (a fresh random salt + nonce every time `encrypt` runs, so encrypting the
+same content twice never produces the same bytes) — `encrypt` refuses a file that's
+already encrypted, `decrypt`/`view` refuse one that isn't. `--password-env <VAR>` reads
+the passphrase from a different env var if you keep more than one vault password around;
+the default is always `TOOLER_VAULT_PASSWORD`.
+
+The playbook side needs nothing new: any `vars_files:`/`--vars-file` entry that turns out
+to be vault-encrypted is transparently decrypted the moment it's read (see
+[Templating → `vars_files:`](#tooler-play)), always via the fixed `TOOLER_VAULT_PASSWORD`
+env var (not `--password-env`, which is only a CLI convenience for encrypting/decrypting
+outside a playbook run) — set it before `tooler play` runs, the same way you'd set any
+other secret an agent-driven run needs.
 
 ---
 
@@ -1411,3 +1445,5 @@ Builds for: `linux/x86_64`, `linux/aarch64`, `macos/x86_64`, `macos/aarch64`, `w
 | `lettre` (`rustls-tls`) | SMTP client (`tooler mail send`, `mail:` playbook task) |
 | `imap` + `imap-proto` (`rustls-tls`) | IMAP client (`tooler mail check`, `mail_check:` playbook task) |
 | `csv` | CSV parsing/writing (`read_csv:`/`write_csv:` playbook tasks) |
+| `similar` | Unified line diffs (`tooler play --diff`) |
+| `aes-gcm` + `argon2` + `base64` | File encryption (`tooler vault`, vault-encrypted `vars_files:`/`--vars-file`) |

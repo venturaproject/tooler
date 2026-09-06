@@ -2555,6 +2555,268 @@ fn wait_for_file_absent_times_out_while_the_file_still_exists() {
 }
 
 #[test]
+fn failed_when_overrides_a_zero_exit_task_to_failed() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: FailedWhen\ntasks:\n  - name: always exits 0 but logs BAD\n    \
+         run: \"echo BAD\"\n    register: out\n    failed_when: \"{{out}} == BAD\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("failed_when: '{{out}} == BAD' was true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn failed_when_is_retried_by_retries_before_giving_up() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: FailedWhenRetries\ntasks:\n  - name: always exits 0 but logs BAD\n    \
+         run: \"echo BAD\"\n    register: out\n    failed_when: \"{{out}} == BAD\"\n    \
+         retries: 2\n    delay: 0\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("attempt 1/3"), "stdout was: {out}");
+    assert!(out.contains("attempt 2/3"), "stdout was: {out}");
+}
+
+#[test]
+fn failed_when_combined_with_ignore_errors_continues_the_playbook() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: FailedWhenIgnored\ntasks:\n  - name: always exits 0 but logs BAD\n    \
+         run: \"echo BAD\"\n    register: out\n    failed_when: \"{{out}} == BAD\"\n    \
+         ignore_errors: true\n  - name: still runs\n    run: touch reached.txt\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    assert!(dir.path().join("reached.txt").exists());
+}
+
+#[test]
+fn failed_when_is_ignored_in_a_dry_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: FailedWhenDry\ntasks:\n  - name: always exits 0 but logs BAD\n    \
+         run: \"echo BAD\"\n    register: out\n    failed_when: \"{{out}} == BAD\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--dry"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn diff_shows_added_and_removed_lines_when_overwriting_a_local_file() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("out.txt"), "old line\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Diff\ntasks:\n  - name: overwrite\n    write_file:\n      \
+         path: out.txt\n      content: \"new line\\n\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--diff"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("old line"), "stdout was: {out}");
+    assert!(out.contains("new line"), "stdout was: {out}");
+}
+
+#[test]
+fn diff_on_append_shows_only_the_appended_line() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("out.txt"), "kept line\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: DiffAppend\ntasks:\n  - name: append\n    write_file:\n      \
+         path: out.txt\n      content: \"new tail\\n\"\n      append: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--diff"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("new tail"), "stdout was: {out}");
+    // The kept line is unchanged (present on both sides), so it must never show up as a
+    // `-`/`+` diff line -- only as ordinary equal context, which print_diff_if_enabled
+    // never prints at all.
+    assert!(
+        !out.contains("-kept line") && !out.contains("+kept line"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn diff_flag_does_not_change_fs_write_s_existing_gates() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: DiffFsWrite\ntasks:\n  - name: overwrite it\n    fs_write:\n      \
+         server: ghost\n      path: /etc/app/.env\n      content: FOO=1\n      confirm: true\n",
+    )
+    .unwrap();
+
+    // Still fails clearly on the unconfigured server -- --diff doesn't skip or reorder
+    // fs_write:'s existing confirm:/server-resolution gates.
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--diff"])
+            .assert()
+            .failure(),
+    );
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn without_diff_flag_write_file_prints_no_diff_lines() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("out.txt"), "old line\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: NoDiff\ntasks:\n  - name: overwrite\n    write_file:\n      \
+         path: out.txt\n      content: \"new line\\n\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    assert!(!out.contains("old line"), "stdout was: {out}");
+}
+
+#[test]
+fn flush_handlers_runs_a_pending_handler_immediately_mid_playbook() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: FlushHandlers\n\
+         handlers:\n\
+         \x20\x20- name: restart\n\
+         \x20\x20\x20\x20run: echo restart >> order.txt\n\
+         tasks:\n\
+         \x20\x20- name: t1\n\
+         \x20\x20\x20\x20run: echo t1 >> order.txt\n\
+         \x20\x20\x20\x20notify: [restart]\n\
+         \x20\x20- name: flush now\n\
+         \x20\x20\x20\x20flush_handlers: true\n\
+         \x20\x20- name: t2\n\
+         \x20\x20\x20\x20run: echo t2 >> order.txt\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    let order = std::fs::read_to_string(dir.path().join("order.txt")).unwrap();
+    let lines: Vec<&str> = order.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["t1", "restart", "t2"],
+        "handler should have run between t1 and t2, not at the very end"
+    );
+}
+
+#[test]
+fn flush_handlers_with_nothing_pending_is_a_harmless_ok_no_op() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: FlushNoOp\ntasks:\n  - name: flush now\n    flush_handlers: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["ok"], 1);
+    assert_eq!(value["failed"], 0);
+}
+
+#[test]
+fn flush_handlers_inside_a_block_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: FlushInBlock\ntasks:\n  - name: wrapper\n    block:\n      \
+         - name: flush now\n        flush_handlers: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("flush_handlers: is only supported as a direct playbook task"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn vault_encrypted_vars_file_resolves_transparently_when_the_password_is_set() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("secrets.yml"), "api_key: super-secret\n").unwrap();
+    tooler_in(dir.path())
+        .env("TOOLER_VAULT_PASSWORD", "hunter2")
+        .args(["vault", "encrypt", "secrets.yml"])
+        .assert()
+        .success();
+
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Vault\nvars_files: [secrets.yml]\ntasks:\n  - name: check it\n    \
+         assert: \"{{api_key}} == super-secret\"\n",
+    )
+    .unwrap();
+
+    cmd.env("TOOLER_VAULT_PASSWORD", "hunter2")
+        .args(["play", "playbook.yml"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn vault_encrypted_vars_file_without_the_password_fails_clearly_naming_the_file() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("secrets.yml"), "api_key: super-secret\n").unwrap();
+    tooler_in(dir.path())
+        .env("TOOLER_VAULT_PASSWORD", "hunter2")
+        .args(["vault", "encrypt", "secrets.yml"])
+        .assert()
+        .success();
+
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Vault\nvars_files: [secrets.yml]\ntasks:\n  - name: check it\n    \
+         assert: \"{{api_key}} == super-secret\"\n",
+    )
+    .unwrap();
+
+    let out = cmd
+        .env_remove("TOOLER_VAULT_PASSWORD")
+        .args(["play", "playbook.yml"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("secrets.yml") && stderr.contains("TOOLER_VAULT_PASSWORD"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn a_typo_d_task_field_fails_clearly_instead_of_being_silently_ignored() {
     let (mut cmd, dir) = tooler();
     std::fs::write(

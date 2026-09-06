@@ -6,7 +6,7 @@ use crate::{
         info::InfoArgs, jobs::JobsArgs, json::JsonArgs, logs::LogsArgs, mail::MailArgs,
         mcp::McpArgs, play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs,
         scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs, stat::StatArgs,
-        systemd::SystemdArgs,
+        systemd::SystemdArgs, vault::VaultArgs,
     },
     output::OutputFormat,
 };
@@ -124,4 +124,8 @@ pub enum Commands {
 
     /// Send email over SMTP (config.mail.<name> profiles or inline host/user/password)
     Mail(MailArgs),
+
+    /// Encrypt/decrypt/view a file in place with a passphrase (AES-256-GCM) — for
+    /// committing secrets a playbook's vars_files:/--vars-file can read encrypted at rest
+    Vault(VaultArgs),
 }
