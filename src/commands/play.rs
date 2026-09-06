@@ -528,6 +528,43 @@ struct FsCatSpec {
     path: String,
 }
 
+/// A destructive task spec gated behind `confirm: true` in the YAML — implemented by
+/// `FsWriteSpec`/`SystemdRestartSpec`/`PsKillSpec`/`DbExecSpec`. See `Confirmed`.
+trait RequiresConfirm {
+    fn is_confirmed(&self) -> bool;
+}
+
+/// Proof that a destructive spec's `confirm: true` gate has already been checked. The
+/// only way to obtain one is `Confirmed::require`, which bails if `confirm` isn't set —
+/// so a function performing the actual side effect (`exec_fs_write`, etc.) can require
+/// `&Confirmed<T>` instead of `&T` in its signature, making it impossible to call from
+/// anywhere in the crate without going through the check first, at compile time rather
+/// than by convention. This exists specifically because the "just remember to check
+/// confirm" convention already failed once — `systemd_restart:` briefly shipped without
+/// its gate and needed a follow-up fix — so this makes that class of bug a compile error
+/// for any destructive action added from here on, not something a review has to catch.
+#[derive(Debug)]
+struct Confirmed<'a, T>(&'a T);
+
+impl<'a, T: RequiresConfirm> Confirmed<'a, T> {
+    fn require(spec: &'a T, action: &str, task_name: &str) -> Result<Self> {
+        if !spec.is_confirmed() {
+            bail!(
+                "{action}: refused to run without confirm: true (task '{task_name}') — this \
+                 is a deliberate action, add confirm: true to the task once you've reviewed it"
+            );
+        }
+        Ok(Self(spec))
+    }
+}
+
+impl<'a, T> std::ops::Deref for Confirmed<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0
+    }
+}
+
 /// `fs_write:` — overwrites a remote file over SSH via `commands::fs::write_cmd`.
 /// Deliberately requires `confirm: true` in the YAML itself, same non-negotiable gate
 /// `db_exec:` uses — overwriting a remote file is just as destructive/hard-to-reverse as
@@ -542,6 +579,12 @@ struct FsWriteSpec {
     content: String,
     #[serde(default)]
     confirm: bool,
+}
+
+impl RequiresConfirm for FsWriteSpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
 }
 
 /// `systemd_restart:` — restarts a remote systemd unit via `commands::systemd::restart_cmd`.
@@ -561,6 +604,12 @@ struct SystemdRestartSpec {
     sudo_pass: Option<String>,
     #[serde(default)]
     confirm: bool,
+}
+
+impl RequiresConfirm for SystemdRestartSpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
 }
 
 /// `systemd_status:` — checks a remote systemd unit via `commands::systemd::status_cmd`.
@@ -638,6 +687,12 @@ struct PsKillSpec {
     sudo_pass: Option<String>,
     #[serde(default)]
     confirm: bool,
+}
+
+impl RequiresConfirm for PsKillSpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
 }
 
 fn default_kill_signal() -> String {
@@ -986,6 +1041,12 @@ struct DbExecSpec {
     password: Option<String>,
     #[serde(default)]
     confirm: bool,
+}
+
+impl RequiresConfirm for DbExecSpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
 }
 
 /// `mail:` — every field is renderable via `render()` (so `{{secret.<profile>.password}}`
@@ -2913,6 +2974,99 @@ fn print_diff_if_enabled(env: &RunEnv, old: &str, new: &str) {
     }
 }
 
+/// The only place `fs_write:` actually overwrites a remote file — requires
+/// `&Confirmed<FsWriteSpec>`, obtainable only via `Confirmed::require`, so this can never
+/// run against an unconfirmed spec. Returns the rendered content written, for the byte
+/// count / `register:`.
+fn exec_fs_write(
+    confirmed: &Confirmed<FsWriteSpec>,
+    path: &str,
+    vars: &HashMap<String, String>,
+    env: &RunEnv,
+) -> Result<String> {
+    let server_name = render(&confirmed.server, vars);
+    let content = render(&confirmed.content, vars);
+    let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+    if env.diff {
+        // A nonexistent remote file is a legitimate "new file" diff (all-added) —
+        // tolerate the cat failing rather than treat it as an error.
+        let old = crate::db::ssh_exec_capture(&server, &crate::commands::fs::cat_cmd(path))
+            .unwrap_or_default();
+        print_diff_if_enabled(env, &old, &content);
+    }
+    let (_, stderr, success) = crate::db::ssh_exec_with_stdin(
+        &server,
+        &crate::commands::fs::write_cmd(path),
+        content.as_bytes(),
+    )?;
+    if !success {
+        let err = stderr.trim();
+        bail!("{}", if err.is_empty() { "write failed" } else { err });
+    }
+    Ok(content)
+}
+
+/// The only place `systemd_restart:` actually restarts a remote unit — see
+/// `exec_fs_write`'s doc comment for why this takes `&Confirmed<SystemdRestartSpec>`.
+fn exec_systemd_restart(
+    confirmed: &Confirmed<SystemdRestartSpec>,
+    unit: &str,
+    vars: &HashMap<String, String>,
+    env: &RunEnv,
+) -> Result<()> {
+    let server_name = render(&confirmed.server, vars);
+    let sudo_pass = confirmed.sudo_pass.as_deref().map(|s| render(s, vars));
+    let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+    crate::db::ssh_exec_capture(
+        &server,
+        &crate::commands::systemd::restart_cmd(unit, confirmed.sudo, sudo_pass.as_deref()),
+    )?;
+    Ok(())
+}
+
+/// The only place `ps_kill:` actually sends a signal to a remote process — see
+/// `exec_fs_write`'s doc comment for why this takes `&Confirmed<PsKillSpec>`.
+fn exec_ps_kill(
+    confirmed: &Confirmed<PsKillSpec>,
+    signal: &str,
+    vars: &HashMap<String, String>,
+    env: &RunEnv,
+) -> Result<()> {
+    let server_name = render(&confirmed.server, vars);
+    let sudo_pass = confirmed.sudo_pass.as_deref().map(|s| render(s, vars));
+    let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+    crate::db::ssh_exec_capture(
+        &server,
+        &crate::commands::ps::kill_cmd(confirmed.pid, signal, confirmed.sudo, sudo_pass.as_deref()),
+    )?;
+    Ok(())
+}
+
+/// The only place `db_exec:` actually runs its statement — see `exec_fs_write`'s doc
+/// comment for why this takes `&Confirmed<DbExecSpec>`. Returns `db::run_exec`'s output
+/// string, for `register:`.
+fn exec_db_exec(
+    confirmed: &Confirmed<DbExecSpec>,
+    sql: &str,
+    vars: &HashMap<String, String>,
+    env: &RunEnv,
+) -> Result<String> {
+    let server_name = render(&confirmed.server, vars);
+    let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+    let creds = resolve_conn_creds(
+        &server,
+        confirmed.env.as_deref(),
+        confirmed.engine.as_deref(),
+        confirmed.host.as_deref(),
+        confirmed.port,
+        confirmed.database.as_deref(),
+        confirmed.user.as_deref(),
+        confirmed.password.as_deref(),
+        vars,
+    )?;
+    crate::db::run_exec(&server, &creds, sql)
+}
+
 fn run_task_once(
     task: &Task,
     vars: &mut HashMap<String, String>,
@@ -3815,32 +3969,8 @@ fn run_task_once(
             );
         }
         if !env.dry {
-            if !spec.confirm {
-                bail!(
-                    "fs_write: refused to run without confirm: true (task '{}') — this is a \
-                     deliberate write, add confirm: true to the task once you've reviewed it",
-                    task.name
-                );
-            }
-            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
-            let content = render(&spec.content, vars);
-            if env.diff {
-                // A nonexistent remote file is a legitimate "new file" diff (all-added) —
-                // tolerate the cat failing rather than treat it as an error.
-                let old =
-                    crate::db::ssh_exec_capture(&server, &crate::commands::fs::cat_cmd(&path))
-                        .unwrap_or_default();
-                print_diff_if_enabled(env, &old, &content);
-            }
-            let (_, stderr, success) = crate::db::ssh_exec_with_stdin(
-                &server,
-                &crate::commands::fs::write_cmd(&path),
-                content.as_bytes(),
-            )?;
-            if !success {
-                let err = stderr.trim();
-                bail!("{}", if err.is_empty() { "write failed" } else { err });
-            }
+            let confirmed = Confirmed::require(spec, "fs_write", &task.name)?;
+            let content = exec_fs_write(&confirmed, &path, vars, env)?;
             if !env.quiet {
                 println!("  {} {} byte(s)", "✓ ok".green().bold(), content.len());
             }
@@ -3854,7 +3984,6 @@ fn run_task_once(
     if let Some(spec) = &task.systemd_restart {
         let server_name = render(&spec.server, vars);
         let unit = render(&spec.unit, vars);
-        let sudo_pass = spec.sudo_pass.as_deref().map(|s| render(s, vars));
         if !env.quiet {
             println!(
                 "  {} restart {} on {}",
@@ -3864,19 +3993,8 @@ fn run_task_once(
             );
         }
         if !env.dry {
-            if !spec.confirm {
-                bail!(
-                    "systemd_restart: refused to run without confirm: true (task '{}') — \
-                     this is a deliberate write, add confirm: true to the task once you've \
-                     reviewed it",
-                    task.name
-                );
-            }
-            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
-            crate::db::ssh_exec_capture(
-                &server,
-                &crate::commands::systemd::restart_cmd(&unit, spec.sudo, sudo_pass.as_deref()),
-            )?;
+            let confirmed = Confirmed::require(spec, "systemd_restart", &task.name)?;
+            exec_systemd_restart(&confirmed, &unit, vars, env)?;
             if !env.quiet {
                 println!("  {} {} restarted", "✓ ok".green().bold(), unit);
             }
@@ -4037,19 +4155,8 @@ fn run_task_once(
             );
         }
         if !env.dry {
-            if !spec.confirm {
-                bail!(
-                    "ps_kill: refused to run without confirm: true (task '{}') — this is a \
-                     deliberate write, add confirm: true to the task once you've reviewed it",
-                    task.name
-                );
-            }
-            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
-            let sudo_pass = spec.sudo_pass.as_deref().map(|s| render(s, vars));
-            crate::db::ssh_exec_capture(
-                &server,
-                &crate::commands::ps::kill_cmd(spec.pid, &signal, spec.sudo, sudo_pass.as_deref()),
-            )?;
+            let confirmed = Confirmed::require(spec, "ps_kill", &task.name)?;
+            exec_ps_kill(&confirmed, &signal, vars, env)?;
             if !env.quiet {
                 println!("  {} sent", "✓ ok".green().bold());
             }
@@ -4226,26 +4333,8 @@ fn run_task_once(
             );
         }
         if !env.dry {
-            if !spec.confirm {
-                bail!(
-                    "db_exec: refused to run without confirm: true (task '{}') — this is a \
-                     deliberate write, add confirm: true to the task once you've reviewed it",
-                    task.name
-                );
-            }
-            let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
-            let creds = resolve_conn_creds(
-                &server,
-                spec.env.as_deref(),
-                spec.engine.as_deref(),
-                spec.host.as_deref(),
-                spec.port,
-                spec.database.as_deref(),
-                spec.user.as_deref(),
-                spec.password.as_deref(),
-                vars,
-            )?;
-            let output = crate::db::run_exec(&server, &creds, &sql)?;
+            let confirmed = Confirmed::require(spec, "db_exec", &task.name)?;
+            let output = exec_db_exec(&confirmed, &sql, vars, env)?;
             if !env.quiet {
                 println!("  {} {}", "✓ ok".green().bold(), output.dimmed());
             }
@@ -5994,6 +6083,28 @@ mod tests {
         let spec: FsWriteSpec =
             serde_yaml::from_str("server: web1\npath: /tmp/x\ncontent: hi\n").unwrap();
         assert!(!spec.confirm);
+    }
+
+    #[test]
+    fn confirmed_require_rejects_an_unconfirmed_spec_with_a_clear_message() {
+        let spec: FsWriteSpec =
+            serde_yaml::from_str("server: web1\npath: /tmp/x\ncontent: hi\n").unwrap();
+        let err = Confirmed::require(&spec, "fs_write", "overwrite it").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fs_write: refused to run without confirm: true (task 'overwrite it')"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn confirmed_require_accepts_a_confirmed_spec() {
+        let spec: FsWriteSpec =
+            serde_yaml::from_str("server: web1\npath: /tmp/x\ncontent: hi\nconfirm: true\n")
+                .unwrap();
+        let confirmed = Confirmed::require(&spec, "fs_write", "overwrite it").unwrap();
+        // Deref gives access to the spec's own fields through the proof wrapper.
+        assert_eq!(confirmed.path, "/tmp/x");
     }
 
     #[test]
