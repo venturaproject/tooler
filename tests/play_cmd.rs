@@ -828,6 +828,151 @@ fn list_tags_prints_a_sorted_deduplicated_tag_list() {
 }
 
 #[test]
+fn lint_flags_an_unquoted_tainted_value_reaching_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintTaint\ntasks:\n  - name: query rows\n    db_query:\n      \
+         server: ghost\n      sql: SELECT 1\n    register: rows\n  - name: use it\n    \
+         run: \"echo {{rows}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["message"].as_str().unwrap().contains("without | quote")),
+        "findings were: {findings:?}"
+    );
+}
+
+#[test]
+fn lint_does_not_flag_a_tainted_value_piped_through_quote() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintTaintQuoted\ntasks:\n  - name: query rows\n    db_query:\n      \
+         server: ghost\n      sql: SELECT 1\n    register: rows\n  - name: use it\n    \
+         run: \"echo {{rows | quote}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["findings"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn lint_does_not_flag_an_unquoted_value_from_a_non_tainted_source() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintNotTainted\ntasks:\n  - name: compute it\n    set_fact:\n      \
+         greeting: hi\n  - name: use it\n    run: \"echo {{greeting}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["findings"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn lint_flags_a_reference_to_an_undefined_var() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintTypo\ntasks:\n  - name: use a typo\n    debug: \"{{typo_var}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["message"].as_str().unwrap().contains("possible typo")),
+        "findings were: {findings:?}"
+    );
+}
+
+#[test]
+fn lint_does_not_flag_vars_defined_by_vars_or_earlier_register_or_special_prefixes() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintKnownVars\nvars:\n  host: prod.example.com\ntasks:\n  - name: use vars\n    \
+         debug: \"{{host}}\"\n  - name: register something\n    run: echo hi\n    \
+         register: out\n  - name: use registered\n    debug: \"{{out}}\"\n  - \
+         name: use special prefixes\n    debug: \"{{secret.p.k}} {{state.x}} {{env.HOME}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["findings"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn lint_suppresses_undefined_var_check_after_an_include_vars_task() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintIncludeVars\ntasks:\n  - name: load\n    include_vars: extra.yml\n  - \
+         name: use it\n    debug: \"{{whatever_it_defined}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["findings"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn lint_makes_no_connections_and_always_exits_zero() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintNoConnect\ntasks:\n  - name: unreachable\n    ssh:\n      \
+         server: ghost\n      command: \"echo {{typo}}\"\n",
+    )
+    .unwrap();
+
+    // Would fail immediately on server resolution if this ever actually ran.
+    cmd.args(["play", "playbook.yml", "--lint"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn include_runs_a_sub_playbook_and_shares_vars() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1241,6 +1386,35 @@ fn timeout_without_run_is_rejected() {
     .unwrap();
 
     cmd.args(["play", "playbook.yml"]).assert().failure();
+}
+
+#[test]
+fn timeout_on_ssh_no_longer_rejected_upfront_fails_on_server_resolution_instead() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: SshTimeout\ntasks:\n  - name: run it\n    ssh:\n      \
+         server: ghost\n      command: echo hi\n    timeout: 5\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+    assert!(!out.contains("only supported on"), "stdout was: {out}");
+}
+
+#[test]
+fn timeout_on_fleet_no_longer_rejected_upfront_fails_on_server_resolution_instead() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: FleetTimeout\ntasks:\n  - name: run it\n    fleet:\n      \
+         servers: ghost\n      command: echo hi\n    timeout: 5\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(!out.contains("only supported on"), "stdout was: {out}");
 }
 
 #[test]

@@ -108,6 +108,15 @@ pub struct PlayArgs {
     /// Same zero-side-effect parsing as --list-tasks.
     #[arg(long = "list-tags")]
     pub list_tags: bool,
+
+    /// Static analysis, zero side effects (same parsing as --list-tasks): warns about a
+    /// registered http:/scrape:/db_query:/mail_check: result reaching run:/ssh:/fleet:
+    /// without a | quote filter (possible shell injection), and a {{var}} reference that
+    /// nothing earlier in the playbook defines (a likely typo). Heuristic, not a formal
+    /// verifier -- see the README for its documented false-positive cases. Always exits
+    /// 0; findings are advisory.
+    #[arg(long)]
+    pub lint: bool,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
@@ -285,10 +294,10 @@ struct Task {
     /// also the MCP/agent path) unless `--yes` was passed — it fails fast instead, so an
     /// agent-driven `tooler play` can't hang forever on stdin. See `RunEnv.auto_yes`.
     confirm: Option<String>,
-    /// Kill the task if it runs longer than this many seconds. Only supported on
-    /// `run:` — there's no process handle to kill for `ssh:`/`fleet:` without changing
-    /// the shared SSH helper they route through, so those reject `timeout:` upfront
-    /// rather than silently not honoring it.
+    /// Kill the task if it runs longer than this many seconds. Supported on `run:`
+    /// (kills the local subprocess) and `ssh:`/`fleet:` (kills the `ssh` process,
+    /// ending the remote command's connection — see `db::run_with_deadline`). Every
+    /// other action rejects `timeout:` upfront rather than silently not honoring it.
     #[serde(default)]
     timeout: Option<u64>,
     /// Dump `from`'s database and restore it into `to`'s, both reached through the same
@@ -1157,7 +1166,41 @@ fn is_literal_path(s: &str) -> bool {
 /// filesystem (no `canonicalize`) since the caller — `write_file:` — may be about to
 /// create the file, so it need not exist yet. `a/../b` is allowed (it never actually
 /// leaves `base`, just references it awkwardly); `../b` or `a/../../b` are not.
-fn join_confined(base: &Path, rel: &str) -> Result<PathBuf> {
+/// A path that has passed through `join_confined` — the only way to construct one. A
+/// local-file action's own executing code can require `&ConfinedPath` instead of
+/// `&Path`/`PathBuf`, making it impossible to hand it a path that skipped confinement,
+/// not just conventionally unlikely — the same "prove it, don't just check it" pattern
+/// `Confirmed<T>` applies to the `confirm:` gate.
+struct ConfinedPath(PathBuf);
+
+impl std::ops::Deref for ConfinedPath {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for ConfinedPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl ConfinedPath {
+    /// Only needed where an owned `PathBuf` has to cross into a function that isn't
+    /// (and shouldn't be) coupled to this type — e.g. `send_mail`, also called from
+    /// `tooler mail send`'s own CLI path with ordinary `PathBuf`s.
+    fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+
+    #[cfg(test)]
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+fn join_confined(base: &Path, rel: &str) -> Result<ConfinedPath> {
     if Path::new(rel).is_absolute() {
         bail!(
             "path '{rel}' must be relative to the playbook directory (absolute paths are rejected)"
@@ -1182,7 +1225,7 @@ fn join_confined(base: &Path, rel: &str) -> Result<PathBuf> {
             _ => bail!("path '{rel}' is not a valid relative path"),
         }
     }
-    Ok(resolved)
+    Ok(ConfinedPath(resolved))
 }
 
 /// Appends a trailing `/` to `path` if missing — rsync only copies a source directory's
@@ -1372,6 +1415,238 @@ fn print_tag_list(tasks: &[&Task], ctx: &Context) -> Result<()> {
         for tag in tags {
             println!("{tag}");
         }
+    }
+    Ok(())
+}
+
+// ── --lint ────────────────────────────────────────────────────────────────────
+
+/// One `--lint` finding: `task` names which task it's about, `message` describes it.
+#[derive(Debug, Serialize)]
+struct LintFinding {
+    task: String,
+    message: String,
+}
+
+/// Register: source actions Check A treats as "untrusted" — a third-party API response,
+/// a scraped page, DB rows an attacker could influence, or inbox content — same examples
+/// the README's own Trust model section already calls out for `| quote`.
+fn tainted_source_action(task: &Task) -> Option<&'static str> {
+    if task.http.is_some() {
+        Some("http")
+    } else if task.scrape.is_some() {
+        Some("scrape")
+    } else if task.db_query.is_some() {
+        Some("db_query")
+    } else if task.mail_check.is_some() {
+        Some("mail_check")
+    } else {
+        None
+    }
+}
+
+/// The command string Check A scans for unquoted tainted tokens — the same three action
+/// types the README's Trust model section names as reaching a shell line unescaped.
+fn shell_command(task: &Task) -> Option<&str> {
+    if let Some(s) = &task.run {
+        Some(s.as_str())
+    } else if let Some(spec) = &task.ssh {
+        Some(spec.command.as_str())
+    } else if let Some(spec) = &task.fleet {
+        Some(spec.command.as_str())
+    } else {
+        None
+    }
+}
+
+/// The fields Check B scans for a `{{var}}` reference nothing defines — task-level
+/// condition strings plus the same three shell-command fields `shell_command` covers.
+/// Not exhaustive (doesn't scan e.g. `http: {url}`, `db_query: {sql}`, `write_file:
+/// {content}`) — a deliberate scope limit to keep the heuristic simple and its false
+/// positives predictable, documented in the README alongside `--lint`'s other caveats.
+fn lintable_fields(task: &Task) -> Vec<&str> {
+    let mut fields: Vec<&str> = shell_command(task).into_iter().collect();
+    for s in [
+        &task.debug,
+        &task.assert,
+        &task.when,
+        &task.changed_when,
+        &task.failed_when,
+        &task.until,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        fields.push(s.as_str());
+    }
+    fields
+}
+
+/// Scans `s` for every `{{...}}` template token, in the same shape `render_with`'s
+/// substitution loop parses them (`split_filter` reuse) — but collecting `(token,
+/// filter)` pairs instead of substituting. Shared by `--lint`'s two checks.
+fn find_tokens(s: &str) -> Vec<(&str, Option<Filter<'_>>)> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            break;
+        };
+        out.push(split_filter(after[..end].trim()));
+        rest = &after[end + 2..];
+    }
+    out
+}
+
+/// The part of a `{{token}}` before its first `.` — `"resp.status"` -> `"resp"`, so a
+/// dotted-key reference (`<reg>.status`/`<reg>.results`/`item.<field>`) is checked
+/// against the same plain name `register:`/`set_fact:`/`loop:` would have added.
+fn token_base_name(token: &str) -> &str {
+    token.split('.').next().unwrap_or(token)
+}
+
+/// `--lint`: static analysis over the parsed YAML only (same zero-side-effect parsing as
+/// `--list-tasks`) — see `PlayArgs.lint`'s doc comment for what it checks. `playbook_dir`
+/// is only used to best-effort read `vars_files:` entries for Check B; an unreadable or
+/// vault-encrypted one (no `TOOLER_VAULT_PASSWORD` set) is skipped, never an error —
+/// `--lint` never fails, it only ever reports findings.
+fn lint_playbook(playbook: &Playbook, playbook_dir: &Path) -> Vec<LintFinding> {
+    let mut known: std::collections::HashSet<String> = playbook.vars.keys().cloned().collect();
+    for vf in &playbook.vars_files {
+        if let Ok(loaded) = load_vars_file(&playbook_dir.join(vf)) {
+            known.extend(loaded.into_keys());
+        }
+    }
+    let mut tainted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut saw_include_vars = false;
+    let mut findings = Vec::new();
+    lint_tasks(
+        &playbook.tasks,
+        &mut known,
+        &mut tainted,
+        &mut saw_include_vars,
+        &mut findings,
+    );
+    findings
+}
+
+/// Walks `tasks` in execution order, threading the same running `known`/`tainted` state
+/// into nested `block:`/`rescue:`/`always:` (all three, conservatively — only one branch
+/// actually runs at a time, but none of them create a separate var scope at runtime, see
+/// `run_block`/`run_task_sequence`, so a static lint errs toward fewer false positives by
+/// assuming any of them could have). `include:` is never recursed into, same scoping
+/// `--list-tasks` already has — a separate file, possibly not resolvable here.
+fn lint_tasks(
+    tasks: &[Task],
+    known: &mut std::collections::HashSet<String>,
+    tainted: &mut std::collections::HashSet<String>,
+    saw_include_vars: &mut bool,
+    findings: &mut Vec<LintFinding>,
+) {
+    for task in tasks {
+        // Check B — skipped entirely once an include_vars: task has been seen, since its
+        // target's contents aren't known statically and could define anything.
+        if !*saw_include_vars {
+            for field in lintable_fields(task) {
+                for (token, _) in find_tokens(field) {
+                    let base = token_base_name(token);
+                    if base == "item" {
+                        if task.loop_spec.is_none() {
+                            findings.push(LintFinding {
+                                task: task.name.clone(),
+                                message: format!(
+                                    "{{{{{token}}}}} referenced but this task has no loop:"
+                                ),
+                            });
+                        }
+                        continue;
+                    }
+                    if base == "secret" || base == "state" || base == "env" {
+                        continue;
+                    }
+                    if !known.contains(base) {
+                        findings.push(LintFinding {
+                            task: task.name.clone(),
+                            message: format!(
+                                "{{{{{token}}}}} isn't defined by any earlier vars:/vars_files:/register:/set_fact: in this playbook — possible typo (or set by --var/--vars-file at run time, which --lint can't see)"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Check A — untrusted data reaching a shell command unquoted.
+        if let Some(cmd) = shell_command(task) {
+            for (token, filter) in find_tokens(cmd) {
+                let base = token_base_name(token);
+                if tainted.contains(base) && !matches!(filter, Some(Filter::Quote)) {
+                    findings.push(LintFinding {
+                        task: task.name.clone(),
+                        message: format!(
+                            "{{{{{token}}}}} comes from a registered result of an untrusted \
+                             source and reaches run:/ssh:/fleet: without | quote — possible \
+                             shell injection"
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Update the running state for tasks that come after this one.
+        if let Some(reg) = &task.register {
+            known.insert(reg.clone());
+            if tainted_source_action(task).is_some() {
+                tainted.insert(reg.clone());
+            }
+        }
+        if let Some(facts) = &task.set_fact {
+            known.extend(facts.keys().cloned());
+        }
+        if task.include_vars.is_some() {
+            *saw_include_vars = true;
+        }
+
+        if let Some(block) = &task.block {
+            lint_tasks(block, known, tainted, saw_include_vars, findings);
+        }
+        if let Some(rescue) = &task.rescue {
+            lint_tasks(rescue, known, tainted, saw_include_vars, findings);
+        }
+        if let Some(always) = &task.always {
+            lint_tasks(always, known, tainted, saw_include_vars, findings);
+        }
+    }
+}
+
+fn print_lint_findings(playbook_name: &str, findings: &[LintFinding], ctx: &Context) -> Result<()> {
+    if ctx.output == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({"playbook": playbook_name, "findings": findings})
+        );
+        return Ok(());
+    }
+    println!(
+        "{} {}",
+        "PLAY".bold().cyan(),
+        format!("[{playbook_name}]").bold()
+    );
+    if findings.is_empty() {
+        println!("{}", "No issues found.".green());
+    } else {
+        for f in findings {
+            println!("  {} {}: {}", "!".yellow().bold(), f.task.bold(), f.message);
+        }
+        println!(
+            "\n{}",
+            format!(
+                "{} finding(s) — advisory only, review before running",
+                findings.len()
+            )
+            .yellow()
+        );
     }
     Ok(())
 }
@@ -1581,6 +1856,16 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         } else {
             print_tag_list(&tasks, ctx)
         };
+    }
+
+    if args.lint {
+        let content = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("Cannot read playbook: {file}"))?;
+        let playbook: Playbook =
+            serde_yaml::from_str(&content).with_context(|| format!("Invalid YAML in {file}"))?;
+        let playbook_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let findings = lint_playbook(&playbook, &playbook_dir);
+        return print_lint_findings(&playbook.name, &findings, ctx);
     }
 
     let notes = read_notes(&file_path);
@@ -3102,8 +3387,8 @@ fn run_task_once(
         );
     }
 
-    if task.timeout.is_some() && task.run.is_none() {
-        bail!("timeout: is only supported on run: tasks");
+    if task.timeout.is_some() && task.run.is_none() && task.ssh.is_none() && task.fleet.is_none() {
+        bail!("timeout: is only supported on run:/ssh:/fleet: tasks");
     }
 
     if let Some(spec) = &task.wait_for {
@@ -3864,7 +4149,7 @@ fn run_task_once(
         if !env.dry {
             let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
             let (stdout, stderr, success) =
-                crate::db::ssh_exec_capture_lenient(&server, &full_cmd)?;
+                crate::db::ssh_exec_capture_lenient_with_timeout(&server, &full_cmd, task.timeout)?;
             if success {
                 let out = stdout.trim();
                 if !env.quiet && !out.is_empty() {
@@ -3909,6 +4194,7 @@ fn run_task_once(
                 spec.sudo,
                 spec.parallel,
                 spec.batch_size,
+                task.timeout,
             )?;
             let ok_count = results.iter().filter(|r| r.success).count();
             let total = results.len();
@@ -4378,7 +4664,10 @@ fn run_task_once(
             let attachments = spec
                 .attachments
                 .iter()
-                .map(|p| join_confined(&env.playbook_dir, &render(p, vars)))
+                .map(|p| {
+                    join_confined(&env.playbook_dir, &render(p, vars))
+                        .map(ConfinedPath::into_path_buf)
+                })
                 .collect::<Result<Vec<_>>>()?;
             let count = send_mail(
                 &creds,
@@ -6968,12 +7257,12 @@ mod tests {
     fn join_confined_allows_plain_relative_paths() {
         let base = Path::new("/pb/dir");
         assert_eq!(
-            join_confined(base, "out.txt").unwrap(),
-            PathBuf::from("/pb/dir/out.txt")
+            join_confined(base, "out.txt").unwrap().as_path(),
+            Path::new("/pb/dir/out.txt")
         );
         assert_eq!(
-            join_confined(base, "sub/out.txt").unwrap(),
-            PathBuf::from("/pb/dir/sub/out.txt")
+            join_confined(base, "sub/out.txt").unwrap().as_path(),
+            Path::new("/pb/dir/sub/out.txt")
         );
     }
 
@@ -6982,8 +7271,8 @@ mod tests {
         let base = Path::new("/pb/dir");
         // Wanders outside and back, but never nets below `base`.
         assert_eq!(
-            join_confined(base, "a/../b").unwrap(),
-            PathBuf::from("/pb/dir/b")
+            join_confined(base, "a/../b").unwrap().as_path(),
+            Path::new("/pb/dir/b")
         );
     }
 

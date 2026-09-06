@@ -59,6 +59,74 @@ pub(crate) fn ssh_exec_capture_lenient(
     ))
 }
 
+/// Spawns `cmd`, killing it if `timeout` (seconds) elapses first, and returns
+/// (stdout, stderr, exit_success) — the same poll+kill mechanism `run:`'s own
+/// `commands::play::run_with_timeout` uses, generalized here (both streams captured via
+/// their own reader thread, so neither can block on a full pipe buffer while the main
+/// thread polls) so `ssh_exec_*`'s timeout-aware variants can share it. `None` just
+/// waits for the command to finish, same as a plain `.output()` call.
+fn run_with_deadline(
+    mut cmd: std::process::Command,
+    timeout: Option<u64>,
+) -> Result<(String, String, bool)> {
+    use std::time::{Duration, Instant};
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .context("Failed to launch ssh — is it installed?")?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = stdout_pipe.read_to_string(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
+
+    let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("ssh command timed out after {}s", timeout.unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    Ok((
+        stdout_reader.join().unwrap_or_default(),
+        stderr_reader.join().unwrap_or_default(),
+        status.success(),
+    ))
+}
+
+/// Same as `ssh_exec_capture_lenient`, but kills the remote command if `timeout`
+/// (seconds) elapses first — see `run_with_deadline`. `None` behaves identically to
+/// `ssh_exec_capture_lenient` itself.
+pub(crate) fn ssh_exec_capture_lenient_with_timeout(
+    server: &Server,
+    command: &str,
+    timeout: Option<u64>,
+) -> Result<(String, String, bool)> {
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.args(server.ssh_args())
+        .arg(server.host_target())
+        .arg(command);
+    run_with_deadline(cmd, timeout)
+}
+
 /// Runs `command` on `server` over SSH and returns its stdout. Used for
 /// reading a remote `.env`, invoking `psql`/`mysql` remotely, and by the
 /// systemd/cron/logs commands, since this codebase's target hosting (shared
@@ -488,6 +556,29 @@ pub fn run_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_with_deadline_kills_a_hung_command_and_bails_quickly() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("5");
+        let start = std::time::Instant::now();
+        let err = run_with_deadline(cmd, Some(1)).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.to_string().contains("timed out"), "error was: {err}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "expected the timeout to cut this short, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn run_with_deadline_without_a_timeout_waits_for_completion() {
+        let mut cmd = std::process::Command::new("echo");
+        cmd.arg("hi");
+        let (stdout, _stderr, success) = run_with_deadline(cmd, None).unwrap();
+        assert!(success);
+        assert_eq!(stdout.trim(), "hi");
+    }
 
     #[test]
     fn parse_dotenv_handles_comments_quotes_and_blank_lines() {

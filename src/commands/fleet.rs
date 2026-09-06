@@ -134,9 +134,9 @@ pub(crate) struct ExecResult {
     pub(crate) stderr: String,
 }
 
-fn exec_on_server(ctx: &Context, name: &str, full_cmd: &str) -> ExecResult {
+fn exec_on_server(ctx: &Context, name: &str, full_cmd: &str, timeout: Option<u64>) -> ExecResult {
     match resolve_server(ctx, name) {
-        Ok(server) => match db::ssh_exec_capture_lenient(&server, full_cmd) {
+        Ok(server) => match db::ssh_exec_capture_lenient_with_timeout(&server, full_cmd, timeout) {
             Ok((stdout, stderr, success)) => ExecResult {
                 server: name.to_string(),
                 success,
@@ -171,9 +171,12 @@ fn exec_on_server(ctx: &Context, name: &str, full_cmd: &str) -> ExecResult {
 /// canary/rolling pattern (e.g. restart 3 servers at a time across a 20-server fleet)
 /// instead of either strictly one-at-a-time or all-at-once. `None` (or `Some(0)`,
 /// tolerated the same way a `0`/`1` batch elsewhere in this codebase degrades rather than
-/// erroring) reproduces the original all-in-one-batch behavior exactly. `tooler fleet
-/// exec` doesn't expose this yet — it always passes `None` — but every caller goes
-/// through this one function, so wiring a CLI flag for it later is a one-line change.
+/// erroring) reproduces the original all-in-one-batch behavior exactly. `timeout`
+/// (seconds) kills a target's `ssh` process if it runs longer, via
+/// `db::ssh_exec_capture_lenient_with_timeout` — one server timing out doesn't affect
+/// the others. `tooler fleet exec` doesn't expose either of these yet — it always
+/// passes `None` — but every caller goes through this one function, so wiring CLI flags
+/// for them later is a one-line change each.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_on_targets(
     ctx: &Context,
@@ -184,6 +187,7 @@ pub(crate) fn run_on_targets(
     sudo: bool,
     parallel: bool,
     batch_size: Option<usize>,
+    timeout: Option<u64>,
 ) -> Result<Vec<ExecResult>> {
     let names = resolve_targets(ctx, servers, all, group)?;
     if names.is_empty() {
@@ -200,7 +204,7 @@ pub(crate) fn run_on_targets(
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = chunk
                         .iter()
-                        .map(|name| scope.spawn(|| exec_on_server(ctx, name, &full_cmd)))
+                        .map(|name| scope.spawn(|| exec_on_server(ctx, name, &full_cmd, timeout)))
                         .collect();
                     handles
                         .into_iter()
@@ -212,7 +216,7 @@ pub(crate) fn run_on_targets(
     } else {
         Ok(names
             .iter()
-            .map(|name| exec_on_server(ctx, name, &full_cmd))
+            .map(|name| exec_on_server(ctx, name, &full_cmd, timeout))
             .collect())
     }
 }
@@ -229,7 +233,9 @@ fn exec(
     let json = ctx.output == OutputFormat::Json;
 
     let full_cmd = exec_command(command, sudo);
-    let results = match run_on_targets(ctx, servers, all, group, command, sudo, parallel, None) {
+    let results = match run_on_targets(
+        ctx, servers, all, group, command, sudo, parallel, None, None,
+    ) {
         Ok(r) => r,
         Err(e) => return fail(json, format!("{e:#}")),
     };
