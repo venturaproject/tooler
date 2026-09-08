@@ -51,7 +51,7 @@
 Downloads a prebuilt binary for your OS and architecture:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/venturaproject/tooler/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/venturaproject/tooler/main/install.sh | sh
 ```
 
 Supports: macOS (Intel + Apple Silicon), Linux (x86\_64 + arm64).
@@ -59,7 +59,7 @@ Supports: macOS (Intel + Apple Silicon), Linux (x86\_64 + arm64).
 To install a specific version:
 
 ```sh
-TOOLER_VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/venturaproject/tooler/master/install.sh | sh
+TOOLER_VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/venturaproject/tooler/main/install.sh | sh
 ```
 
 ### Option 2 — cargo (requires Rust)
