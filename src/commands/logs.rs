@@ -131,7 +131,7 @@ fn grep(
     };
     // grep exits 1 (not an error) when nothing matches -- ssh_exec_capture_lenient lets
     // us tell that apart from a real failure (e.g. file not found, exit >1).
-    let (stdout, stderr, success) =
+    let (stdout, stderr, success, _) =
         match db::ssh_exec_capture_lenient(&server, &grep_cmd(path, pattern)) {
             Ok(r) => r,
             Err(e) => return fail(json, format!("{e:#}")),

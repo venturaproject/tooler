@@ -1372,6 +1372,10 @@ struct TaskListEntry {
     /// skips).
     #[serde(skip_serializing_if = "Option::is_none")]
     include: Option<String>,
+    /// `Some(true)`/`Some(false)` for a destructive action (whether its YAML already
+    /// has `confirm: true`); `None` for every other task. See `confirm_gate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmed: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     block: Vec<TaskListEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1393,6 +1397,7 @@ fn build_task_list<'a>(tasks: impl IntoIterator<Item = &'a Task>) -> Vec<TaskLis
             action: task_action_label(t),
             tags: t.tags.clone(),
             include: t.include.as_ref().map(|s| s.file().to_string()),
+            confirmed: confirm_gate(t),
             block: t.block.as_deref().map(build_task_list).unwrap_or_default(),
             rescue: t.rescue.as_deref().map(build_task_list).unwrap_or_default(),
             always: t.always.as_deref().map(build_task_list).unwrap_or_default(),
@@ -1433,6 +1438,13 @@ fn print_task_list(playbook_name: &str, tasks: &[&Task], ctx: &Context) -> Resul
                     " {}",
                     format!("tags: [{}]", e.tags.join(", ")).dimmed()
                 ));
+            }
+            // Only the risky case (destructive, but confirm: true isn't set) gets a
+            // visible marker -- silence means safe, same "don't clutter the common
+            // case" convention --lint's findings already use. A destructive task that
+            // already has confirm: true, or a non-destructive task, prints nothing extra.
+            if e.confirmed == Some(false) {
+                line.push_str(&format!(" {}", "[needs confirm:]".red().bold()));
             }
             println!("{line}");
             for (label, sub) in [
@@ -2920,12 +2932,16 @@ fn run_notified_handlers(
         match run_task(handler, vars, include_stack, env) {
             Ok(()) => {
                 *ok += 1;
-                // A notified handler that actually ran always did something -- handlers
-                // don't currently get their own changed_when: evaluation.
+                // A handler is a real Task -- honor its own changed_when: the same way
+                // a regular task's success branch does, instead of hardcoding true.
+                let changed = match &handler.changed_when {
+                    Some(expr) => eval_when(expr, vars),
+                    None => true,
+                };
                 outcomes.push(TaskOutcome {
                     name: handler.name.clone(),
                     status: "ok",
-                    changed: true,
+                    changed,
                     error: None,
                     error_kind: None,
                 });
@@ -3922,7 +3938,7 @@ fn run_task_once(
                         .and_then(|server| {
                             crate::db::ssh_exec_capture_lenient(&server, &full_cmd).ok()
                         })
-                        .map(|(_, _, success)| success)
+                        .map(|(_, _, success, _)| success)
                         .unwrap_or(false)
                 };
                 if attempt_ok {
@@ -4349,8 +4365,18 @@ fn run_task_once(
         }
         if !env.dry {
             let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
-            let (stdout, stderr, success) =
+            let (stdout, stderr, success, code) =
                 crate::db::ssh_exec_capture_lenient_with_timeout(&server, &full_cmd, task.timeout)?;
+            // Set before the success check (not only inside the `if success` branch),
+            // same as run:'s <reg>.exit_code -- so it survives a subsequent bail! when
+            // vars is a &mut the caller already holds, letting ignore_errors: true plus
+            // a later {{reg.exit_code}} read see what actually happened.
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    format!("{reg}.exit_code"),
+                    code.map(|c| c.to_string()).unwrap_or_default(),
+                );
+            }
             if success {
                 let out = stdout.trim();
                 if !env.quiet && !out.is_empty() {
@@ -4411,6 +4437,14 @@ fn run_task_once(
             }
             if let Some(reg) = &task.register {
                 vars.insert(reg.clone(), format!("{ok_count}/{total}"));
+                // Per-server detail (server/success/stdout/stderr/exit_code) alongside
+                // the plain ok_count/total summary above -- same <name>.results
+                // convention loop:/db_query:/etc. already use, so an agent can find
+                // exactly which server(s) failed and why via
+                // loop: {from: "{{reg.results}}"} or a | json: pull, not just "3/5".
+                let json = serde_json::to_string(&results)
+                    .expect("serializing Vec<ExecResult> to JSON cannot fail");
+                vars.insert(format!("{reg}.results"), json);
             }
             if !all_succeeded {
                 bail!("{ok_count}/{total} servers succeeded");
@@ -4505,7 +4539,7 @@ fn run_task_once(
         }
         if !env.dry {
             let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
-            let (stdout, stderr, active) = crate::db::ssh_exec_capture_lenient(
+            let (stdout, stderr, active, _) = crate::db::ssh_exec_capture_lenient(
                 &server,
                 &crate::commands::systemd::status_cmd(&unit),
             )?;
@@ -4573,7 +4607,7 @@ fn run_task_once(
         }
         if !env.dry {
             let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
-            let (stdout, stderr, success) = crate::db::ssh_exec_capture_lenient(
+            let (stdout, stderr, success, _) = crate::db::ssh_exec_capture_lenient(
                 &server,
                 &crate::commands::logs::grep_cmd(&path, &pattern),
             )?;
@@ -4745,7 +4779,7 @@ fn run_task_once(
                 crate::db::shell_quote(&from),
                 crate::db::shell_quote(&to),
             );
-            let (stdout, stderr, success) = crate::db::ssh_exec_capture_lenient(&server, &cmd)?;
+            let (stdout, stderr, success, _) = crate::db::ssh_exec_capture_lenient(&server, &cmd)?;
             if success {
                 let out = stdout.trim();
                 if !env.quiet {
@@ -5067,6 +5101,30 @@ fn run_task_once(
 /// Same field list its "no action" error enumerates, checked in the same order; a task
 /// with no action field set never reaches here in practice (`run_task_once` rejects it
 /// first), so `"unknown"` is just a safe fallback, not an expected case.
+/// Whether `task` is one of the 5 confirm:-gated destructive actions
+/// (fs_write:/systemd_restart:/ps_kill:/db_exec:/secret_set: -- see `Confirmed<T>`/
+/// `RequiresConfirm` above), and if so, whether its own YAML already sets that gate.
+/// `None` for every other action -- most tasks aren't destructive at all, so
+/// --list-tasks's output only carries this where it means something.
+fn confirm_gate(task: &Task) -> Option<bool> {
+    if let Some(s) = &task.fs_write {
+        return Some(s.is_confirmed());
+    }
+    if let Some(s) = &task.systemd_restart {
+        return Some(s.is_confirmed());
+    }
+    if let Some(s) = &task.ps_kill {
+        return Some(s.is_confirmed());
+    }
+    if let Some(s) = &task.db_exec {
+        return Some(s.is_confirmed());
+    }
+    if let Some(s) = &task.secret_set {
+        return Some(s.is_confirmed());
+    }
+    None
+}
+
 fn task_action_label(task: &Task) -> &'static str {
     // A plain bool, not an Option<T>, so it doesn't fit the check! macro below.
     if task.flush_handlers {

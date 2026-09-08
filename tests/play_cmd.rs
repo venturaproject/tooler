@@ -3682,3 +3682,140 @@ fn error_kind_falls_back_to_other_for_an_unrecognized_failure() {
     let value = last_line_json(&out);
     assert_eq!(value["tasks"][0]["error_kind"], "other");
 }
+
+#[test]
+fn ssh_register_exit_code_is_populated_on_a_connection_failure() {
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args(["server", "add", "s1", "--host", "127.0.0.1", "--port", "1"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: SshExitCode\ntasks:\n  - name: connect\n    ssh:\n      server: s1\n      \
+         command: echo hi\n    register: r\n    ignore_errors: true\n  - name: show it\n    \
+         debug: \"code={{r.exit_code}}\"\n",
+    )
+    .unwrap();
+
+    // Not asserting the exact OS exit code (ssh-version/platform-dependent) -- just
+    // that it's populated with something numeric and non-zero, proving the plumbing
+    // reaches ssh: the same way run:'s <reg>.exit_code already works.
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml"])
+            .timeout(std::time::Duration::from_secs(15))
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("code="), "stdout was: {out}");
+    assert!(!out.contains("code=\n"), "stdout was: {out}");
+}
+
+#[test]
+fn fleet_register_results_captures_per_server_exit_code() {
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args(["server", "add", "s1", "--host", "127.0.0.1", "--port", "1"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: FleetExitCode\ntasks:\n  - name: fan out\n    fleet:\n      servers: s1\n      \
+         command: echo hi\n    register: r\n    ignore_errors: true\n  - name: show it\n    \
+         debug: \"{{r.results}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml"])
+            .timeout(std::time::Duration::from_secs(15))
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("\"server\":\"s1\""), "stdout was: {out}");
+    assert!(out.contains("\"exit_code\":"), "stdout was: {out}");
+}
+
+#[test]
+fn list_tasks_flags_a_destructive_task_missing_confirm() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: NeedsConfirm\ntasks:\n  - name: set a secret\n    \
+         secret_set:\n      profile: test\n      key: k\n      value: v\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--list-tasks"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["tasks"][0]["confirmed"], false);
+}
+
+#[test]
+fn list_tasks_shows_confirmed_true_when_the_yaml_already_sets_it() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: AlreadyConfirmed\ntasks:\n  - name: set a secret\n    \
+         secret_set:\n      profile: test\n      key: k\n      value: v\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--list-tasks"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["tasks"][0]["confirmed"], true);
+}
+
+#[test]
+fn list_tasks_omits_confirmed_entirely_for_a_non_destructive_task() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: NotDestructive\ntasks:\n  - name: t1\n    run: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--list-tasks"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        value["tasks"][0].get("confirmed").is_none(),
+        "expected `confirmed` to be entirely absent, got: {value}"
+    );
+}
+
+#[test]
+fn changed_when_on_a_handler_is_respected_not_hardcoded_true() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: HandlerChanged\nhandlers:\n  - name: restart\n    run: echo restarted\n    \
+         changed_when: \"false\"\ntasks:\n  - name: t1\n    run: echo t1\n    notify: [restart]\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    let handler_outcome = value["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "restart")
+        .expect("handler outcome present");
+    assert_eq!(handler_outcome["changed"], false);
+}

@@ -37,15 +37,17 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Runs `command` on `server` over SSH and returns (stdout, stderr, exit_success)
-/// without bailing on a non-zero exit. Used where a non-zero exit is itself
+/// Runs `command` on `server` over SSH and returns (stdout, stderr, exit_success,
+/// exit_code) without bailing on a non-zero exit. Used where a non-zero exit is itself
 /// meaningful output rather than a hard failure -- e.g. `systemctl status` on a
 /// stopped unit, or `crontab -l` for a user with no crontab (exit 1, informative
-/// stderr, not an error worth surfacing as one).
+/// stderr, not an error worth surfacing as one). `exit_code` is `None` only when the
+/// process was killed by a signal rather than exiting normally (Unix-only distinction --
+/// see `std::process::ExitStatus::code`).
 pub(crate) fn ssh_exec_capture_lenient(
     server: &Server,
     command: &str,
-) -> Result<(String, String, bool)> {
+) -> Result<(String, String, bool, Option<i32>)> {
     let output = std::process::Command::new("ssh")
         .args(server.ssh_args())
         .arg(server.host_target())
@@ -56,6 +58,7 @@ pub(crate) fn ssh_exec_capture_lenient(
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
         output.status.success(),
+        output.status.code(),
     ))
 }
 
@@ -115,7 +118,7 @@ pub(crate) fn kill_process_group(child: &mut std::process::Child) {
 fn run_with_deadline(
     mut cmd: std::process::Command,
     timeout: Option<u64>,
-) -> Result<(String, String, bool)> {
+) -> Result<(String, String, bool, Option<i32>)> {
     use std::time::{Duration, Instant};
     isolate_process_group(&mut cmd);
     cmd.stdout(std::process::Stdio::piped());
@@ -157,6 +160,7 @@ fn run_with_deadline(
         stdout_reader.join().unwrap_or_default(),
         stderr_reader.join().unwrap_or_default(),
         status.success(),
+        status.code(),
     ))
 }
 
@@ -167,7 +171,7 @@ pub(crate) fn ssh_exec_capture_lenient_with_timeout(
     server: &Server,
     command: &str,
     timeout: Option<u64>,
-) -> Result<(String, String, bool)> {
+) -> Result<(String, String, bool, Option<i32>)> {
     let mut cmd = std::process::Command::new("ssh");
     cmd.args(server.ssh_args())
         .arg(server.host_target())
@@ -182,7 +186,7 @@ pub(crate) fn ssh_exec_capture_lenient_with_timeout(
 /// an SSH tunnel + local DB driver in favor of running everything directly
 /// on the remote host over a plain SSH exec.
 pub(crate) fn ssh_exec_capture(server: &Server, command: &str) -> Result<String> {
-    let (stdout, stderr, success) = ssh_exec_capture_lenient(server, command)?;
+    let (stdout, stderr, success, _) = ssh_exec_capture_lenient(server, command)?;
     if !success {
         bail!(
             "remote command failed on {}: {}",
@@ -623,7 +627,7 @@ mod tests {
     fn run_with_deadline_without_a_timeout_waits_for_completion() {
         let mut cmd = std::process::Command::new("echo");
         cmd.arg("hi");
-        let (stdout, _stderr, success) = run_with_deadline(cmd, None).unwrap();
+        let (stdout, _stderr, success, _code) = run_with_deadline(cmd, None).unwrap();
         assert!(success);
         assert_eq!(stdout.trim(), "hi");
     }

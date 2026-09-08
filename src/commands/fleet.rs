@@ -132,22 +132,28 @@ pub(crate) struct ExecResult {
     pub(crate) success: bool,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
+    /// The remote command's real numeric exit code -- `None` when there was no process
+    /// to have one (server didn't resolve, or `ssh` itself failed to launch), or on a
+    /// signal kill (Unix-only distinction -- see `std::process::ExitStatus::code`).
+    pub(crate) exit_code: Option<i32>,
 }
 
 fn exec_on_server(ctx: &Context, name: &str, full_cmd: &str, timeout: Option<u64>) -> ExecResult {
     match resolve_server(ctx, name) {
         Ok(server) => match db::ssh_exec_capture_lenient_with_timeout(&server, full_cmd, timeout) {
-            Ok((stdout, stderr, success)) => ExecResult {
+            Ok((stdout, stderr, success, exit_code)) => ExecResult {
                 server: name.to_string(),
                 success,
                 stdout,
                 stderr,
+                exit_code,
             },
             Err(e) => ExecResult {
                 server: name.to_string(),
                 success: false,
                 stdout: String::new(),
                 stderr: format!("{e:#}"),
+                exit_code: None,
             },
         },
         Err(e) => ExecResult {
@@ -155,6 +161,7 @@ fn exec_on_server(ctx: &Context, name: &str, full_cmd: &str, timeout: Option<u64
             success: false,
             stdout: String::new(),
             stderr: format!("{e:#}"),
+            exit_code: None,
         },
     }
 }
@@ -291,7 +298,7 @@ fn check_on_server(ctx: &Context, name: &str) -> CheckResult {
         Ok(server) => {
             let host = server.host_target();
             match db::ssh_exec_capture_lenient(&server, "echo ok") {
-                Ok((_, stderr, success)) => CheckResult {
+                Ok((_, stderr, success, _)) => CheckResult {
                     server: name.to_string(),
                     host,
                     success,

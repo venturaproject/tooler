@@ -290,7 +290,7 @@ fn remove_local(pattern: &str, ctx: &Context) -> Result<()> {
 }
 
 fn fetch_crontab(server: &crate::config::Server) -> Result<String> {
-    let (stdout, stderr, success) = db::ssh_exec_capture_lenient(server, "crontab -l")?;
+    let (stdout, stderr, success, _) = db::ssh_exec_capture_lenient(server, "crontab -l")?;
     if success {
         Ok(stdout)
     } else if is_no_crontab_error(&stderr) {

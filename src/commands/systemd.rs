@@ -108,7 +108,7 @@ fn status(server_name: &str, unit: &str, ctx: &Context) -> Result<()> {
         Err(e) => return fail(json, format!("{e:#}")),
     };
     let (output, active) = match db::ssh_exec_capture_lenient(&server, &status_cmd(unit)) {
-        Ok((stdout, stderr, success)) => (merge_output(stdout, stderr), success),
+        Ok((stdout, stderr, success, _)) => (merge_output(stdout, stderr), success),
         Err(e) => return fail(json, format!("{e:#}")),
     };
 
