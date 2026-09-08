@@ -40,6 +40,7 @@
 - [Extending tooler](#extending-tooler)
 - [Releasing a new version](#releasing-a-new-version)
 - [Dependencies](#dependencies)
+- [License](#license)
 
 ---
 
@@ -1455,3 +1456,9 @@ Builds for: `linux/x86_64`, `linux/aarch64`, `macos/x86_64`, `macos/aarch64`, `w
 | `csv` | CSV parsing/writing (`read_csv:`/`write_csv:` playbook tasks) |
 | `similar` | Unified line diffs (`tooler play --diff`) |
 | `aes-gcm` + `argon2` + `base64` | File encryption (`tooler vault`, vault-encrypted `vars_files:`/`--vars-file`) |
+
+---
+
+## License
+
+[MIT](LICENSE)

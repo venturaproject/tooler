@@ -4,10 +4,19 @@ version = "0.5.0"
 edition = "2024"
 description = "A modular CLI toolkit"
 authors = ["Antonio Ventura <antonioventura.j@gmail.com>"]
+license = "MIT"
 
 [[bin]]
 name = "tooler"
 path = "src/main.rs"
+
+# Tuned for a CLI distributed as prebuilt binaries (see release.yml) rather than a
+# library other crates compile against: smaller, somewhat faster-starting executables in
+# exchange for a slower release build (already several minutes in CI regardless).
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
 
 [dependencies]
 clap = { version = "4", features = ["derive", "color", "env"] }
