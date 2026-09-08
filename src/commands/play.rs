@@ -117,11 +117,21 @@ pub struct PlayArgs {
     /// 0; findings are advisory.
     #[arg(long)]
     pub lint: bool,
+
+    /// Dump the whole playbook DSL (every task action's fields, and their types) as a
+    /// formal JSON Schema document to stdout, and exit. Needs no FILE and no project --
+    /// unlike --list-tasks/--lint, this describes the *language*, not one playbook. For
+    /// an agent about to write or validate a playbook, or any other schema-aware
+    /// tooling.
+    #[arg(long)]
+    pub schema: bool,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+/// The playbook DSL's root. Every field here and on `Task`/its nested `*Spec` structs
+/// is dumped as a formal JSON Schema document by `tooler play --schema` (see `run()`).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Playbook {
     name: String,
@@ -142,7 +152,7 @@ struct Playbook {
     handlers: Vec<Task>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Task {
     name: String,
@@ -401,7 +411,7 @@ struct Task {
 }
 
 /// One `loop:` item — a plain scalar (`{{item}}`) or a map (`{{item.<field>}}` per key).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, schemars::JsonSchema)]
 #[serde(untagged)]
 enum LoopItem {
     Scalar(String),
@@ -412,7 +422,7 @@ enum LoopItem {
 /// source resolved at task-run time from a rendered var. `serde`'s untagged matching tries
 /// `Static` first; a YAML sequence (`loop: [a, b, c]`) parses as `Static`, and a mapping
 /// with a `from:` key (`loop: {from: "{{items}}"}`) parses as `Dynamic`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 enum LoopSpec {
     Static(Vec<LoopItem>),
@@ -432,7 +442,7 @@ enum LoopSpec {
 /// checking several conditions in one task with its own failure message. `serde`'s
 /// untagged matching tries `Simple` first; a bare YAML string parses as `Simple`, and a
 /// mapping with a `that:` key parses as `Structured`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 enum AssertSpec {
     Simple(String),
@@ -447,7 +457,7 @@ enum AssertSpec {
 /// adding `env:` to inject extra environment variables into the spawned subprocess
 /// directly, instead of interpolating them into the command string by hand (which needs
 /// `| quote` to be safe and doesn't compose well with values containing spaces/quotes).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(untagged, deny_unknown_fields)]
 enum RunSpec {
     Simple(String),
@@ -504,7 +514,7 @@ fn resolve_loop_items(spec: &LoopSpec, vars: &HashMap<String, String>) -> Vec<Lo
 /// a mapping with per-call `vars:` overrides. `serde` tries `Simple` first: a bare scalar
 /// (`include: sub.yml`) parses as `Simple`; a mapping (`include: {file: sub.yml, vars:
 /// {...}}`) parses as `WithVars`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 enum IncludeSpec {
     Simple(String),
@@ -532,7 +542,7 @@ impl IncludeSpec {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SshSpec {
     /// Server profile name (see: tooler server list)
@@ -542,7 +552,7 @@ struct SshSpec {
     sudo: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FleetSpec {
     /// Comma-separated server profile names (mutually exclusive with all/group)
@@ -570,7 +580,7 @@ struct FleetSpec {
 
 /// `fs_cat:` — reads a remote file over SSH via `commands::fs::cat_cmd`, the same
 /// command builder `tooler fs cat` uses.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FsCatSpec {
     /// Server profile name (see: tooler server list)
@@ -621,7 +631,7 @@ impl<'a, T> std::ops::Deref for Confirmed<'a, T> {
 /// `db_exec:` uses — overwriting a remote file is just as destructive/hard-to-reverse as
 /// a DML write, and a playbook has no interactive `--confirm` re-run step the way the
 /// standalone `tooler fs write` command does.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FsWriteSpec {
     server: String,
@@ -642,7 +652,7 @@ impl RequiresConfirm for FsWriteSpec {
 /// Deliberately requires `confirm: true` in the YAML itself, same non-negotiable gate
 /// `fs_write:`/`ps_kill:`/`db_exec:` use — restarting a live service is just as
 /// disruptive as a write or a kill.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SystemdRestartSpec {
     server: String,
@@ -667,7 +677,7 @@ impl RequiresConfirm for SystemdRestartSpec {
 /// Never fails the task on an inactive unit — same query-not-control behavior
 /// `tooler systemd status` already has; use `assert:`/`when:` on the registered
 /// `<reg>.active` to decide what an inactive unit means for the playbook.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SystemdStatusSpec {
     server: String,
@@ -678,7 +688,7 @@ struct SystemdStatusSpec {
 /// line count is ever printed (never the content, which could contain sensitive data) —
 /// `register:` (if set) captures a JSON array of lines, same `loop: {from: "{{reg}}"}`
 /// -chainable convention as `db_query:`/`scrape:`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct LogsTailSpec {
     server: String,
@@ -694,7 +704,7 @@ fn default_tail_lines() -> u32 {
 
 /// `logs_grep:` — searches a remote file over SSH via `commands::logs::grep_cmd` (a
 /// fixed-substring match, not a regex). Same content-hiding convention as `logs_tail:`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct LogsGrepSpec {
     server: String,
@@ -713,7 +723,7 @@ fn default_grep_max_lines() -> usize {
 /// `ps_list:` — lists remote processes over SSH via `commands::ps::parse_ps_aux`/
 /// `apply_filter`. Same content-hiding convention as `fs_cat:`/`logs_tail:`: row-shaped
 /// data, so only the count prints; `register:` captures the JSON array.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PsListSpec {
     server: String,
@@ -725,7 +735,7 @@ struct PsListSpec {
 /// `ps_kill:` — sends a signal to a remote process via `commands::ps::kill_cmd`.
 /// Deliberately requires `confirm: true` in the YAML itself, same non-negotiable gate
 /// `db_exec:`/`fs_write:` use.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PsKillSpec {
     server: String,
@@ -754,7 +764,7 @@ fn default_kill_signal() -> String {
 /// `parse_sections`. A single small operational status blob, not row-shaped bulk data,
 /// so it prints directly (same as `systemd_status:`); `register:` captures
 /// `{uptime, memory, disk}` as JSON for `report:`/`mail:` chaining.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct StatSpec {
     server: String,
@@ -763,13 +773,13 @@ struct StatSpec {
 /// `git_summary:` — the local repo's branch/tag/status/recent-commits summary via
 /// `commands::git::compute_summary`, run against the playbook's own directory (same cwd
 /// convention `run:` already has). No fields; invoked as `git_summary: {}`.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitSummarySpec {}
 
 /// `git_changelog:` — commits since the last tag (or `from:`), categorized into
 /// features/fixes/other, via `commands::git::compute_changelog`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitChangelogSpec {
     /// Starting tag or commit (defaults to the latest tag)
@@ -780,7 +790,7 @@ struct GitChangelogSpec {
 /// `gh_prs:` — lists GitHub pull requests via `commands::gh::fetch_prs` (shells out to
 /// the `gh` CLI). Row-shaped external data like `db_query:`, so only the count prints;
 /// `register:` captures the JSON array, directly chainable into `report:`/`loop:`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GhPrsSpec {
     /// Repository as owner/name (defaults to the repo in the playbook's own directory)
@@ -806,7 +816,7 @@ fn default_pr_limit() -> u32 {
     500
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DbSyncSpec {
     /// Server profile to run mysqldump/pg_dump + mysql/psql through (both sides)
@@ -818,7 +828,7 @@ struct DbSyncSpec {
 /// One side of a `sync_db:` task — either `env:` (a remote dotenv-style file, e.g. a
 /// Laravel `.env`, to read DB_* credentials from) or the explicit fields. Mirrors
 /// `commands::db::ConnOpts`, which `resolve_db_sync_creds` delegates to.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DbSyncSide {
     #[serde(default)]
@@ -837,7 +847,7 @@ struct DbSyncSide {
     password: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SyncFilesSpec {
     /// Server profile (see: tooler server list)
@@ -849,7 +859,7 @@ struct SyncFilesSpec {
     delete: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CheckPortSpec {
     host: String,
@@ -858,7 +868,7 @@ struct CheckPortSpec {
     timeout: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EnvCheckSpec {
     reference: String,
@@ -866,7 +876,7 @@ struct EnvCheckSpec {
     target: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct HttpSpec {
     #[serde(default = "default_http_method")]
@@ -898,7 +908,7 @@ struct HttpSpec {
 /// Distinct from `retries:`, which retries a whole task on *failure*; `wait_for:` is for
 /// "keep checking until this becomes true" (e.g. wait for a service to come back up after
 /// a restart), so it doesn't log every attempt the way `retries:` does.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WaitForSpec {
     #[serde(default)]
@@ -927,7 +937,7 @@ fn default_wait_timeout() -> u64 {
     60
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ScrapeSpec {
     url: String,
@@ -947,7 +957,7 @@ struct ScrapeSpec {
 /// uses (`report::{pdf,excel,html}::build`), but fed inline data instead of file paths,
 /// so a `register:`ed `http:`/`scrape:` result can go straight into a report with no
 /// temp-file round-trip.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReportSpec {
     /// "html", "pdf", or "excel"
@@ -972,7 +982,7 @@ fn default_report_title() -> String {
 /// directory), creating parent directories as needed. `path` is confined to that
 /// directory by `join_confined` — an absolute path or a `..` that nets outside it is
 /// rejected, rather than silently writing wherever a rendered `{{var}}` happened to point.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WriteFileSpec {
     path: String,
@@ -987,7 +997,7 @@ struct WriteFileSpec {
 /// uses the first row as field names, producing one JSON object per row; `headers: false`
 /// produces plain arrays instead. Every cell comes back as a JSON string -- no type
 /// guessing, same "let the consumer decide" philosophy `parse_mysql_tsv` already uses.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadCsvSpec {
     path: String,
@@ -1006,7 +1016,7 @@ struct ReadCsvSpec {
 /// order is alphabetical, not YAML/JSON source order; an array of plain values/arrays is
 /// written as raw rows (`headers:` has no effect — there are no field names to derive a
 /// header from).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WriteCsvSpec {
     path: String,
@@ -1033,7 +1043,7 @@ fn json_cell_to_string(value: &serde_json::Value) -> String {
 
 /// `db_query:` — mirrors `commands::db::DbSubcommand::Query`'s fields exactly, so the
 /// mental model transfers 1:1 from the standalone `tooler db query` command.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DbQuerySpec {
     /// Server profile to run the query through (see: tooler server list)
@@ -1070,7 +1080,7 @@ fn default_db_max_rows() -> usize {
 /// only, no DDL). `confirm` must be `true` in the YAML itself -- the same "never runs
 /// silently" posture `tooler db restore --confirm` uses on the CLI, just expressed as a
 /// visible task field instead of a flag, so it shows up in a code review/diff.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DbExecSpec {
     server: String,
@@ -1102,7 +1112,7 @@ impl RequiresConfirm for DbExecSpec {
 
 /// `secret_set:` — writes `value` into the OS keychain under `profile`/`key`, the same
 /// store `{{secret.<profile>.<key>}}` reads from.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SecretSetSpec {
     profile: String,
@@ -1124,7 +1134,7 @@ impl RequiresConfirm for SecretSetSpec {
 /// explicit `host`/`port`/`user`/`password`/`tls` fields win over the named `server:`
 /// profile (`config.mail.<name>` + the OS keychain), which wins over `TOOLER_MAIL_PASSWORD`
 /// for the password specifically.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MailSpec {
     /// Mail profile to send through (see: tooler config set mail.<name>.host, and
@@ -1166,7 +1176,7 @@ struct MailSpec {
 /// inline host/user/password the way `mail:`/`db_query:` allow): narrower, newer, and a
 /// profile is the common case since IMAP shares the same mailbox login `mail:` already
 /// uses. See `fetch_mail`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MailCheckSpec {
     /// Mail profile to read from (see: tooler config set mail.<name>.imap_port, etc).
@@ -1841,6 +1851,15 @@ fn apply_var_overrides(vars: &mut HashMap<String, String>, raw: &[String]) -> Re
 }
 
 pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
+    // Describes the DSL itself, not a playbook -- runs before project::load() (unlike
+    // every other early-exit flag below) so it works with no project and no FILE, the
+    // same way --help would.
+    if args.schema {
+        let schema = schemars::schema_for!(Playbook);
+        println!("{}", serde_json::to_string_pretty(&schema)?);
+        return Ok(());
+    }
+
     let (_, project_root) = project::load()?;
     let playbooks_dir = project_root.join("playbooks");
 

@@ -3492,3 +3492,56 @@ fn a_typo_d_task_field_fails_clearly_instead_of_being_silently_ignored() {
         "stderr was: {stderr}"
     );
 }
+
+/// `--schema` describes the DSL itself, not one playbook -- it needs no FILE and no
+/// project. `tooler()`'s temp dir has no `.tooler.toml` at all, proving this literally
+/// rather than only by reading `run()`'s dispatch order.
+#[test]
+fn schema_prints_valid_json_with_no_file_and_no_project() {
+    let (mut cmd, _dir) = tooler();
+    let out = cmd.args(["play", "--schema"]).assert().success();
+    let stdout = stdout_of(out);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--schema output was not valid JSON");
+    assert_eq!(parsed["type"], "object");
+}
+
+#[test]
+fn schema_top_level_describes_the_tasks_array() {
+    let (mut cmd, _dir) = tooler();
+    let out = cmd.args(["play", "--schema"]).assert().success();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_of(out)).unwrap();
+    assert!(
+        parsed["properties"]["tasks"].is_object(),
+        "expected a top-level `tasks` property, got: {parsed}"
+    );
+}
+
+/// Lightweight regression guard: every `Task` field gets `JsonSchema` for free since
+/// it's derived at the struct level, but this catches a future field whose *type*
+/// doesn't implement `JsonSchema` (which would fail to compile, not silently vanish --
+/// still worth a test naming the exact fields this round added, so a `cargo check`
+/// failure on one of them points straight back here).
+#[test]
+fn schema_mentions_every_new_task_action() {
+    let (mut cmd, _dir) = tooler();
+    let out = cmd.args(["play", "--schema"]).assert().success();
+    let stdout = stdout_of(out);
+    for action in ["run", "assert", "secret_set", "loop", "confirm", "block"] {
+        assert!(
+            stdout.contains(&format!("\"{action}\"")),
+            "schema is missing task action `{action}`"
+        );
+    }
+}
+
+#[test]
+fn schema_ignores_unrelated_flags_and_still_just_prints_the_schema() {
+    let (mut cmd, _dir) = tooler();
+    let out = cmd
+        .args(["play", "--schema", "--dry", "--yes"])
+        .assert()
+        .success();
+    let stdout = stdout_of(out);
+    serde_json::from_str::<serde_json::Value>(&stdout).expect("still valid JSON");
+}

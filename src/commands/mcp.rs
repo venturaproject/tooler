@@ -469,6 +469,12 @@ struct PlayMcpArgs {
     /// are advisory, not a hard failure
     #[serde(default)]
     lint: bool,
+    /// Dump the whole playbook DSL (every task action's fields, and their types) as a
+    /// formal JSON Schema document and exit -- no file needed, this describes the
+    /// language itself, not one playbook. For an agent about to write or validate a
+    /// playbook.
+    #[serde(default)]
+    schema: bool,
     cwd: Option<String>,
 }
 
@@ -1494,7 +1500,10 @@ impl ToolerMcp {
                         of starting over — start_at_task and resume are mutually exclusive. \
                         list_tasks/list_tags/lint inspect a playbook with zero side effects \
                         (no vars_files:/secrets resolution, no connections, nothing run) \
-                        instead of executing it — useful before committing to a real run",
+                        instead of executing it — useful before committing to a real run. \
+                        schema=true dumps the whole playbook DSL itself as a formal JSON \
+                        Schema document and exits — no file needed, for grounding an agent \
+                        before it writes or validates a playbook",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1525,6 +1534,7 @@ impl ToolerMcp {
         push_flag(&mut argv, "--list-tasks", args.list_tasks);
         push_flag(&mut argv, "--list-tags", args.list_tags);
         push_flag(&mut argv, "--lint", args.lint);
+        push_flag(&mut argv, "--schema", args.schema);
         self.exec_self(argv, &args.cwd).await
     }
 
@@ -2760,6 +2770,7 @@ mod tests {
             "list_tasks",
             "list_tags",
             "lint",
+            "schema",
             "cwd",
         ];
 
