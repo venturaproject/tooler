@@ -2347,7 +2347,39 @@ fn run_repl(mut vars: HashMap<String, String>, env: RunEnv) -> Result<()> {
 struct TaskOutcome {
     name: String,
     status: &'static str,
+    /// Whether this task's success is considered a real effect (see `changed_when:`).
+    /// Always `false` for `skipped`/`ignored`/`failed` -- only a real `ok` success can
+    /// be "changed", same scope `changed_when:` itself already has.
+    changed: bool,
     error: Option<String>,
+    /// Best-effort classification of `error`, so an agent can match on a stable
+    /// category instead of parsing free-text -- see `classify_error`. `None` whenever
+    /// `error` is `None`.
+    error_kind: Option<&'static str>,
+}
+
+/// Best-effort classification of a task failure's message into a coarse, stable
+/// category an agent can match on instead of parsing free-text `error`. Heuristic, not
+/// exhaustive -- same "advisory, not a formal verifier" spirit as `--lint`'s findings:
+/// message shapes this codebase itself controls are recognized by their known
+/// prefixes/substrings; anything else (a raw ssh/rsync/db subprocess's own stderr,
+/// mostly) falls back to "other" rather than being guessed at.
+fn classify_error(msg: &str) -> &'static str {
+    if msg.contains("refused to run without confirm: true") {
+        "confirm_required"
+    } else if msg.starts_with("assertion failed") {
+        "assertion"
+    } else if msg.starts_with("command exited with code") {
+        "exit_code"
+    } else if msg.contains("timed out") {
+        "timeout"
+    } else if msg.starts_with("HTTP ") {
+        "http_status"
+    } else if msg.contains("not configured") || msg.contains("tooler config set") {
+        "config"
+    } else {
+        "other"
+    }
 }
 
 /// `--resume`'s on-disk checkpoint — a sibling of the playbook file (`<file>.state.json`,
@@ -2629,7 +2661,9 @@ fn execute_playbook(
             outcomes.push(TaskOutcome {
                 name: task.name.clone(),
                 status: "skipped",
+                changed: false,
                 error: None,
+                error_kind: None,
             });
             if is_top_level && !env.dry {
                 write_checkpoint(env, &playbook.name, &task.name, vars);
@@ -2646,7 +2680,9 @@ fn execute_playbook(
                 outcomes.push(TaskOutcome {
                     name: task.name.clone(),
                     status: "skipped",
+                    changed: false,
                     error: None,
+                    error_kind: None,
                 });
             } else {
                 run_notified_handlers(
@@ -2668,7 +2704,9 @@ fn execute_playbook(
                 outcomes.push(TaskOutcome {
                     name: task.name.clone(),
                     status: "ok",
+                    changed: false,
                     error: None,
+                    error_kind: None,
                 });
             }
             if is_top_level && !env.dry {
@@ -2689,20 +2727,24 @@ fn execute_playbook(
                     outcomes.push(TaskOutcome {
                         name: task.name.clone(),
                         status: "skipped",
+                        changed: false,
                         error: None,
+                        error_kind: None,
                     });
                 } else {
                     ok += 1;
-                    outcomes.push(TaskOutcome {
-                        name: task.name.clone(),
-                        status: "ok",
-                        error: None,
-                    });
-
                     let changed = match &task.changed_when {
                         Some(expr) => eval_when(expr, vars),
                         None => true,
                     };
+                    outcomes.push(TaskOutcome {
+                        name: task.name.clone(),
+                        status: "ok",
+                        changed,
+                        error: None,
+                        error_kind: None,
+                    });
+
                     if changed {
                         for h in &task.notify {
                             if !notified.contains(h) {
@@ -2713,6 +2755,8 @@ fn execute_playbook(
                 }
             }
             Err(e) => {
+                let msg = e.to_string();
+                let kind = classify_error(&msg);
                 if task.ignore_errors {
                     if !json {
                         println!("  {} failed (ignored): {e}", "!".yellow().bold());
@@ -2721,14 +2765,18 @@ fn execute_playbook(
                     outcomes.push(TaskOutcome {
                         name: task.name.clone(),
                         status: "ignored",
-                        error: Some(e.to_string()),
+                        changed: false,
+                        error: Some(msg),
+                        error_kind: Some(kind),
                     });
                 } else {
                     failed += 1;
                     outcomes.push(TaskOutcome {
                         name: task.name.clone(),
                         status: "failed",
-                        error: Some(e.to_string()),
+                        changed: false,
+                        error: Some(msg),
+                        error_kind: Some(kind),
                     });
 
                     if json {
@@ -2742,6 +2790,7 @@ fn execute_playbook(
                                 "ok": ok,
                                 "failed": failed,
                                 "skipped": skipped,
+                                "changed": outcomes.iter().filter(|o| o.changed).count(),
                                 "success": false,
                             })
                         );
@@ -2759,7 +2808,12 @@ fn execute_playbook(
                         task.name.bold(),
                         "Remaining tasks skipped.".dimmed()
                     );
-                    print_recap(ok, failed, skipped);
+                    print_recap(
+                        ok,
+                        failed,
+                        skipped,
+                        outcomes.iter().filter(|o| o.changed).count(),
+                    );
                     bail!("playbook failed");
                 }
             }
@@ -2814,6 +2868,7 @@ fn execute_playbook(
                 "ok": ok,
                 "failed": failed,
                 "skipped": skipped,
+                "changed": outcomes.iter().filter(|o| o.changed).count(),
                 "success": true,
             })
         );
@@ -2821,7 +2876,12 @@ fn execute_playbook(
     }
 
     println!("\n{}", sep.dimmed());
-    print_recap(ok, failed, skipped);
+    print_recap(
+        ok,
+        failed,
+        skipped,
+        outcomes.iter().filter(|o| o.changed).count(),
+    );
     Ok(())
 }
 
@@ -2860,18 +2920,26 @@ fn run_notified_handlers(
         match run_task(handler, vars, include_stack, env) {
             Ok(()) => {
                 *ok += 1;
+                // A notified handler that actually ran always did something -- handlers
+                // don't currently get their own changed_when: evaluation.
                 outcomes.push(TaskOutcome {
                     name: handler.name.clone(),
                     status: "ok",
+                    changed: true,
                     error: None,
+                    error_kind: None,
                 });
             }
             Err(e) => {
                 *failed += 1;
+                let msg = e.to_string();
+                let kind = classify_error(&msg);
                 outcomes.push(TaskOutcome {
                     name: handler.name.clone(),
                     status: "failed",
-                    error: Some(e.to_string()),
+                    changed: false,
+                    error: Some(msg),
+                    error_kind: Some(kind),
                 });
 
                 if json {
@@ -2885,6 +2953,7 @@ fn run_notified_handlers(
                             "ok": *ok,
                             "failed": *failed,
                             "skipped": skipped,
+                            "changed": outcomes.iter().filter(|o| o.changed).count(),
                             "success": false,
                         })
                     );
@@ -2901,7 +2970,12 @@ fn run_notified_handlers(
                     "PLAY".bold().red(),
                     handler.name.bold()
                 );
-                print_recap(*ok, *failed, skipped);
+                print_recap(
+                    *ok,
+                    *failed,
+                    skipped,
+                    outcomes.iter().filter(|o| o.changed).count(),
+                );
                 bail!("playbook failed");
             }
         }
@@ -5919,9 +5993,9 @@ fn render_for_display(s: &str, vars: &HashMap<String, String>) -> String {
     })
 }
 
-fn print_recap(ok: usize, failed: usize, skipped: usize) {
+fn print_recap(ok: usize, failed: usize, skipped: usize, changed: usize) {
     println!(
-        "\n{}  {}  {}  {}",
+        "\n{}  {}  {}  {}  {}",
         "RECAP".bold(),
         format!("ok={ok}").green().bold(),
         if failed > 0 {
@@ -5930,6 +6004,7 @@ fn print_recap(ok: usize, failed: usize, skipped: usize) {
             format!("failed={failed}").dimmed()
         },
         format!("skipped={skipped}").dimmed(),
+        format!("changed={changed}").dimmed(),
     );
 }
 

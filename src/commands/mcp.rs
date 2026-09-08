@@ -22,6 +22,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Args)]
 pub struct McpArgs {
@@ -411,6 +412,35 @@ struct RunMcpArgs {
     cwd: Option<String>,
 }
 
+/// A short-lived temp file backing `PlayMcpArgs.content` -- deleted on drop, so an
+/// inline playbook never lingers on disk past the one `tooler_play` call that used it.
+/// Not backed by the `tempfile` crate (only a dev-dependency in this project): just
+/// `std::env::temp_dir()` plus a name unique enough not to collide with a concurrent
+/// MCP call (pid + a nanosecond timestamp).
+struct TempPlaybookFile(PathBuf);
+
+impl TempPlaybookFile {
+    fn write(content: &str) -> std::io::Result<Self> {
+        let name = format!(
+            "tooler-play-inline-{}-{}.yml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, content)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for TempPlaybookFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct PlayMcpArgs {
     /// Playbook YAML file to run (omit with init=true to generate a sample)
@@ -475,6 +505,13 @@ struct PlayMcpArgs {
     /// playbook.
     #[serde(default)]
     schema: bool,
+    /// Inline playbook YAML instead of a file on disk -- written to a short-lived temp
+    /// file for this call only, then deleted. Mutually exclusive with file. Only valid
+    /// combined with dry=true, lint=true, list_tasks=true, or list_tags=true -- a real
+    /// run still needs a real file, so a destructive action is never one step away
+    /// from unreviewed YAML. For inspecting/validating a draft playbook before saving
+    /// it, without a separate write-to-disk round trip.
+    content: Option<String>,
     cwd: Option<String>,
 }
 
@@ -1503,7 +1540,10 @@ impl ToolerMcp {
                         instead of executing it — useful before committing to a real run. \
                         schema=true dumps the whole playbook DSL itself as a formal JSON \
                         Schema document and exits — no file needed, for grounding an agent \
-                        before it writes or validates a playbook",
+                        before it writes or validates a playbook. content=\"<yaml>\" runs \
+                        against inline playbook text instead of file (mutually exclusive), \
+                        skipping the write-to-disk step — only valid combined with dry/lint/ \
+                        list_tasks/list_tags, since a real run still needs a real file",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1516,8 +1556,31 @@ impl ToolerMcp {
         Parameters(args): Parameters<PlayMcpArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut argv = vec!["play".to_string()];
-        if let Some(file) = &args.file {
-            argv.push(file.clone());
+        let _temp_guard;
+        if let Some(content) = &args.content {
+            if args.file.is_some() {
+                return Err(McpError::invalid_params(
+                    "content and file are mutually exclusive",
+                    None,
+                ));
+            }
+            if !(args.dry || args.lint || args.list_tasks || args.list_tags) {
+                return Err(McpError::invalid_params(
+                    "content: requires dry=true, lint=true, list_tasks=true, or \
+                     list_tags=true -- a real run needs a real file",
+                    None,
+                ));
+            }
+            let guard = TempPlaybookFile::write(content).map_err(|e| {
+                McpError::internal_error(format!("failed to write temp playbook: {e}"), None)
+            })?;
+            argv.push(guard.0.to_string_lossy().to_string());
+            _temp_guard = Some(guard);
+        } else {
+            if let Some(file) = &args.file {
+                argv.push(file.clone());
+            }
+            _temp_guard = None;
         }
         push_flag(&mut argv, "--dry", args.dry);
         push_repeated(&mut argv, "--var", &args.vars);

@@ -3545,3 +3545,140 @@ fn schema_ignores_unrelated_flags_and_still_just_prints_the_schema() {
     let stdout = stdout_of(out);
     serde_json::from_str::<serde_json::Value>(&stdout).expect("still valid JSON");
 }
+
+#[test]
+fn changed_true_by_default_on_a_successful_task_with_no_changed_when() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Changed default\ntasks:\n  - name: t1\n    run: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][0]["changed"], true);
+    assert_eq!(value["changed"], 1);
+}
+
+#[test]
+fn changed_when_false_keeps_changed_at_zero() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Changed false\ntasks:\n  - name: t1\n    run: echo hi\n    \
+         changed_when: \"false\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][0]["status"], "ok");
+    assert_eq!(value["tasks"][0]["changed"], false);
+    assert_eq!(value["changed"], 0);
+}
+
+#[test]
+fn skipped_and_ignored_tasks_never_count_as_changed() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Changed skip/ignore\ntasks:\n  - name: skip me\n    \
+         when: \"{{missing}} == present\"\n    run: echo skipped\n  - name: fail me\n    \
+         run: exit 1\n    ignore_errors: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][0]["status"], "skipped");
+    assert_eq!(value["tasks"][0]["changed"], false);
+    assert_eq!(value["tasks"][1]["status"], "ignored");
+    assert_eq!(value["tasks"][1]["changed"], false);
+    assert_eq!(value["changed"], 0);
+}
+
+#[test]
+fn error_kind_classifies_a_confirm_required_failure() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Confirm required\ntasks:\n  - name: set a secret\n    \
+         secret_set:\n      profile: test\n      key: k\n      value: v\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .failure(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][0]["error_kind"], "confirm_required");
+}
+
+#[test]
+fn error_kind_classifies_an_assertion_failure() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Assertion\ntasks:\n  - name: check it\n    assert: \"1 == 2\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .failure(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][0]["error_kind"], "assertion");
+}
+
+#[test]
+fn error_kind_classifies_a_run_exit_code_failure() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ExitCode\ntasks:\n  - name: fail\n    run: exit 7\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .failure(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][0]["error_kind"], "exit_code");
+}
+
+#[test]
+fn error_kind_falls_back_to_other_for_an_unrecognized_failure() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Unrecognized\ntasks:\n  - name: bad include\n    include: nope.yml\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .failure(),
+    );
+    let value = last_line_json(&out);
+    assert_eq!(value["tasks"][0]["error_kind"], "other");
+}
