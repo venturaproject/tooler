@@ -208,7 +208,9 @@ struct Task {
     failed_when: Option<String>,
 
     // Actions — only one should be set per task
-    run: Option<String>,
+    /// A shell command — either a bare string, or `{command: "...", env: {...}}` to also
+    /// inject extra environment variables into the subprocess. See `RunSpec`.
+    run: Option<RunSpec>,
     check_url: Option<String>,
     check_port: Option<CheckPortSpec>,
     /// Make an HTTP request. `register:` (if set) captures two vars: `<reg>` = the
@@ -263,8 +265,10 @@ struct Task {
     /// `IncludeSpec`, `resolve_include_path`.
     include: Option<IncludeSpec>,
     /// Fails the task immediately (not skips) unless the condition (same syntax as
-    /// `when:`) holds.
-    assert: Option<String>,
+    /// `when:`) holds — either a bare condition string, or `{that: [...], msg: "..."}`
+    /// to check several conditions in one task with a custom failure message. See
+    /// `AssertSpec`.
+    assert: Option<AssertSpec>,
     /// Run these tasks in order as a single unit; see `rescue`/`always`. Counts as one
     /// outcome in the parent's recap — its own tasks aren't flattened into the parent's
     /// totals (same scope line as `include:`).
@@ -352,6 +356,14 @@ struct Task {
     /// Deliberately requires `confirm: true` in the YAML itself — never runs silently.
     /// See `DbExecSpec`.
     db_exec: Option<DbExecSpec>,
+    /// Write a value into the OS keychain (`{{secret.<profile>.<key>}}`'s own backing
+    /// store) — the write-side counterpart to reading `{{secret.*}}`, so a playbook can
+    /// generate/rotate a credential end-to-end without dropping out to `tooler config
+    /// set`. `value:` renders normally, so `{{secret.old.key}}` (copying/rotating
+    /// between profiles) works with no special-casing. Deliberately requires `confirm:
+    /// true` in the YAML itself, same non-negotiable gate `db_exec:`/`fs_write:` use.
+    /// See `SecretSetSpec`.
+    secret_set: Option<SecretSetSpec>,
     /// Cap concurrent `loop:` iterations to N at a time (processed in chunks of N) instead
     /// of the default strictly-sequential execution. Only valid combined with `loop:`. See
     /// `run_loop_parallel`.
@@ -413,6 +425,36 @@ enum LoopSpec {
         from: String,
         #[serde(default)]
         split: Option<String>,
+    },
+}
+
+/// `assert:`'s two shapes — a bare condition string (unchanged), or a structured form
+/// checking several conditions in one task with its own failure message. `serde`'s
+/// untagged matching tries `Simple` first; a bare YAML string parses as `Simple`, and a
+/// mapping with a `that:` key parses as `Structured`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AssertSpec {
+    Simple(String),
+    Structured {
+        that: Vec<String>,
+        #[serde(default)]
+        msg: Option<String>,
+    },
+}
+
+/// `run:`'s two shapes — a bare shell command string (unchanged), or a structured form
+/// adding `env:` to inject extra environment variables into the spawned subprocess
+/// directly, instead of interpolating them into the command string by hand (which needs
+/// `| quote` to be safe and doesn't compose well with values containing spaces/quotes).
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum RunSpec {
+    Simple(String),
+    Structured {
+        command: String,
+        #[serde(default)]
+        env: HashMap<String, String>,
     },
 }
 
@@ -1058,6 +1100,24 @@ impl RequiresConfirm for DbExecSpec {
     }
 }
 
+/// `secret_set:` — writes `value` into the OS keychain under `profile`/`key`, the same
+/// store `{{secret.<profile>.<key>}}` reads from.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretSetSpec {
+    profile: String,
+    key: String,
+    value: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+impl RequiresConfirm for SecretSetSpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
+}
+
 /// `mail:` — every field is renderable via `render()` (so `{{secret.<profile>.password}}`
 /// or any `{{var}}` works anywhere here, same as `db_query:`). `to`/`cc`/`bcc` accept a
 /// comma-separated list of addresses. Credentials resolve through `resolve_mail_creds`:
@@ -1448,8 +1508,11 @@ fn tainted_source_action(task: &Task) -> Option<&'static str> {
 /// The command string Check A scans for unquoted tainted tokens — the same three action
 /// types the README's Trust model section names as reaching a shell line unescaped.
 fn shell_command(task: &Task) -> Option<&str> {
-    if let Some(s) = &task.run {
-        Some(s.as_str())
+    if let Some(spec) = &task.run {
+        Some(match spec {
+            RunSpec::Simple(s) => s.as_str(),
+            RunSpec::Structured { command, .. } => command.as_str(),
+        })
     } else if let Some(spec) = &task.ssh {
         Some(spec.command.as_str())
     } else if let Some(spec) = &task.fleet {
@@ -1468,7 +1531,6 @@ fn lintable_fields(task: &Task) -> Vec<&str> {
     let mut fields: Vec<&str> = shell_command(task).into_iter().collect();
     for s in [
         &task.debug,
-        &task.assert,
         &task.when,
         &task.changed_when,
         &task.failed_when,
@@ -1478,6 +1540,13 @@ fn lintable_fields(task: &Task) -> Vec<&str> {
     .flatten()
     {
         fields.push(s.as_str());
+    }
+    match &task.assert {
+        Some(AssertSpec::Simple(expr)) => fields.push(expr.as_str()),
+        Some(AssertSpec::Structured { that, .. }) => {
+            fields.extend(that.iter().map(String::as_str));
+        }
+        None => {}
     }
     fields
 }
@@ -3353,6 +3422,20 @@ fn exec_db_exec(
     crate::db::run_exec(&server, &creds, sql)
 }
 
+/// The only place `secret_set:` actually writes to the OS keychain — see
+/// `exec_fs_write`'s doc comment for why this takes `&Confirmed<SecretSetSpec>`. The
+/// value is never printed or returned, matching every other secret-shaped value's
+/// content-hiding convention in this DSL.
+fn exec_secret_set(
+    confirmed: &Confirmed<SecretSetSpec>,
+    profile: &str,
+    key: &str,
+    vars: &HashMap<String, String>,
+) -> Result<()> {
+    let value = render(&confirmed.value, vars);
+    crate::secrets::set_secret(profile, key, &value)
+}
+
 fn run_task_once(
     task: &Task,
     vars: &mut HashMap<String, String>,
@@ -3507,9 +3590,18 @@ fn run_task_once(
         return Ok(());
     }
 
-    if let Some(expr) = &task.assert {
-        if !eval_when(expr, vars) {
-            bail!("assertion failed: {expr}");
+    if let Some(spec) = &task.assert {
+        let (conditions, msg): (&[String], Option<&str>) = match spec {
+            AssertSpec::Simple(expr) => (std::slice::from_ref(expr), None),
+            AssertSpec::Structured { that, msg } => (that.as_slice(), msg.as_deref()),
+        };
+        for expr in conditions {
+            if !eval_when(expr, vars) {
+                match msg {
+                    Some(m) => bail!("assertion failed: {m} (condition: {expr})"),
+                    None => bail!("assertion failed: {expr}"),
+                }
+            }
         }
         return Ok(());
     }
@@ -3525,13 +3617,17 @@ fn run_task_once(
         );
     }
 
-    if let Some(cmd) = &task.run {
-        let rendered_cmd = render(cmd, vars);
+    if let Some(spec) = &task.run {
+        let (cmd_str, env_vars): (&str, Option<&HashMap<String, String>>) = match spec {
+            RunSpec::Simple(s) => (s.as_str(), None),
+            RunSpec::Structured { command, env } => (command.as_str(), Some(env)),
+        };
+        let rendered_cmd = render(cmd_str, vars);
         if !env.quiet {
             println!(
                 "  {} {}",
                 "$".bold().green(),
-                render_for_display(cmd, vars).dimmed()
+                render_for_display(cmd_str, vars).dimmed()
             );
         }
         if !env.dry {
@@ -3540,9 +3636,23 @@ fn run_task_once(
             cmd.arg("-c")
                 .arg(&rendered_cmd)
                 .current_dir(&env.playbook_dir);
+            if let Some(env_vars) = env_vars {
+                for (k, v) in env_vars {
+                    cmd.env(k, render(v, vars));
+                }
+            }
             let (success, code, captured) =
                 run_with_timeout(cmd, task.register.is_some(), task.timeout)?;
             let elapsed = start.elapsed();
+            if let Some(reg) = &task.register {
+                vars.insert(
+                    format!("{reg}.exit_code"),
+                    code.map(|c| c.to_string()).unwrap_or_default(),
+                );
+                if let Some(val) = &captured {
+                    vars.insert(reg.clone(), val.clone());
+                }
+            }
             if success {
                 if !env.quiet {
                     println!(
@@ -3550,9 +3660,6 @@ fn run_task_once(
                         "✓ ok".green().bold(),
                         format!("({:.1}s)", elapsed.as_secs_f32()).dimmed()
                     );
-                }
-                if let (Some(reg), Some(val)) = (&task.register, captured) {
-                    vars.insert(reg.clone(), val);
                 }
             } else {
                 bail!("command exited with code {}", code.unwrap_or(1));
@@ -4632,6 +4739,30 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.secret_set {
+        let profile = render(&spec.profile, vars);
+        let key = render(&spec.key, vars);
+        if !env.quiet {
+            println!(
+                "  {} secret.{}.{}",
+                "→ set".bold(),
+                profile.dimmed(),
+                key.dimmed()
+            );
+        }
+        if !env.dry {
+            let confirmed = Confirmed::require(spec, "secret_set", &task.name)?;
+            exec_secret_set(&confirmed, &profile, &key, vars)?;
+            if !env.quiet {
+                println!("  {} secret set", "✓ ok".green().bold());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), "true".to_string());
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.mail {
         let to = render(&spec.to, vars);
         let subject = render(&spec.subject, vars);
@@ -4832,8 +4963,8 @@ fn run_task_once(
          report, env_check, ssh, fleet, fs_cat, fs_write, systemd_restart, systemd_status, \
          logs_tail, logs_grep, ps_list, ps_kill, stat, include, assert, block, debug, \
          confirm, set_fact, include_vars, state_set, sync_db, sync_files, write_file, \
-         read_csv, write_csv, db_query, db_exec, mail, mail_check, git_summary, \
-         git_changelog, gh_prs)",
+         read_csv, write_csv, db_query, db_exec, secret_set, mail, mail_check, \
+         git_summary, git_changelog, gh_prs)",
         task.name
     );
 }
@@ -4888,6 +5019,7 @@ fn task_action_label(task: &Task) -> &'static str {
         write_csv,
         db_query,
         db_exec,
+        secret_set,
         mail,
         mail_check,
         git_summary,
@@ -6070,7 +6202,7 @@ mod tests {
         let mut include_stack = Vec::new();
         let task = Task {
             register: Some("x".to_string()),
-            run: Some("echo hi".to_string()),
+            run: Some(RunSpec::Simple("echo hi".to_string())),
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
@@ -6105,13 +6237,13 @@ mod tests {
         let mut include_stack = Vec::new();
 
         let task = Task {
-            assert: Some("{{env}} == prod".to_string()),
+            assert: Some(AssertSpec::Simple("{{env}} == prod".to_string())),
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
 
         let task = Task {
-            assert: Some("{{env}} == staging".to_string()),
+            assert: Some(AssertSpec::Simple("{{env}} == staging".to_string())),
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
@@ -6347,7 +6479,7 @@ mod tests {
     #[test]
     fn task_action_label_identifies_run_and_debug_and_falls_back_to_unknown() {
         let run_task = Task {
-            run: Some("echo hi".to_string()),
+            run: Some(RunSpec::Simple("echo hi".to_string())),
             ..Default::default()
         };
         assert_eq!(task_action_label(&run_task), "run");
@@ -7243,7 +7375,7 @@ mod tests {
         let mut include_stack = Vec::new();
         let task = Task {
             timeout: Some(5),
-            run: Some("echo hi".to_string()),
+            run: Some(RunSpec::Simple("echo hi".to_string())),
             ..Default::default()
         };
         assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());

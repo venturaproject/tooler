@@ -613,6 +613,145 @@ fn register_captures_run_output_and_when_uses_it() {
 }
 
 #[test]
+fn register_exit_code_is_zero_on_a_successful_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ExitCodeOk\ntasks:\n  - name: succeed\n    run: echo hi\n    \
+         register: r\n  - name: check it\n    assert: \"{{r.exit_code}} == 0\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn register_exit_code_survives_a_failure_when_ignore_errors_lets_the_playbook_continue() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: ExitCodeIgnored\ntasks:\n  - name: fail with a specific code\n    \
+         run: exit 3\n    register: r\n    ignore_errors: true\n  - name: check it\n    \
+         assert: \"{{r.exit_code}} == 3\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn run_env_injects_a_variable_into_the_subprocess() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: RunEnv\ntasks:\n  - name: read it\n    run:\n      command: \"echo $FOO\"\n      \
+         env:\n        FOO: bar\n    register: out\n  - name: check it\n    \
+         assert: \"{{out}} == bar\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn run_env_value_is_templated_before_being_set() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: RunEnvTemplated\nvars:\n  greeting: hello-from-vars\ntasks:\n  - \
+         name: read it\n    run:\n      command: \"echo $MSG\"\n      \
+         env:\n        MSG: \"{{greeting}}\"\n    register: out\n  - name: check it\n    \
+         assert: \"{{out}} == hello-from-vars\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn structured_run_rejects_an_unknown_field() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: RunUnknownField\ntasks:\n  - name: bad\n    run:\n      command: echo hi\n      \
+         env:\n        FOO: bar\n      bogus: true\n",
+    )
+    .unwrap();
+
+    let out = cmd.args(["play", "playbook.yml"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    // `#[serde(untagged)]` doesn't surface the specific unknown-field name the way a
+    // plain deny_unknown_fields struct does -- it just reports that nothing matched --
+    // but it does still fail clearly (never silently drops the typo'd field).
+    assert!(
+        stderr.contains("did not match any variant"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn secret_set_without_confirm_fails_clearly_and_makes_no_write() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: SecretSetNoConfirm\ntasks:\n  - name: store it\n    secret_set:\n      \
+         profile: __tooler_test_secret_set_probe__\n      key: probe\n      value: x\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn secret_set_dry_run_previews_without_writing() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: SecretSetDry\ntasks:\n  - name: store it\n    secret_set:\n      \
+         profile: __tooler_test_secret_set_probe__\n      key: probe\n      value: x\n      \
+         confirm: true\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--dry"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn secret_set_task_writes_a_secret_that_secret_dot_reads_back() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: SecretSetRoundTrip\ntasks:\n  - name: store it\n    secret_set:\n      \
+         profile: __tooler_test_secret_set_probe__\n      key: probe\n      \
+         value: hello123\n      confirm: true\n  - name: read it back\n    \
+         assert: \"{{secret.__tooler_test_secret_set_probe__.probe}} == hello123\"\n",
+    )
+    .unwrap();
+
+    let assert = cmd.args(["play", "playbook.yml"]).assert();
+    let output = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() && combined.to_lowercase().contains("credential store") {
+        eprintln!(
+            "skipping secret_set_task_writes_a_secret_that_secret_dot_reads_back: no OS \
+             credential store backend available in this environment"
+        );
+        return;
+    }
+    assert!(output.status.success(), "playbook failed: {combined}");
+}
+
+#[test]
 fn retries_eventually_succeeds() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1073,6 +1212,76 @@ fn assert_failure_aborts_the_playbook_with_a_clear_message() {
 
     let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
     assert!(out.to_lowercase().contains("assertion failed"));
+}
+
+#[test]
+fn structured_assert_passes_when_every_condition_in_that_holds() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: StructuredAssertOk\nvars:\n  env: prod\n  count: \"3\"\ntasks:\n  - \
+         name: multi-check\n    assert:\n      that:\n        - \"{{env}} == prod\"\n        \
+         - \"{{count}} >= 1\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+fn structured_assert_fails_naming_the_failing_condition() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: StructuredAssertFail\nvars:\n  env: staging\ntasks:\n  - name: multi-check\n    \
+         assert:\n      that:\n        - \"{{env}} == prod\"\n        - \"1 == 1\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("{{env}} == prod"),
+        "expected the failing condition to be named, stdout was: {out}"
+    );
+}
+
+#[test]
+fn structured_assert_uses_the_custom_msg_on_failure() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: StructuredAssertMsg\nvars:\n  env: staging\ntasks:\n  - name: multi-check\n    \
+         assert:\n      that:\n        - \"{{env}} == prod\"\n      msg: \"must run in prod\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("must run in prod"), "stdout was: {out}");
+}
+
+#[test]
+fn lint_flags_an_undefined_var_inside_a_structured_assert_that() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintStructuredAssert\ntasks:\n  - name: multi-check\n    assert:\n      \
+         that:\n        - \"{{typo_var}} == 1\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["message"].as_str().unwrap().contains("possible typo")),
+        "findings were: {findings:?}"
+    );
 }
 
 #[test]
