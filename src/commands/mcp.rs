@@ -593,6 +593,9 @@ struct PlayReplCloseArgs {
     cwd: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct PlayReplListArgs {}
+
 // ── git ───────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
@@ -1872,6 +1875,68 @@ impl ToolerMcp {
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::json!({"closed": true, "saved_to": saved_to}).to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "List currently open incremental playbook sessions (see \
+                        tooler_play_repl_open) -- every session file still on disk, \
+                        with its session_id, playbook name, and how many tasks it has \
+                        so far. For recovering a session_id lost from context, or \
+                        auditing for abandoned sessions before the OS's own \
+                        temp-directory policy eventually cleans them up (this tool \
+                        only lists -- it never deletes).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tooler_play_repl_list(
+        &self,
+        Parameters(_args): Parameters<PlayReplListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut sessions = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // A session's own checkpoint file (`<session>.yml.state.json`, written
+                // by --keep-checkpoint) sits in the same temp dir and also starts with
+                // SESSION_FILE_PREFIX -- excluded by requiring the real ".yml" playbook
+                // extension too, or it would show up as a second, phantom session.
+                if !name.starts_with(SESSION_FILE_PREFIX) || !name.ends_with(".yml") {
+                    continue;
+                }
+                let (playbook_name, task_count) = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_yaml::from_str::<serde_yaml::Value>(&s).ok())
+                    .map(|doc| {
+                        let name = doc
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let count = doc
+                            .get("tasks")
+                            .and_then(|t| t.as_sequence())
+                            .map(Vec::len)
+                            .unwrap_or(0);
+                        (name, count)
+                    })
+                    .unwrap_or_default();
+                sessions.push(serde_json::json!({
+                    "session_id": path.to_string_lossy(),
+                    "playbook_name": playbook_name,
+                    "task_count": task_count,
+                }));
+            }
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::json!({"sessions": sessions}).to_string(),
         )]))
     }
 

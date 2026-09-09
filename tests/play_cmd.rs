@@ -4131,3 +4131,158 @@ fn without_keep_checkpoint_the_state_file_is_still_deleted_as_before() {
         "expected the checkpoint to still be deleted on success without --keep-checkpoint"
     );
 }
+
+#[test]
+fn deploy_without_confirm_fails_clearly_and_makes_no_connection() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Deploy\ntasks:\n  - name: deploy it\n    deploy:\n      \
+         server: ghost\n      path: /var/www/app\n      restart: \"systemctl restart app\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn deploy_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Deploy\ntasks:\n  - name: deploy it\n    deploy:\n      \
+         server: ghost\n      path: /var/www/app\n      restart: \"systemctl restart app\"\n      \
+         confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("/var/www/app"), "stdout was: {out}");
+}
+
+#[test]
+fn deploy_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Deploy\ntasks:\n  - name: deploy it\n    deploy:\n      \
+         server: ghost\n      path: /var/www/app\n      restart: \"systemctl restart app\"\n      \
+         confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+#[test]
+fn lint_flags_an_unconfigured_group_on_fleet() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintFleetGroup\ntasks:\n  - name: fan out\n    fleet:\n      \
+         group: ghost\n      command: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|f| f["message"]
+            .as_str()
+            .unwrap()
+            .contains("'ghost' isn't a configured group")),
+        "findings were: {findings:?}"
+    );
+}
+
+#[test]
+fn lint_does_not_flag_a_configured_group_on_fleet() {
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args(["group", "add", "web"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintFleetGroupOk\ntasks:\n  - name: fan out\n    fleet:\n      \
+         group: web\n      command: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["findings"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn lint_flags_individual_bad_names_inside_fleets_comma_separated_servers() {
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args(["server", "add", "s1", "--host", "127.0.0.1"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintFleetServers\ntasks:\n  - name: fan out\n    fleet:\n      \
+         servers: \"s1,ghost\"\n      command: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|f| f["message"]
+            .as_str()
+            .unwrap()
+            .contains("'ghost' isn't a configured server profile")),
+        "findings were: {findings:?}"
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f["message"].as_str().unwrap().contains("'s1'")),
+        "s1 is configured and should not be flagged: {findings:?}"
+    );
+}
+
+#[test]
+fn lint_does_not_flag_fleet_targeting_all() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintFleetAll\ntasks:\n  - name: fan out\n    fleet:\n      \
+         all: true\n      command: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["findings"].as_array().unwrap().len(), 0);
+}

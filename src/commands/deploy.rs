@@ -171,20 +171,73 @@ fn deploy(
         return Ok(());
     }
 
-    if pull && let Err(e) = db::ssh_exec_capture(&server, &pull_cmd(path)) {
-        return fail(json, format!("git pull failed: {e:#}"));
+    if let Err(e) = apply_deploy_steps(
+        &server,
+        path,
+        pull,
+        build,
+        restart,
+        health_url,
+        health_timeout,
+        health_retries,
+        health_delay,
+        sudo,
+        sudo_pass,
+    ) {
+        return fail(json, e.to_string());
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"server": server_name, "path": path, "deployed": true})
+        );
+        return Ok(());
+    }
+    println!(
+        "{} deployed {} on {}",
+        "✓".green().bold(),
+        path.dimmed(),
+        server_name.cyan()
+    );
+    Ok(())
+}
+
+/// Runs `deploy`'s actual side effects (pull/build/restart/health-check) against an
+/// already-resolved server -- the caller is responsible for any confirm-gating.
+/// Shared by the standalone `tooler deploy run` CLI command (`deploy`, above) and
+/// `tooler play`'s native `deploy:` task, so both go through identical step logic.
+/// Error messages are stable text ("git pull failed: ...", "build failed: ...",
+/// "restart failed: ...", "health check failed after N attempt(s): ...") -- both
+/// callers surface them verbatim.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_deploy_steps(
+    server: &crate::config::Server,
+    path: &str,
+    pull: bool,
+    build: Option<&str>,
+    restart: Option<&str>,
+    health_url: Option<&str>,
+    health_timeout: u64,
+    health_retries: u32,
+    health_delay: u64,
+    sudo: bool,
+    sudo_pass: Option<&str>,
+) -> Result<()> {
+    if pull && let Err(e) = db::ssh_exec_capture(server, &pull_cmd(path)) {
+        bail!("git pull failed: {e:#}");
     }
 
     if let Some(cmd) = build
-        && let Err(e) = db::ssh_exec_capture(&server, &build_cmd(path, cmd))
+        && let Err(e) = db::ssh_exec_capture(server, &build_cmd(path, cmd))
     {
-        return fail(json, format!("build failed: {e:#}"));
+        bail!("build failed: {e:#}");
     }
 
     if let Some(cmd) = restart
-        && let Err(e) = db::ssh_exec_capture(&server, &restart_cmd(cmd, sudo, sudo_pass))
+        && let Err(e) = db::ssh_exec_capture(server, &restart_cmd(cmd, sudo, sudo_pass))
     {
-        return fail(json, format!("restart failed: {e:#}"));
+        bail!("restart failed: {e:#}");
     }
 
     if let Some(url) = health_url {
@@ -204,30 +257,14 @@ fn deploy(
             }
         }
         if !healthy {
-            return fail(
-                json,
-                format!(
-                    "health check failed after {} attempt(s): {}",
-                    health_retries,
-                    last_err.unwrap_or_default()
-                ),
+            bail!(
+                "health check failed after {} attempt(s): {}",
+                health_retries,
+                last_err.unwrap_or_default()
             );
         }
     }
 
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"server": server_name, "path": path, "deployed": true})
-        );
-        return Ok(());
-    }
-    println!(
-        "{} deployed {} on {}",
-        "✓".green().bold(),
-        path.dimmed(),
-        server_name.cyan()
-    );
     Ok(())
 }
 

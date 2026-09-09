@@ -382,6 +382,11 @@ struct Task {
     /// true` in the YAML itself, same non-negotiable gate `db_exec:`/`fs_write:` use.
     /// See `SecretSetSpec`.
     secret_set: Option<SecretSetSpec>,
+    /// Pull the latest code, run a build step, restart a service, and health-check it,
+    /// each step optional — the native playbook equivalent of `tooler deploy run`.
+    /// Deliberately requires `confirm: true`, same gate every other action that
+    /// mutates or restarts remote state already has. See `DeploySpec`.
+    deploy: Option<DeploySpec>,
     /// Cap concurrent `loop:` iterations to N at a time (processed in chunks of N) instead
     /// of the default strictly-sequential execution. Only valid combined with `loop:`. See
     /// `run_loop_parallel`.
@@ -1136,6 +1141,64 @@ impl RequiresConfirm for SecretSetSpec {
     }
 }
 
+fn default_deploy_health_timeout() -> u64 {
+    5
+}
+fn default_deploy_health_retries() -> u32 {
+    3
+}
+fn default_deploy_health_delay() -> u64 {
+    2
+}
+
+/// `deploy:` — the native playbook equivalent of `tooler deploy run`: pull the latest
+/// code, run a build step, restart a service, and health-check it, each step optional.
+/// Deliberately requires `confirm: true`, same gate every other action that mutates or
+/// restarts remote state already has. See `commands::deploy::apply_deploy_steps`, the
+/// exact function both this task and the standalone CLI command run through.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DeploySpec {
+    server: String,
+    /// Remote path (git repo) to deploy
+    path: String,
+    /// Pull the latest code (git pull) in `path` before restarting
+    #[serde(default)]
+    pull: bool,
+    /// Command to run remotely in `path` after pulling (e.g. a build step)
+    #[serde(default)]
+    build: Option<String>,
+    /// Command to restart the service (e.g. "systemctl restart myapp")
+    #[serde(default)]
+    restart: Option<String>,
+    /// URL to check after restarting
+    #[serde(default)]
+    health_url: Option<String>,
+    /// Timeout in seconds for each health check attempt
+    #[serde(default = "default_deploy_health_timeout")]
+    health_timeout: u64,
+    /// Number of health check attempts before giving up
+    #[serde(default = "default_deploy_health_retries")]
+    health_retries: u32,
+    /// Seconds to wait between health check attempts
+    #[serde(default = "default_deploy_health_delay")]
+    health_delay: u64,
+    /// Run the restart command via sudo
+    #[serde(default)]
+    sudo: bool,
+    /// Sudo password (only used with `sudo: true`; omit to rely on NOPASSWD)
+    #[serde(default)]
+    sudo_pass: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+impl RequiresConfirm for DeploySpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
+}
+
 /// `mail:` — every field is renderable via `render()` (so `{{secret.<profile>.password}}`
 /// or any `{{var}}` works anywhere here, same as `db_query:`). `to`/`cc`/`bcc` accept a
 /// comma-separated list of addresses. Credentials resolve through `resolve_mail_creds`:
@@ -1605,23 +1668,27 @@ fn token_base_name(token: &str) -> &str {
     token.split('.').next().unwrap_or(token)
 }
 
-/// A literal `server:` field on a task, tagged with which profile namespace to check
-/// it against for Check C — see `task_profile_refs`.
+/// A literal `server:`/`group:` field on a task, tagged with which profile namespace to
+/// check it against for Check C — see `task_profile_refs`.
 enum ProfileRef<'a> {
     Ssh(&'a str),
     Mail(&'a str),
+    Group(&'a str),
 }
 
 /// Every literal (non-`{{templated}}` — can't be statically resolved, same scope limit
-/// Check B already has) server:/mail-profile reference on `task`, for Check C.
+/// Check B already has) server:/mail-profile/group reference on `task`, for Check C.
 /// `ssh:`/`fs_cat:`/`fs_write:`/`systemd_restart:`/`systemd_status:`/`logs_tail:`/
 /// `logs_grep:`/`ps_list:`/`ps_kill:`/`stat:`/`db_query:`/`db_exec:`/`sync_db:`/
-/// `sync_files:` all resolve their `server:` through `ctx.config.server` (see
+/// `sync_files:`/`deploy:` all resolve their `server:` through `ctx.config.server` (see
 /// `crate::commands::ssh::resolve_server`); `mail:`/`mail_check:` resolve theirs
 /// through the separate `ctx.config.mail` — confirmed by reading each dispatch site,
 /// not assumed, since they share the same field name but are different namespaces.
-/// `fleet:` is deliberately excluded — its `servers:`/`group:`/`all:` targeting is a
-/// different shape (comma-separated or a named group, not one literal profile name).
+/// `fleet:`'s `servers:` is a comma-separated list of the *same* `ctx.config.server`
+/// names, so each entry becomes its own `Ssh` ref; its `group:` is a genuinely
+/// different namespace (`ctx.config.group`, confirmed via `fleet::resolve_targets`) and
+/// gets `Group`. `fleet: {all: true}` needs no check at all — targeting every
+/// configured server is always resolvable, nothing to look up.
 fn task_profile_refs(task: &Task) -> Vec<ProfileRef<'_>> {
     let mut out = Vec::new();
     let lit = |s: &str| !s.contains("{{");
@@ -1648,6 +1715,21 @@ fn task_profile_refs(task: &Task) -> Vec<ProfileRef<'_>> {
     ssh_ref!(task.db_exec.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.sync_db.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.sync_files.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.deploy.as_ref().map(|s| s.server.as_str()));
+    if let Some(spec) = &task.fleet {
+        if let Some(servers) = &spec.servers
+            && lit(servers)
+        {
+            for name in servers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                out.push(ProfileRef::Ssh(name));
+            }
+        }
+        if let Some(group) = &spec.group
+            && lit(group)
+        {
+            out.push(ProfileRef::Group(group));
+        }
+    }
     if let Some(s) = &task.mail_check
         && lit(&s.server)
     {
@@ -1781,9 +1863,8 @@ fn lint_tasks(
             }
         }
 
-        // Check C (server:/mail-profile half) -- a literal server: field naming a
-        // profile this environment never configured. fleet: excluded (its
-        // servers:/group:/all: targeting is a different shape entirely).
+        // Check C (server:/mail-profile/group half) -- a literal server:/group: field
+        // naming a profile or group this environment never configured.
         for r in task_profile_refs(task) {
             match r {
                 ProfileRef::Ssh(name) if !ctx.config.server.contains_key(name) => {
@@ -1799,6 +1880,14 @@ fn lint_tasks(
                         task: task.name.clone(),
                         message: format!(
                             "server: '{name}' isn't a configured mail profile -- tooler config set mail.{name}.host ..."
+                        ),
+                    });
+                }
+                ProfileRef::Group(name) if !ctx.config.group.contains_key(name) => {
+                    findings.push(LintFinding {
+                        task: task.name.clone(),
+                        message: format!(
+                            "group: '{name}' isn't a configured group -- tooler group add {name} ..."
                         ),
                     });
                 }
@@ -3698,6 +3787,36 @@ fn exec_secret_set(
     crate::secrets::set_secret(profile, key, &value)
 }
 
+/// The only place `deploy:` actually runs — see `commands::deploy::apply_deploy_steps`,
+/// the exact same function the standalone `tooler deploy run` CLI command calls, so
+/// both go through identical step logic and identical error wording.
+fn exec_deploy(
+    confirmed: &Confirmed<DeploySpec>,
+    vars: &HashMap<String, String>,
+    env: &RunEnv,
+) -> Result<()> {
+    let server_name = render(&confirmed.server, vars);
+    let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
+    let path = render(&confirmed.path, vars);
+    let build = confirmed.build.as_deref().map(|b| render(b, vars));
+    let restart = confirmed.restart.as_deref().map(|r| render(r, vars));
+    let health_url = confirmed.health_url.as_deref().map(|u| render(u, vars));
+    let sudo_pass = confirmed.sudo_pass.as_deref().map(|p| render(p, vars));
+    crate::commands::deploy::apply_deploy_steps(
+        &server,
+        &path,
+        confirmed.pull,
+        build.as_deref(),
+        restart.as_deref(),
+        health_url.as_deref(),
+        confirmed.health_timeout,
+        confirmed.health_retries,
+        confirmed.health_delay,
+        confirmed.sudo,
+        sudo_pass.as_deref(),
+    )
+}
+
 fn run_task_once(
     task: &Task,
     vars: &mut HashMap<String, String>,
@@ -5055,6 +5174,30 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.deploy {
+        let server_name = render(&spec.server, vars);
+        let path = render(&spec.path, vars);
+        if !env.quiet {
+            println!(
+                "  {} deploy {} on {}",
+                "→".bold(),
+                path.dimmed(),
+                server_name.dimmed()
+            );
+        }
+        if !env.dry {
+            let confirmed = Confirmed::require(spec, "deploy", &task.name)?;
+            exec_deploy(&confirmed, vars, env)?;
+            if !env.quiet {
+                println!("  {} deployed", "✓ ok".green().bold());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), "true".to_string());
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.mail {
         let to = render(&spec.to, vars);
         let subject = render(&spec.subject, vars);
@@ -5256,7 +5399,7 @@ fn run_task_once(
          report, env_check, ssh, fleet, fs_cat, fs_write, systemd_restart, systemd_status, \
          logs_tail, logs_grep, ps_list, ps_kill, stat, include, assert, block, debug, \
          confirm, set_fact, include_vars, state_set, sync_db, sync_files, write_file, \
-         read_csv, write_csv, db_query, db_exec, secret_set, mail, mail_check, \
+         read_csv, write_csv, db_query, db_exec, secret_set, deploy, mail, mail_check, \
          git_summary, git_changelog, gh_prs)",
         task.name
     );
@@ -5286,6 +5429,9 @@ fn confirm_gate(task: &Task) -> Option<bool> {
         return Some(s.is_confirmed());
     }
     if let Some(s) = &task.secret_set {
+        return Some(s.is_confirmed());
+    }
+    if let Some(s) = &task.deploy {
         return Some(s.is_confirmed());
     }
     None
@@ -5337,6 +5483,7 @@ fn task_action_label(task: &Task) -> &'static str {
         db_query,
         db_exec,
         secret_set,
+        deploy,
         mail,
         mail_check,
         git_summary,
