@@ -79,6 +79,14 @@ pub struct PlayArgs {
     #[arg(long)]
     pub resume: bool,
 
+    /// Skip deleting the --resume checkpoint after a fully-successful run. Meaningful
+    /// combined with --resume (to keep the ability to resume again later) or on a fresh
+    /// run (to pre-seed a checkpoint a future run can --resume from) -- e.g. an
+    /// MCP-driven session that appends and runs one task at a time, each call keeping
+    /// the checkpoint alive for the next. Ignored in --dry, same as checkpointing itself.
+    #[arg(long = "keep-checkpoint")]
+    pub keep_checkpoint: bool,
+
     /// Start an interactive console: type one task action at a time (`run: echo hi`, or
     /// `{http: {url: "..."}, register: x}` for multiple keys on one line) and see it
     /// execute immediately against a `vars` map that persists for the session. `.help`
@@ -1897,6 +1905,10 @@ struct RunEnv<'a> {
     /// playbook's `vars` map already, so its `state.*` vars flow through for free with
     /// no extra plumbing; only the on-disk *persistence* is a top-level concept.
     data_path: Option<PathBuf>,
+    /// From `--keep-checkpoint` — skip deleting `state_path` after a fully-successful
+    /// run. Only ever matters when `state_path.is_some()`, so same top-level-only scope
+    /// as `state_path`/`start_at`/`data_path`.
+    keep_checkpoint: bool,
     ctx: &'a Context,
 }
 
@@ -1964,7 +1976,10 @@ fn apply_vars_file_overrides(vars: &mut HashMap<String, String>, paths: &[PathBu
 
 /// Applies `--var key=value` CLI overrides (repeatable) on top of `vars`, in order —
 /// shared by a normal run, a `--resume`d run, and `--repl`.
-fn apply_var_overrides(vars: &mut HashMap<String, String>, raw: &[String]) -> Result<()> {
+pub(crate) fn apply_var_overrides(
+    vars: &mut HashMap<String, String>,
+    raw: &[String],
+) -> Result<()> {
     for var in raw {
         if let Some((k, v)) = var.split_once('=') {
             vars.insert(k.trim().to_string(), v.trim().to_string());
@@ -2027,6 +2042,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
             start_at: None,
             state_path: None,
             data_path: None,
+            keep_checkpoint: args.keep_checkpoint,
             ctx,
         };
         return run_repl(vars, env);
@@ -2168,6 +2184,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         start_at: start_at_task,
         state_path: Some(state_path),
         data_path: Some(data_path),
+        keep_checkpoint: args.keep_checkpoint,
         ctx,
     };
 
@@ -2188,7 +2205,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
 /// Inserts `name: "<name>"` into `value` (must already be a `Mapping`) if it doesn't
 /// already have a `name` key — the synthetic name every `--repl` line gets so it can
 /// deserialize into `Task` (whose `name` field is required) without the user typing one.
-fn merge_repl_name(value: &mut serde_yaml::Value, name: &str) {
+pub(crate) fn merge_repl_name(value: &mut serde_yaml::Value, name: &str) {
     if let serde_yaml::Value::Mapping(map) = value {
         let key = serde_yaml::Value::String("name".to_string());
         if !map.contains_key(&key) {
@@ -2517,16 +2534,16 @@ fn classify_error(msg: &str) -> &'static str {
 /// include values resolved from `{{secret.*}}` (e.g. via `set_fact:`) — see
 /// `write_checkpoint`'s 0600-permission handling.
 #[derive(Debug, Serialize, Deserialize)]
-struct PlayCheckpoint {
+pub(crate) struct PlayCheckpoint {
     playbook: String,
-    last_completed_task: String,
+    pub(crate) last_completed_task: String,
     vars: HashMap<String, String>,
     updated_at: String,
 }
 
 /// The `--resume` checkpoint path for a given playbook file: the file's own path with
 /// `.state.json` appended (e.g. `playbooks/deploy.yml` -> `playbooks/deploy.yml.state.json`).
-fn state_path_for(file_path: &Path) -> PathBuf {
+pub(crate) fn state_path_for(file_path: &Path) -> PathBuf {
     let mut s = file_path.as_os_str().to_os_string();
     s.push(".state.json");
     PathBuf::from(s)
@@ -2594,7 +2611,7 @@ fn write_persisted_state(env: &RunEnv, vars: &HashMap<String, String>) {
     }
 }
 
-fn load_checkpoint(path: &Path) -> Result<PlayCheckpoint> {
+pub(crate) fn load_checkpoint(path: &Path) -> Result<PlayCheckpoint> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("reading checkpoint {}", path.display()))?;
     serde_json::from_str(&content)
@@ -2988,9 +3005,13 @@ fn execute_playbook(
     // A fully-completed playbook has nothing left to resume — best-effort, never fails
     // the run over a stray delete error. Never touches the checkpoint in --dry: a dry
     // run does no real work, so it must not discard a real checkpoint from an earlier
-    // failed run just because a preview happened to "succeed" afterward.
+    // failed run just because a preview happened to "succeed" afterward. --keep-checkpoint
+    // opts out of the deletion entirely -- e.g. an MCP-driven session that appends and
+    // runs one task at a time needs the checkpoint to survive every successful call, not
+    // just a failed one, so the next call can --resume from it.
     if is_top_level
         && !env.dry
+        && !env.keep_checkpoint
         && let Some(path) = &env.state_path
     {
         let _ = std::fs::remove_file(path);
@@ -5196,6 +5217,7 @@ fn run_task_once(
                 start_at: None,
                 state_path: None,
                 data_path: None,
+                keep_checkpoint: false,
                 ctx: env.ctx,
             };
             include_stack.push(include_path);
@@ -6519,6 +6541,7 @@ mod tests {
             start_at: None,
             state_path: None,
             data_path: None,
+            keep_checkpoint: false,
             ctx,
         }
     }

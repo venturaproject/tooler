@@ -357,6 +357,8 @@ tooler play playbook.yml --diff             # preview fs_write:/write_file: chan
 
 **`--resume`** is the real thing: every top-level run writes a checkpoint (`<file>.state.json`, a sibling of the playbook file) after each task's non-fatal outcome, capturing the *entire* vars map at that point — deleted automatically once the playbook fully succeeds. `tooler play playbook.yml --resume` restores those vars exactly as they were after the last completed task, continues with the task right after it, and errors clearly if no checkpoint exists. `--var` overrides still apply on top of the restored vars, so a bad value can be fixed before retrying — the whole point of resuming rather than restarting from scratch. **Security note**: since the checkpoint holds the *entire* vars snapshot, it can contain values resolved from `{{secret.*}}` (e.g. via `set_fact:`) — the file is written with `0600` permissions on Unix, but treat it like any other local credential material (gitignore `*.state.json`) rather than relying on that alone.
 
+**`--keep-checkpoint`** skips that automatic deletion on success, combined with `--resume` or on a fresh run — for anything that wants to keep resuming the *same* checkpoint across several separate, individually-successful `tooler play` invocations instead of just recovering from one failure. This is what the incremental MCP sessions below are built on.
+
 **Persistent state (`state_set:` + `{{state.*}}`)** is the durable counterpart to `--resume`'s checkpoint — deliberately a *different* file (`<file>.data.json`, never auto-deleted) for a different purpose: `--resume` restores one specific failed run; `state_set:` carries memory forward across many separate *successful* runs, e.g. a `tooler cron local`-scheduled playbook remembering "the last row ID processed" or "already sent today's report" without abusing IMAP's `\Seen` flag or a DB write for bookkeeping unrelated to the DB itself.
 
 ```yaml
@@ -401,7 +403,26 @@ tooler-repl> .save check.yml
 tooler-repl> .exit
 ```
 
-Each line is the *body* of a task — everything a YAML task has except `name:`, which the REPL fills in for you (`repl-1`, `repl-2`, ...). A bare `key: value` line works for a single-key action (`run: echo hi`); wrap the whole line in `{...}` (flow-style YAML) to add `register:`/`when:`/`ignore_errors:`/etc. on the same line — no new syntax, this is just YAML. Any field a real playbook task supports works here too, including `loop:`/`max_parallel:`/`block:`/`include:`. A failing line (a typo, a bad URL) prints the error and **keeps the session going** — unlike a batch `tooler play` run, one bad line doesn't end it. Meta-commands: `.vars` (show every current var, unmasked — same tradeoff `debug:` already makes), `.clear` (empty all vars), `.save <path>` (write the session so far as a real playbook, resolved relative to the playbook's directory — only lines that actually succeeded, or explicitly failed with `ignore_errors: true`, are included; a hard failure you were debugging isn't baked back into the "clean" file), `.help`, and `.exit`/`.quit` (Ctrl+D also works). Like `confirm:`, this is an inherently interactive tool — not wired into the `tooler_play` MCP tool.
+Each line is the *body* of a task — everything a YAML task has except `name:`, which the REPL fills in for you (`repl-1`, `repl-2`, ...). A bare `key: value` line works for a single-key action (`run: echo hi`); wrap the whole line in `{...}` (flow-style YAML) to add `register:`/`when:`/`ignore_errors:`/etc. on the same line — no new syntax, this is just YAML. Any field a real playbook task supports works here too, including `loop:`/`max_parallel:`/`block:`/`include:`. A failing line (a typo, a bad URL) prints the error and **keeps the session going** — unlike a batch `tooler play` run, one bad line doesn't end it. Meta-commands: `.vars` (show every current var, unmasked — same tradeoff `debug:` already makes), `.clear` (empty all vars), `.save <path>` (write the session so far as a real playbook, resolved relative to the playbook's directory — only lines that actually succeeded, or explicitly failed with `ignore_errors: true`, are included; a hard failure you were debugging isn't baked back into the "clean" file), `.help`, and `.exit`/`.quit` (Ctrl+D also works). This particular form is inherently interactive — built around a real terminal — so it isn't wired into MCP directly; an MCP-callable equivalent exists as three separate tools, next.
+
+#### Incremental sessions over MCP (`tooler_play_repl_*`)
+
+`--repl` can't be called once-per-line over MCP's request/response shape — there's no
+open connection to block on. Three tools give an MCP-driven agent the same "one task at
+a time, vars persist" capability instead:
+
+- **`tooler_play_repl_open`** (`name?`, `vars?`) creates a private session — a temp playbook file — and returns a `session_id` (its path). Optional `vars: ["key=value", ...]` seeds initial values, same shape as `tooler_play`'s own `vars`.
+- **`tooler_play_repl_exec`** (`session_id`, `task`, `cwd?`) appends one task — the same YAML shape a `--repl` line accepts, e.g. `"run: echo hi"` or `{http: {url: "..."}, register: x}` — and runs only that new task, with every var registered/set by earlier calls on this session already restored. Returns the same JSON shape `tooler_play` itself returns. If the *previous* call's task failed, this call's task **replaces** it instead of appending after it — a failed task would otherwise block every later call, since `--resume` (which this is built on) always retries from right after the last *completed* task. `cwd` matters here: it's the project context (server profiles, config) the task actually runs against, even though the session file itself lives outside any project.
+- **`tooler_play_repl_close`** (`session_id`, `save_as?`, `cwd?`) deletes the session's temp file and checkpoint. `save_as: "<path>"` copies the accumulated playbook there first — relative to `cwd` — turning the session into a real, standalone playbook file `tooler play` can run again later, the same outcome `--repl`'s own `.save` gives you.
+
+Under the hood a session is nothing more than `--resume --keep-checkpoint` called
+repeatedly against one growing temp file — no server-side state beyond that file and
+its checkpoint. Two things follow directly from that: it's **not safe to call
+`tooler_play_repl_exec` twice concurrently on the same `session_id`** (a
+read-modify-write on the file plus a subprocess spawn — parallel calls can race each
+other), and an abandoned session (never `_close`d) just leaks a temp file, cleaned up
+eventually by the OS's own temp-directory policy like any other stray file — there's no
+active session reaping.
 
 The line editor (`rustyline`) gives you ↑/↓ history — both within the session and persisted across sessions in `~/.tooler/repl_history` — and Tab-completion of action names (`run: `, `http: `, ...) and meta-commands (`.vars`, `.save `, ...) against the start of the line. It degrades to plain, unedited line reads when stdin isn't a real terminal (piped/scripted input, e.g. `.write_stdin` in a test), so a non-interactive `--repl` session keeps working exactly as before.
 

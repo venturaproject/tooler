@@ -4095,3 +4095,39 @@ fn audit_log_entry_includes_error_kind_on_a_failure() {
     assert_eq!(entries.len(), 1, "entries were: {entries:?}");
     assert_eq!(entries[0]["error_kind"], "assertion");
 }
+
+#[test]
+fn keep_checkpoint_preserves_the_state_file_after_a_successful_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: KeepCheckpoint\ntasks:\n  - name: t1\n    run: echo hi\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--keep-checkpoint"])
+        .assert()
+        .success();
+
+    assert!(
+        dir.path().join("playbook.yml.state.json").exists(),
+        "expected the checkpoint to survive a successful run under --keep-checkpoint"
+    );
+}
+
+#[test]
+fn without_keep_checkpoint_the_state_file_is_still_deleted_as_before() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: NoKeepCheckpoint\ntasks:\n  - name: t1\n    run: echo hi\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+
+    assert!(
+        !dir.path().join("playbook.yml.state.json").exists(),
+        "expected the checkpoint to still be deleted on success without --keep-checkpoint"
+    );
+}
