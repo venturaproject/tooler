@@ -995,6 +995,13 @@ fn lint_flags_an_unquoted_tainted_value_reaching_run() {
 #[test]
 fn lint_does_not_flag_a_tainted_value_piped_through_quote() {
     let (mut cmd, dir) = tooler();
+    // A real (if unreachable) server profile, so Check C's server:-reference check
+    // doesn't add an unrelated finding on top of the Check A/B behavior this test
+    // actually exercises.
+    tooler_in(dir.path())
+        .args(["server", "add", "ghost", "--host", "127.0.0.1"])
+        .assert()
+        .success();
     std::fs::write(
         dir.path().join("playbook.yml"),
         "name: LintTaintQuoted\ntasks:\n  - name: query rows\n    db_query:\n      \
@@ -3818,4 +3825,212 @@ fn changed_when_on_a_handler_is_respected_not_hardcoded_true() {
         .find(|t| t["name"] == "restart")
         .expect("handler outcome present");
     assert_eq!(handler_outcome["changed"], false);
+}
+
+#[test]
+fn lint_flags_a_secret_reference_that_isnt_set_in_the_keychain() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintMissingSecret\ntasks:\n  - name: use it\n    \
+         debug: \"{{secret.__tooler_test_lint_probe__.missing}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    // If this environment has no OS credential store backend, get_secret errors and
+    // the check deliberately stays silent (not the playbook's fault) -- skip rather
+    // than assert a false negative.
+    if findings.is_empty() {
+        eprintln!(
+            "skipping lint_flags_a_secret_reference_that_isnt_set_in_the_keychain: no OS \
+             credential store backend available in this environment"
+        );
+        return;
+    }
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["message"].as_str().unwrap().contains("isn't set")),
+        "findings were: {findings:?}"
+    );
+}
+
+#[test]
+fn lint_does_not_flag_a_secret_that_is_actually_set() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintSetSecret\ntasks:\n  - name: store it\n    secret_set:\n      \
+         profile: __tooler_test_lint_probe__\n      key: k\n      value: v\n      \
+         confirm: true\n  - name: use it\n    \
+         debug: \"{{secret.__tooler_test_lint_probe__.k}}\"\n",
+    )
+    .unwrap();
+
+    // secret_set: writes for real here (--lint parses but never runs tasks, so we
+    // need a separate real run first to actually populate the keychain entry).
+    let write = tooler_in(dir.path())
+        .args(["play", "playbook.yml"])
+        .assert();
+    let output = write.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() && combined.to_lowercase().contains("credential store") {
+        eprintln!(
+            "skipping lint_does_not_flag_a_secret_that_is_actually_set: no OS credential \
+             store backend available in this environment"
+        );
+        return;
+    }
+    assert!(output.status.success(), "playbook failed: {combined}");
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f["message"].as_str().unwrap().contains("secret")),
+        "findings were: {findings:?}"
+    );
+}
+
+#[test]
+fn lint_flags_an_unconfigured_server_profile() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintUnconfiguredServer\ntasks:\n  - name: connect\n    ssh:\n      \
+         server: ghost\n      command: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|f| f["message"]
+            .as_str()
+            .unwrap()
+            .contains("'ghost' isn't a configured server profile")),
+        "findings were: {findings:?}"
+    );
+}
+
+#[test]
+fn lint_does_not_flag_a_configured_server_profile() {
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args(["server", "add", "s1", "--host", "127.0.0.1"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintConfiguredServer\ntasks:\n  - name: connect\n    ssh:\n      \
+         server: s1\n      command: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 0, "findings were: {findings:?}");
+}
+
+#[test]
+fn lint_does_not_flag_a_templated_server_reference() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintTemplatedServer\nvars:\n  env: prod\ntasks:\n  - name: connect\n    ssh:\n      \
+         server: \"{{env}}\"\n      command: echo hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f["message"].as_str().unwrap().contains("server:")),
+        "findings were: {findings:?}"
+    );
+}
+
+#[test]
+fn lint_flags_an_unconfigured_mail_profile() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintUnconfiguredMail\ntasks:\n  - name: check inbox\n    \
+         mail_check:\n      server: ghost\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|f| f["message"]
+            .as_str()
+            .unwrap()
+            .contains("'ghost' isn't a configured mail profile")),
+        "findings were: {findings:?}"
+    );
+}
+
+#[test]
+fn register_json_summary_includes_duration_ms_on_every_task() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: DurationMs\ntasks:\n  - name: skip me\n    \
+         when: \"{{missing}} == present\"\n    run: echo skipped\n  - name: fast task\n    \
+         debug: hi\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value = last_line_json(&out);
+    let tasks = value["tasks"].as_array().unwrap();
+    for t in tasks {
+        assert!(t["duration_ms"].is_number(), "task was: {t}");
+    }
+    assert_eq!(tasks[0]["status"], "skipped");
+    assert_eq!(tasks[0]["duration_ms"], 0);
 }

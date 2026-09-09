@@ -1597,12 +1597,72 @@ fn token_base_name(token: &str) -> &str {
     token.split('.').next().unwrap_or(token)
 }
 
+/// A literal `server:` field on a task, tagged with which profile namespace to check
+/// it against for Check C — see `task_profile_refs`.
+enum ProfileRef<'a> {
+    Ssh(&'a str),
+    Mail(&'a str),
+}
+
+/// Every literal (non-`{{templated}}` — can't be statically resolved, same scope limit
+/// Check B already has) server:/mail-profile reference on `task`, for Check C.
+/// `ssh:`/`fs_cat:`/`fs_write:`/`systemd_restart:`/`systemd_status:`/`logs_tail:`/
+/// `logs_grep:`/`ps_list:`/`ps_kill:`/`stat:`/`db_query:`/`db_exec:`/`sync_db:`/
+/// `sync_files:` all resolve their `server:` through `ctx.config.server` (see
+/// `crate::commands::ssh::resolve_server`); `mail:`/`mail_check:` resolve theirs
+/// through the separate `ctx.config.mail` — confirmed by reading each dispatch site,
+/// not assumed, since they share the same field name but are different namespaces.
+/// `fleet:` is deliberately excluded — its `servers:`/`group:`/`all:` targeting is a
+/// different shape (comma-separated or a named group, not one literal profile name).
+fn task_profile_refs(task: &Task) -> Vec<ProfileRef<'_>> {
+    let mut out = Vec::new();
+    let lit = |s: &str| !s.contains("{{");
+    macro_rules! ssh_ref {
+        ($f:expr) => {
+            if let Some(s) = $f
+                && lit(s)
+            {
+                out.push(ProfileRef::Ssh(s));
+            }
+        };
+    }
+    ssh_ref!(task.ssh.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.fs_cat.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.fs_write.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.systemd_restart.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.systemd_status.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.logs_tail.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.logs_grep.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.ps_list.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.ps_kill.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.stat.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.db_query.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.db_exec.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.sync_db.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.sync_files.as_ref().map(|s| s.server.as_str()));
+    if let Some(s) = &task.mail_check
+        && lit(&s.server)
+    {
+        out.push(ProfileRef::Mail(&s.server));
+    }
+    if let Some(s) = &task.mail
+        && let Some(server) = &s.server
+        && lit(server)
+    {
+        out.push(ProfileRef::Mail(server));
+    }
+    out
+}
+
 /// `--lint`: static analysis over the parsed YAML only (same zero-side-effect parsing as
 /// `--list-tasks`) — see `PlayArgs.lint`'s doc comment for what it checks. `playbook_dir`
 /// is only used to best-effort read `vars_files:` entries for Check B; an unreadable or
 /// vault-encrypted one (no `TOOLER_VAULT_PASSWORD` set) is skipped, never an error —
-/// `--lint` never fails, it only ever reports findings.
-fn lint_playbook(playbook: &Playbook, playbook_dir: &Path) -> Vec<LintFinding> {
+/// `--lint` never fails, it only ever reports findings. `ctx` is only used for Check C's
+/// server:/mail-profile lookups (`ctx.config`, already in memory) and the OS keychain
+/// existence probe (`secrets::get_secret`) -- both read-only, no connections, matching
+/// the zero-side-effect promise every other `--lint` check already makes.
+fn lint_playbook(playbook: &Playbook, playbook_dir: &Path, ctx: &Context) -> Vec<LintFinding> {
     let mut known: std::collections::HashSet<String> = playbook.vars.keys().cloned().collect();
     for vf in &playbook.vars_files {
         if let Ok(loaded) = load_vars_file(&playbook_dir.join(vf)) {
@@ -1618,6 +1678,7 @@ fn lint_playbook(playbook: &Playbook, playbook_dir: &Path) -> Vec<LintFinding> {
         &mut tainted,
         &mut saw_include_vars,
         &mut findings,
+        ctx,
     );
     findings
 }
@@ -1634,6 +1695,7 @@ fn lint_tasks(
     tainted: &mut std::collections::HashSet<String>,
     saw_include_vars: &mut bool,
     findings: &mut Vec<LintFinding>,
+    ctx: &Context,
 ) {
     for task in tasks {
         // Check B — skipped entirely once an include_vars: task has been seen, since its
@@ -1653,7 +1715,33 @@ fn lint_tasks(
                         }
                         continue;
                     }
-                    if base == "secret" || base == "state" || base == "env" {
+                    // Check C (secret half) -- a full 3-part secret.<profile>.<key>
+                    // token is checked against the real OS keychain; a malformed
+                    // shorter form is left to render()'s own runtime handling, not
+                    // this check's job. state:/env: stay blanket-skipped: state: has
+                    // no "real environment" to check against, env: resolves from this
+                    // process's own environment at render time -- a different kind of
+                    // reference this check doesn't extend to.
+                    if base == "secret" {
+                        let parts: Vec<&str> = token.splitn(3, '.').collect();
+                        if let [_, profile, key] = parts[..] {
+                            match crate::secrets::get_secret(profile, key) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => findings.push(LintFinding {
+                                    task: task.name.clone(),
+                                    message: format!(
+                                        "{{{{{token}}}}} references a secret that isn't set -- \
+                                         tooler config set secret.{profile}.{key} <value> (or secret_set: in a playbook)"
+                                    ),
+                                }),
+                                // Keychain unavailable in this environment -- not the
+                                // playbook's fault, don't flag it as a playbook problem.
+                                Err(_) => {}
+                            }
+                        }
+                        continue;
+                    }
+                    if base == "state" || base == "env" {
                         continue;
                     }
                     if !known.contains(base) {
@@ -1685,6 +1773,31 @@ fn lint_tasks(
             }
         }
 
+        // Check C (server:/mail-profile half) -- a literal server: field naming a
+        // profile this environment never configured. fleet: excluded (its
+        // servers:/group:/all: targeting is a different shape entirely).
+        for r in task_profile_refs(task) {
+            match r {
+                ProfileRef::Ssh(name) if !ctx.config.server.contains_key(name) => {
+                    findings.push(LintFinding {
+                        task: task.name.clone(),
+                        message: format!(
+                            "server: '{name}' isn't a configured server profile -- tooler server add {name} ..."
+                        ),
+                    });
+                }
+                ProfileRef::Mail(name) if !ctx.config.mail.contains_key(name) => {
+                    findings.push(LintFinding {
+                        task: task.name.clone(),
+                        message: format!(
+                            "server: '{name}' isn't a configured mail profile -- tooler config set mail.{name}.host ..."
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+
         // Update the running state for tasks that come after this one.
         if let Some(reg) = &task.register {
             known.insert(reg.clone());
@@ -1700,13 +1813,13 @@ fn lint_tasks(
         }
 
         if let Some(block) = &task.block {
-            lint_tasks(block, known, tainted, saw_include_vars, findings);
+            lint_tasks(block, known, tainted, saw_include_vars, findings, ctx);
         }
         if let Some(rescue) = &task.rescue {
-            lint_tasks(rescue, known, tainted, saw_include_vars, findings);
+            lint_tasks(rescue, known, tainted, saw_include_vars, findings, ctx);
         }
         if let Some(always) = &task.always {
-            lint_tasks(always, known, tainted, saw_include_vars, findings);
+            lint_tasks(always, known, tainted, saw_include_vars, findings, ctx);
         }
     }
 }
@@ -1964,7 +2077,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         let playbook: Playbook =
             serde_yaml::from_str(&content).with_context(|| format!("Invalid YAML in {file}"))?;
         let playbook_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let findings = lint_playbook(&playbook, &playbook_dir);
+        let findings = lint_playbook(&playbook, &playbook_dir, ctx);
         return print_lint_findings(&playbook.name, &findings, ctx);
     }
 
@@ -2368,6 +2481,10 @@ struct TaskOutcome {
     /// category instead of parsing free-text -- see `classify_error`. `None` whenever
     /// `error` is `None`.
     error_kind: Option<&'static str>,
+    /// Wall-clock time this attempt took, in milliseconds -- `0` for a task that never
+    /// really ran (`when:`-skipped, or skipped by `--dry`), same "never touched
+    /// anything" scope `--audit-log` already uses to decide what's worth timing.
+    duration_ms: u64,
 }
 
 /// Best-effort classification of a task failure's message into a coarse, stable
@@ -2676,6 +2793,7 @@ fn execute_playbook(
                 changed: false,
                 error: None,
                 error_kind: None,
+                duration_ms: 0,
             });
             if is_top_level && !env.dry {
                 write_checkpoint(env, &playbook.name, &task.name, vars);
@@ -2695,8 +2813,10 @@ fn execute_playbook(
                     changed: false,
                     error: None,
                     error_kind: None,
+                    duration_ms: 0,
                 });
             } else {
+                let start = Instant::now();
                 run_notified_handlers(
                     playbook,
                     &mut notified,
@@ -2719,6 +2839,7 @@ fn execute_playbook(
                     changed: false,
                     error: None,
                     error_kind: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
                 });
             }
             if is_top_level && !env.dry {
@@ -2727,7 +2848,9 @@ fn execute_playbook(
             continue;
         }
 
+        let start = Instant::now();
         let result = run_task(task, vars, include_stack, env);
+        let duration_ms = start.elapsed().as_millis() as u64;
 
         match result {
             Ok(_) => {
@@ -2742,6 +2865,7 @@ fn execute_playbook(
                         changed: false,
                         error: None,
                         error_kind: None,
+                        duration_ms,
                     });
                 } else {
                     ok += 1;
@@ -2755,6 +2879,7 @@ fn execute_playbook(
                         changed,
                         error: None,
                         error_kind: None,
+                        duration_ms,
                     });
 
                     if changed {
@@ -2780,6 +2905,7 @@ fn execute_playbook(
                         changed: false,
                         error: Some(msg),
                         error_kind: Some(kind),
+                        duration_ms,
                     });
                 } else {
                     failed += 1;
@@ -2789,6 +2915,7 @@ fn execute_playbook(
                         changed: false,
                         error: Some(msg),
                         error_kind: Some(kind),
+                        duration_ms,
                     });
 
                     if json {
@@ -2929,7 +3056,10 @@ fn run_notified_handlers(
             println!("\n{} [{}]", "HANDLER".bold().magenta(), handler.name.bold());
         }
 
-        match run_task(handler, vars, include_stack, env) {
+        let start = Instant::now();
+        let handler_result = run_task(handler, vars, include_stack, env);
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match handler_result {
             Ok(()) => {
                 *ok += 1;
                 // A handler is a real Task -- honor its own changed_when: the same way
@@ -2944,6 +3074,7 @@ fn run_notified_handlers(
                     changed,
                     error: None,
                     error_kind: None,
+                    duration_ms,
                 });
             }
             Err(e) => {
@@ -2956,6 +3087,7 @@ fn run_notified_handlers(
                     changed: false,
                     error: Some(msg),
                     error_kind: Some(kind),
+                    duration_ms,
                 });
 
                 if json {
