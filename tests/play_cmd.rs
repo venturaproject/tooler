@@ -1064,13 +1064,18 @@ fn lint_flags_a_reference_to_an_undefined_var() {
 
 #[test]
 fn lint_does_not_flag_vars_defined_by_vars_or_earlier_register_or_special_prefixes() {
+    // secret.<profile>.<key> is deliberately not included here -- since Check C it's
+    // checked against the real OS keychain (see lint_flags_a_secret_reference_that_isnt_set_in_the_keychain
+    // / lint_does_not_flag_a_secret_that_is_actually_set for that, with the graceful
+    // per-platform skip a real keychain probe needs). state:/env: stay blanket-skipped
+    // regardless of platform, which is what this test actually covers.
     let (mut cmd, dir) = tooler();
     std::fs::write(
         dir.path().join("playbook.yml"),
         "name: LintKnownVars\nvars:\n  host: prod.example.com\ntasks:\n  - name: use vars\n    \
          debug: \"{{host}}\"\n  - name: register something\n    run: echo hi\n    \
          register: out\n  - name: use registered\n    debug: \"{{out}}\"\n  - \
-         name: use special prefixes\n    debug: \"{{secret.p.k}} {{state.x}} {{env.HOME}}\"\n",
+         name: use special prefixes\n    debug: \"{{state.x}} {{env.HOME}}\"\n",
     )
     .unwrap();
 
