@@ -275,6 +275,120 @@ pub(crate) fn ssh_exec_with_stdin(
     ))
 }
 
+/// Like `run_with_deadline`, but captures stdout as raw bytes (a `sync_db:` dump may be
+/// gzip-compressed binary, not text) and optionally writes `stdin_data` to the child's
+/// stdin right after spawn, on its own thread -- so a child that doesn't promptly read
+/// stdin can't deadlock the write against a full pipe buffer, same reasoning the
+/// stdout/stderr reader threads below already rely on. Shared by
+/// `ssh_exec_capture_bytes_with_timeout`/`ssh_exec_with_stdin_with_timeout`.
+fn run_with_deadline_bytes(
+    mut cmd: std::process::Command,
+    timeout: Option<u64>,
+    stdin_data: Option<&[u8]>,
+) -> Result<(Vec<u8>, String, bool, Option<i32>)> {
+    use std::time::{Duration, Instant};
+    isolate_process_group(&mut cmd);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    if stdin_data.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    let mut child = cmd
+        .spawn()
+        .context("Failed to launch ssh — is it installed?")?;
+
+    if let Some(data) = stdin_data {
+        let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
+        let data = data.to_vec();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin_pipe.write_all(&data);
+            // stdin_pipe drops here, closing it -- signals EOF to the child.
+        });
+    }
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
+
+    let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            kill_process_group(&mut child);
+            let _ = child.wait();
+            bail!("ssh command timed out after {}s", timeout.unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    Ok((
+        stdout_reader.join().unwrap_or_default(),
+        stderr_reader.join().unwrap_or_default(),
+        status.success(),
+        status.code(),
+    ))
+}
+
+/// Same as `ssh_exec_capture_bytes`, but kills the remote command if `timeout`
+/// (seconds) elapses first — see `run_with_deadline_bytes`. `None` behaves identically
+/// to `ssh_exec_capture_bytes` itself.
+pub(crate) fn ssh_exec_capture_bytes_with_timeout(
+    server: &Server,
+    command: &str,
+    timeout: Option<u64>,
+) -> Result<Vec<u8>> {
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.args(server.ssh_args())
+        .arg(server.host_target())
+        .arg(command);
+    let (bytes, stderr, success, _) = run_with_deadline_bytes(cmd, timeout, None)?;
+    if !success {
+        bail!(
+            "remote command failed on {}: {}",
+            server.host_target(),
+            stderr.trim()
+        );
+    }
+    Ok(bytes)
+}
+
+/// Same as `ssh_exec_with_stdin`, but kills the remote command if `timeout` (seconds)
+/// elapses first — see `run_with_deadline_bytes`. `None` behaves identically to
+/// `ssh_exec_with_stdin` itself.
+pub(crate) fn ssh_exec_with_stdin_with_timeout(
+    server: &Server,
+    command: &str,
+    input: &[u8],
+    timeout: Option<u64>,
+) -> Result<(String, String, bool)> {
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.args(server.ssh_args())
+        .arg(server.host_target())
+        .arg(command);
+    let (stdout_bytes, stderr, success, _) = run_with_deadline_bytes(cmd, timeout, Some(input))?;
+    Ok((
+        String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        stderr,
+        success,
+    ))
+}
+
 /// Builds the remote dump command for a database backup (`pg_dump`/`mysqldump`),
 /// optionally piped through `gzip -c` so the transferred bytes are compressed.
 pub fn dump_command(creds: &Credentials, gzip: bool) -> String {

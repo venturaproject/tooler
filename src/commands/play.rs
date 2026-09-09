@@ -3712,8 +3712,14 @@ fn run_task_once(
         );
     }
 
-    if task.timeout.is_some() && task.run.is_none() && task.ssh.is_none() && task.fleet.is_none() {
-        bail!("timeout: is only supported on run:/ssh:/fleet: tasks");
+    if task.timeout.is_some()
+        && task.run.is_none()
+        && task.ssh.is_none()
+        && task.fleet.is_none()
+        && task.sync_db.is_none()
+        && task.sync_files.is_none()
+    {
+        bail!("timeout: is only supported on run:/ssh:/fleet:/sync_db:/sync_files: tasks");
     }
 
     if let Some(spec) = &task.wait_for {
@@ -4868,10 +4874,15 @@ fn run_task_once(
             let from_creds = resolve_db_sync_creds(&server, &spec.from, vars)?;
             let to_creds = resolve_db_sync_creds(&server, &spec.to, vars)?;
             let dump_cmd = crate::db::dump_command(&from_creds, true);
-            let bytes = crate::db::ssh_exec_capture_bytes(&server, &dump_cmd)?;
+            let bytes =
+                crate::db::ssh_exec_capture_bytes_with_timeout(&server, &dump_cmd, task.timeout)?;
             let restore_cmd = crate::db::restore_command(&to_creds, true);
-            let (_, stderr, success) =
-                crate::db::ssh_exec_with_stdin(&server, &restore_cmd, &bytes)?;
+            let (_, stderr, success) = crate::db::ssh_exec_with_stdin_with_timeout(
+                &server,
+                &restore_cmd,
+                &bytes,
+                task.timeout,
+            )?;
             if !success {
                 bail!("db sync failed: {}", stderr.trim());
             }
@@ -4911,7 +4922,8 @@ fn run_task_once(
                 crate::db::shell_quote(&from),
                 crate::db::shell_quote(&to),
             );
-            let (stdout, stderr, success, _) = crate::db::ssh_exec_capture_lenient(&server, &cmd)?;
+            let (stdout, stderr, success, _) =
+                crate::db::ssh_exec_capture_lenient_with_timeout(&server, &cmd, task.timeout)?;
             if success {
                 let out = stdout.trim();
                 if !env.quiet {
@@ -5332,6 +5344,7 @@ fn write_audit_entry(
     let Some(path) = &env.audit_log else {
         return;
     };
+    let error_kind = error.map(classify_error);
     let line = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "playbook": env.playbook_name,
@@ -5340,6 +5353,7 @@ fn write_audit_entry(
         "status": status,
         "duration_ms": duration.as_millis(),
         "error": error,
+        "error_kind": error_kind,
     });
     use std::io::Write;
     let result = std::fs::OpenOptions::new()
@@ -7794,7 +7808,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_files_rejects_timeout() {
+    fn sync_files_no_longer_rejects_timeout() {
+        // timeout: is now supported on sync_files: (an rsync can hang just as easily as
+        // run:/ssh:/fleet: can) -- --dry never attempts a real connection either way, so
+        // this should succeed instead of hitting the old upfront "only supported on" bail.
         let ctx = Context::new(
             OutputFormat::Json,
             "default".to_string(),
@@ -7813,7 +7830,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_err());
+        assert!(run_task_once(&task, &mut vars, &mut include_stack, &env).is_ok());
     }
 
     #[test]

@@ -4034,3 +4034,59 @@ fn register_json_summary_includes_duration_ms_on_every_task() {
     assert_eq!(tasks[0]["status"], "skipped");
     assert_eq!(tasks[0]["duration_ms"], 0);
 }
+
+#[test]
+fn timeout_on_sync_files_no_longer_rejected_upfront_fails_on_server_resolution_instead() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: SyncFilesTimeout\ntasks:\n  - name: sync\n    sync_files:\n      \
+         server: ghost\n      from: /a\n      to: /b\n    timeout: 5\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+    assert!(!out.contains("only supported on"), "stdout was: {out}");
+}
+
+#[test]
+fn timeout_on_sync_db_no_longer_rejected_upfront_fails_on_server_resolution_instead() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: SyncDbTimeout\ntasks:\n  - name: sync\n    sync_db:\n      \
+         server: ghost\n      from:\n        engine: mysql\n        host: 127.0.0.1\n        \
+         database: a\n        user: u\n      to:\n        engine: mysql\n        \
+         host: 127.0.0.1\n        database: b\n        user: u\n    timeout: 5\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+    assert!(!out.contains("only supported on"), "stdout was: {out}");
+}
+
+#[test]
+fn audit_log_entry_includes_error_kind_on_a_failure() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: AuditErrorKind\ntasks:\n  - name: bad assertion\n    assert: \"1 == 2\"\n",
+    )
+    .unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+
+    cmd.args([
+        "play",
+        "playbook.yml",
+        "--audit-log",
+        audit_path.to_str().unwrap(),
+    ])
+    .assert()
+    .failure();
+
+    let entries = read_jsonl(&audit_path);
+    assert_eq!(entries.len(), 1, "entries were: {entries:?}");
+    assert_eq!(entries[0]["error_kind"], "assertion");
+}
