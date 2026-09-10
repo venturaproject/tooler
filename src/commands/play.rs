@@ -133,6 +133,15 @@ pub struct PlayArgs {
     /// tooling.
     #[arg(long)]
     pub schema: bool,
+
+    /// Resolve every task's {{vars}}/{{state.*}} and print the concrete action each one
+    /// *would* take -- the exact command line, SQL, URL, target server, file path -- as
+    /// JSON, without running anything or opening a connection. Between --dry (shape) and
+    /// --lint (problems): "show me exactly what will happen". A `register:`ed value from
+    /// an earlier task isn't known statically, so it stays as the literal `{{name}}`.
+    /// Always exits 0.
+    #[arg(long)]
+    pub explain: bool,
 }
 
 // ── YAML schema ───────────────────────────────────────────────────────────────
@@ -168,6 +177,18 @@ struct Playbook {
     /// `run_failure_hook`.
     #[serde(default)]
     on_failure: Vec<Task>,
+    /// Opt this playbook in as its own first-class MCP tool: `tooler mcp` (started from
+    /// the project root) then exposes `tooler_pb_<name>` alongside the generic
+    /// `tooler_play`, so an agent calls a proven process by name with typed arguments
+    /// instead of hand-writing YAML. See `McpToolSpec` / `params:` / `playbook_tool_defs`.
+    #[serde(default)]
+    mcp_tool: Option<McpToolSpec>,
+    /// Typed parameters — the input schema for `mcp_tool:` (and a place to document a
+    /// playbook's `--var` inputs even without it). Each becomes a `{{var}}` at run time;
+    /// one with a `default:` also seeds `vars:` so `tooler play <pb> --var k=v` works
+    /// from the plain CLI. See `ParamSpec`.
+    #[serde(default)]
+    params: HashMap<String, ParamSpec>,
     /// When true, a real (non-dry) top-level run of this playbook file takes an exclusive
     /// lock (`<file>.lock`) for its duration. A second `tooler play` of the same file
     /// while that lock is held and still fresh exits non-zero with a clear message
@@ -186,6 +207,159 @@ struct Playbook {
 
 fn default_lock_timeout() -> u64 {
     21600
+}
+
+/// `mcp_tool:` — see `Playbook::mcp_tool`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct McpToolSpec {
+    /// The tool is exposed as `tooler_pb_<name>`. Defaults to a slug of the playbook's
+    /// file name.
+    #[serde(default)]
+    name: Option<String>,
+    /// One-line description shown to the calling agent.
+    description: String,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum ParamType {
+    #[default]
+    String,
+    Number,
+    Boolean,
+}
+
+/// One `params:` entry — see `Playbook::params`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ParamSpec {
+    #[serde(default, rename = "type")]
+    param_type: ParamType,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    required: bool,
+    #[serde(default, rename = "enum")]
+    enum_values: Option<Vec<String>>,
+    /// Default value — seeds `vars:` so the playbook also runs from the plain CLI.
+    #[serde(default)]
+    default: Option<serde_json::Value>,
+}
+
+impl ParamSpec {
+    /// The `default:` rendered as the string a `{{var}}` would see (a scalar as-is,
+    /// anything else as its JSON text). `None` when there's no default.
+    fn default_as_string(&self) -> Option<String> {
+        self.default.as_ref().map(json_cell_to_string)
+    }
+}
+
+/// A playbook that opted in as an MCP tool, reduced to what `tooler mcp` needs to
+/// register it — see `playbook_tool_defs`.
+pub(crate) struct PlaybookToolDef {
+    /// The full MCP tool name, `tooler_pb_<slug>`.
+    pub name: String,
+    pub description: String,
+    pub file: PathBuf,
+    /// A JSON Schema object for the tool's arguments.
+    pub input_schema: serde_json::Value,
+}
+
+/// Scans `playbooks_dir` for `*.yml`/`*.yaml` declaring `mcp_tool:` and builds one
+/// `PlaybookToolDef` each. Best-effort: an unparseable playbook is skipped. Called once
+/// at `tooler mcp` startup.
+pub(crate) fn playbook_tool_defs(playbooks_dir: &Path) -> Vec<PlaybookToolDef> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(playbooks_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "yml" && ext != "yaml" {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(playbook) = serde_yaml::from_str::<Playbook>(&content) else {
+            continue;
+        };
+        let Some(mcp) = &playbook.mcp_tool else {
+            continue;
+        };
+        let slug = mcp.name.clone().unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("playbook")
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect()
+        });
+
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for (pname, p) in &playbook.params {
+            let mut schema = serde_json::Map::new();
+            schema.insert(
+                "type".into(),
+                match p.param_type {
+                    ParamType::String => "string",
+                    ParamType::Number => "number",
+                    ParamType::Boolean => "boolean",
+                }
+                .into(),
+            );
+            if let Some(d) = &p.description {
+                schema.insert("description".into(), d.clone().into());
+            }
+            if let Some(e) = &p.enum_values {
+                schema.insert("enum".into(), serde_json::json!(e));
+            }
+            properties.insert(pname.clone(), serde_json::Value::Object(schema));
+            if p.required {
+                required.push(pname.clone());
+            }
+        }
+        if playbook_has_confirm_gated(&playbook) {
+            properties.insert(
+                "confirm".into(),
+                serde_json::json!({
+                    "type": "boolean",
+                    "description": "Set true to allow this playbook's confirm-gated actions (db_exec:/fs_write:/deploy:/…) to run.",
+                }),
+            );
+        }
+
+        out.push(PlaybookToolDef {
+            name: format!("tooler_pb_{slug}"),
+            description: mcp.description.clone(),
+            file: path.clone(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            }),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Whether any task in `pb` (including nested `block:`/`rescue:`/`always:`/`parallel:`)
+/// is a `confirm:`-gated destructive action — see `confirm_gate`.
+fn playbook_has_confirm_gated(pb: &Playbook) -> bool {
+    fn walk(tasks: &[Task]) -> bool {
+        tasks.iter().any(|t| {
+            confirm_gate(t).is_some()
+                || [&t.block, &t.rescue, &t.always, &t.parallel]
+                    .into_iter()
+                    .flatten()
+                    .any(|b| walk(b))
+        })
+    }
+    walk(&pb.tasks) || walk(&pb.on_failure)
 }
 
 #[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
@@ -1019,6 +1193,32 @@ struct HttpSpec {
     /// same way, relative to this same playbook directory.
     #[serde(default)]
     download: Option<String>,
+    /// Follow pagination: keep fetching successive pages and concatenate their items
+    /// into one `register:`ed JSON array. Mutually exclusive with `download:`. See
+    /// `PaginateSpec`.
+    #[serde(default)]
+    paginate: Option<PaginateSpec>,
+}
+
+fn default_max_pages() -> usize {
+    20
+}
+
+/// `http: {paginate: ...}` — after each page is fetched, `next` is rendered with the
+/// page's body available as `{{page}}` (and `{{page.status}}`); its result is the next
+/// page's URL. The loop stops when `next` renders blank, equals the current URL, or
+/// `max_pages` is reached. `items` (a `| json:`-style path) points at the array within
+/// each page's body — every page's array is concatenated into the registered result;
+/// omit it to collect each whole page body as one element instead. `register:` then also
+/// gets `<reg>.pages` (the page count) alongside `<reg>.status` (the last page's).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PaginateSpec {
+    next: String,
+    #[serde(default)]
+    items: Option<String>,
+    #[serde(default = "default_max_pages")]
+    max_pages: usize,
 }
 
 /// Poll one of `check_url`/`check_port`/`ssh` (exactly one — validated upfront in
@@ -1925,9 +2125,9 @@ fn lintable_fields(task: &Task) -> Vec<&str> {
 }
 
 /// Scans `s` for every `{{...}}` template token, in the same shape `render_with`'s
-/// substitution loop parses them (`split_filter` reuse) — but collecting `(token,
-/// filter)` pairs instead of substituting. Shared by `--lint`'s two checks.
-fn find_tokens(s: &str) -> Vec<(&str, Option<Filter<'_>>)> {
+/// substitution loop parses them (`parse_pipeline` reuse) — but collecting `(token,
+/// pipeline)` pairs instead of substituting. Shared by `--lint`'s checks.
+fn find_tokens(s: &str) -> Vec<(&str, Vec<FilterOp<'_>>)> {
     let mut out = Vec::new();
     let mut rest = s;
     while let Some(start) = rest.find("{{") {
@@ -1935,7 +2135,7 @@ fn find_tokens(s: &str) -> Vec<(&str, Option<Filter<'_>>)> {
         let Some(end) = after.find("}}") else {
             break;
         };
-        out.push(split_filter(after[..end].trim()));
+        out.push(parse_pipeline(after[..end].trim()));
         rest = &after[end + 2..];
     }
     out
@@ -2247,9 +2447,10 @@ fn lint_tasks(
 
         // Check A — untrusted data reaching a shell command unquoted.
         if let Some(cmd) = shell_command(task) {
-            for (token, filter) in find_tokens(cmd) {
+            for (token, pipeline) in find_tokens(cmd) {
                 let base = token_base_name(token);
-                if tainted.contains(base) && !matches!(filter, Some(Filter::Quote)) {
+                let quoted = pipeline.iter().any(|f| matches!(f, FilterOp::Quote));
+                if tainted.contains(base) && !quoted {
                     findings.push(LintFinding {
                         task: task.name.clone(),
                         message: format!(
@@ -2354,6 +2555,253 @@ fn print_lint_findings(playbook_name: &str, findings: &[LintFinding], ctx: &Cont
     Ok(())
 }
 
+/// `--explain`: walks the playbook's tasks (and nested `block:`/`rescue:`/`always:`/
+/// `parallel:`), resolving each one's `{{vars}}` and printing the concrete action it
+/// would take, without running anything. `set_fact:`/`state_set:` values are threaded
+/// forward so later tasks resolve against them; a `register:`ed value can't be known
+/// statically, so it stays literal.
+fn print_explain(
+    playbook: &Playbook,
+    playbook_dir: &Path,
+    project_root: &Path,
+    vars: &mut HashMap<String, String>,
+    ctx: &Context,
+) -> Result<()> {
+    fn walk(
+        tasks: &[Task],
+        vars: &mut HashMap<String, String>,
+        playbook_dir: &Path,
+        project_root: &Path,
+        out: &mut Vec<serde_json::Value>,
+    ) {
+        for task in tasks {
+            let mut entry = serde_json::Map::new();
+            entry.insert("name".into(), task.name.clone().into());
+            entry.insert("action".into(), task_action_label(task).into());
+            if let Some(w) = &task.when {
+                entry.insert("when".into(), render(w, vars).into());
+            }
+            entry.insert(
+                "explain".into(),
+                explain_task(task, vars, playbook_dir, project_root),
+            );
+            out.push(serde_json::Value::Object(entry));
+
+            // Thread forward the two actions whose effect is knowable statically.
+            if let Some(facts) = &task.set_fact {
+                for (k, v) in facts {
+                    vars.insert(k.clone(), render(v, vars));
+                }
+            }
+            if let Some(state) = &task.state_set {
+                for (k, v) in state {
+                    vars.insert(format!("state.{k}"), render(v, vars));
+                }
+            }
+            for branch in [&task.block, &task.rescue, &task.always, &task.parallel]
+                .into_iter()
+                .flatten()
+            {
+                walk(branch, vars, playbook_dir, project_root, out);
+            }
+        }
+    }
+
+    let mut tasks_out = Vec::new();
+    walk(
+        &playbook.tasks,
+        vars,
+        playbook_dir,
+        project_root,
+        &mut tasks_out,
+    );
+    let doc = serde_json::json!({"playbook": playbook.name, "tasks": tasks_out});
+
+    if ctx.output == OutputFormat::Json {
+        println!("{doc}");
+        return Ok(());
+    }
+    println!(
+        "{} {}",
+        "PLAY".bold().cyan(),
+        format!("[{}]", playbook.name).bold()
+    );
+    for t in &tasks_out {
+        println!(
+            "\n{} {} {}",
+            "•".cyan(),
+            t["name"].as_str().unwrap_or("").bold(),
+            format!("({})", t["action"].as_str().unwrap_or("")).dimmed()
+        );
+        if let Some(w) = t.get("when").and_then(|w| w.as_str()) {
+            println!("  when: {w}");
+        }
+        if let Some(obj) = t["explain"].as_object() {
+            for (k, v) in obj {
+                let vs = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                println!("  {}: {}", k.dimmed(), vs);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The concrete, `{{var}}`-resolved fields of one task's action, for `--explain`. A
+/// best-effort match — the actions an agent most needs to see before a run get real
+/// detail; anything else returns an empty object (the task still lists its name/action).
+fn explain_task(
+    task: &Task,
+    vars: &HashMap<String, String>,
+    playbook_dir: &Path,
+    project_root: &Path,
+) -> serde_json::Value {
+    use serde_json::json;
+    let r = |s: &str| render(s, vars);
+
+    if let Some(spec) = &task.run {
+        let (cmd, env) = match spec {
+            RunSpec::Simple(c) => (r(c), serde_json::Map::new()),
+            RunSpec::Structured { command, env } => (
+                r(command),
+                env.iter().map(|(k, v)| (k.clone(), r(v).into())).collect(),
+            ),
+        };
+        return json!({"command": cmd, "env": serde_json::Value::Object(env)});
+    }
+    if let Some(spec) = &task.ssh {
+        return json!({"server": r(&spec.server), "command": r(&spec.command), "sudo": spec.sudo});
+    }
+    if let Some(spec) = &task.fleet {
+        let target = spec
+            .servers
+            .as_ref()
+            .map(|s| format!("servers={}", r(s)))
+            .or_else(|| spec.group.as_ref().map(|g| format!("group={}", r(g))))
+            .unwrap_or_else(|| "all".into());
+        return json!({"target": target, "command": r(&spec.command), "sudo": spec.sudo});
+    }
+    if let Some(spec) = &task.http {
+        return json!({
+            "method": spec.method.to_uppercase(),
+            "url": r(&spec.url),
+            "headers": spec.headers.keys().cloned().collect::<Vec<_>>(),
+            "has_body": spec.body.is_some(),
+            "paginated": spec.paginate.is_some(),
+        });
+    }
+    if let Some(spec) = &task.db_query {
+        return json!({"server": r(&spec.server), "sql": r(&spec.sql)});
+    }
+    if let Some(spec) = &task.db_exec {
+        return json!({"server": r(&spec.server), "sql": r(&spec.sql)});
+    }
+    if let Some(spec) = &task.db_load {
+        return json!({
+            "server": r(&spec.server), "table": r(&spec.table), "file": r(&spec.file),
+            "mode": format!("{:?}", spec.mode).to_lowercase(),
+            "format": format!("{:?}", spec.format).to_lowercase(),
+        });
+    }
+    if let Some(spec) = &task.deploy {
+        let mut steps = Vec::new();
+        if spec.pull {
+            steps.push("pull");
+        }
+        if spec.build.is_some() {
+            steps.push("build");
+        }
+        if spec.restart.is_some() {
+            steps.push("restart");
+        }
+        if spec.health_url.is_some() {
+            steps.push("health-check");
+        }
+        return json!({"server": r(&spec.server), "path": r(&spec.path), "steps": steps});
+    }
+    if let Some(spec) = &task.upload {
+        return json!({"server": r(&spec.server), "local": r(&spec.local), "remote": r(&spec.remote)});
+    }
+    if let Some(spec) = &task.cron {
+        let op = spec
+            .add
+            .as_ref()
+            .map(|a| format!("add {}", r(a)))
+            .or_else(|| spec.remove.as_ref().map(|p| format!("remove /{}/", r(p))))
+            .unwrap_or_else(|| "list".into());
+        return json!({"server": r(&spec.server), "op": op});
+    }
+    if let Some(spec) = &task.fs_write {
+        return json!({"server": r(&spec.server), "path": r(&spec.path)});
+    }
+    if let Some(spec) = &task.fs_cat {
+        return json!({"server": r(&spec.server), "path": r(&spec.path)});
+    }
+    if let Some(spec) = &task.systemd_restart {
+        return json!({"server": r(&spec.server), "unit": r(&spec.unit), "sudo": spec.sudo});
+    }
+    if let Some(spec) = &task.sync_db {
+        return json!({"server": r(&spec.server)});
+    }
+    if let Some(spec) = &task.sync_files {
+        return json!({"server": r(&spec.server), "from": r(&spec.from), "to": r(&spec.to)});
+    }
+    if let Some(spec) = &task.write_file {
+        return json!({"path": r(&spec.path), "append": spec.append});
+    }
+    if let Some(spec) = &task.write_csv {
+        return json!({"path": r(&spec.path)});
+    }
+    if let Some(spec) = &task.read_csv {
+        return json!({"path": r(&spec.path)});
+    }
+    if let Some(spec) = &task.mail {
+        return json!({"to": r(&spec.to), "subject": r(&spec.subject)});
+    }
+    if let Some(facts) = &task.set_fact {
+        return json!(
+            facts
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::from(r(v))))
+                .collect::<serde_json::Map<_, _>>()
+        );
+    }
+    if let Some(state) = &task.state_set {
+        return json!(
+            state
+                .iter()
+                .map(|(k, v)| (format!("state.{k}"), serde_json::Value::from(r(v))))
+                .collect::<serde_json::Map<_, _>>()
+        );
+    }
+    if let Some(msg) = &task.debug {
+        return json!({ "message": r(msg) });
+    }
+    if let Some(spec) = &task.assert {
+        let conds: Vec<String> = match spec {
+            AssertSpec::Simple(c) => vec![r(c)],
+            AssertSpec::Structured { that, .. } => that.iter().map(|c| r(c)).collect(),
+        };
+        return json!({ "conditions": conds });
+    }
+    if let Some(spec) = &task.include {
+        let file = r(spec.file());
+        let resolved = if is_literal_path(&file) {
+            playbook_dir.join(&file).display().to_string()
+        } else {
+            project_root
+                .join("playbooks")
+                .join(format!("{file}.yml"))
+                .display()
+                .to_string()
+        };
+        return json!({ "file": resolved });
+    }
+    json!({})
+}
+
 /// Mostly-static, per-run execution context threaded through the dispatch chain —
 /// bundled into one struct because the parameter list (playbook_dir, project_root, dry,
 /// quiet, ctx, plus mutable vars/include_stack passed alongside) got too long to stay
@@ -2416,6 +2864,13 @@ struct RunEnv<'a> {
 /// playbook in `run()` and for an `include:`d sub-playbook.
 fn load_playbook_vars(playbook: &Playbook, dir: &Path) -> Result<HashMap<String, String>> {
     let mut merged: HashMap<String, String> = HashMap::new();
+    // params: defaults sit at the very bottom — vars_files:, vars:, and any --var still
+    // override them.
+    for (name, p) in &playbook.params {
+        if let Some(d) = p.default_as_string() {
+            merged.insert(name.clone(), d);
+        }
+    }
     for vf in &playbook.vars_files {
         merged.extend(load_vars_file(&dir.join(vf))?);
     }
@@ -2592,6 +3047,21 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         let playbook_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let findings = lint_playbook(&playbook, &playbook_dir, &project_root, ctx);
         return print_lint_findings(&playbook.name, &findings, ctx);
+    }
+
+    if args.explain {
+        let content = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("Cannot read playbook: {file}"))?;
+        let playbook: Playbook =
+            serde_yaml::from_str(&content).with_context(|| format!("Invalid YAML in {file}"))?;
+        let playbook_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let mut vars = load_playbook_vars(&playbook, &playbook_dir)?;
+        apply_vars_file_overrides(&mut vars, &args.vars_file)?;
+        apply_var_overrides(&mut vars, &args.vars)?;
+        for (k, v) in load_persisted_state(&data_path_for(&file_path))? {
+            vars.insert(format!("state.{k}"), v);
+        }
+        return print_explain(&playbook, &playbook_dir, &project_root, &mut vars, ctx);
     }
 
     let notes = read_notes(&file_path);
@@ -4952,22 +5422,27 @@ fn run_task_once(
             .as_ref()
             .map(|d| join_confined(&env.playbook_dir, d))
             .transpose()?;
+        if download_path.is_some() && spec.paginate.is_some() {
+            bail!(
+                "http: can't combine download: and paginate: (task '{}')",
+                task.name
+            );
+        }
         if !env.quiet {
-            match &download_path {
-                Some(p) => println!(
-                    "  {} {} {} → {}",
-                    spec.method.to_uppercase().bold(),
-                    "→".bold(),
-                    url.dimmed(),
-                    p.display().to_string().dimmed()
+            let suffix = match (&download_path, &spec.paginate) {
+                (Some(p), _) => format!(" → {}", p.display().to_string().dimmed()),
+                (None, Some(pg)) => format!(
+                    " {}",
+                    format!("(paginated, ≤{} pages)", pg.max_pages).dimmed()
                 ),
-                None => println!(
-                    "  {} {} {}",
-                    spec.method.to_uppercase().bold(),
-                    "→".bold(),
-                    url.dimmed()
-                ),
-            }
+                (None, None) => String::new(),
+            };
+            println!(
+                "  {} {} {}{suffix}",
+                spec.method.to_uppercase().bold(),
+                "→".bold(),
+                url.dimmed(),
+            );
         }
         if !env.dry {
             if let Some(out_path) = &download_path {
@@ -4975,6 +5450,16 @@ fn run_task_once(
                 if let Some(reg) = &task.register {
                     vars.insert(format!("{reg}.status"), status.to_string());
                     vars.insert(reg.clone(), download_rel.clone().unwrap_or_default());
+                }
+            } else if let Some(pg) = &spec.paginate {
+                let (items_json, last_status, pages) = http_paginate(spec, pg, &url, vars)?;
+                if !env.quiet {
+                    println!("  {} {pages} page(s)", "✓".green());
+                }
+                if let Some(reg) = &task.register {
+                    vars.insert(format!("{reg}.status"), last_status.to_string());
+                    vars.insert(format!("{reg}.pages"), pages.to_string());
+                    vars.insert(reg.clone(), items_json);
                 }
             } else {
                 let (body, status) = http_request(spec, &url, vars)?;
@@ -6941,6 +7426,67 @@ fn http_request(
     Ok((body, status.as_u16()))
 }
 
+/// `http: {paginate: ...}`'s engine — fetches `url`, then repeatedly renders
+/// `pg.next` (with the just-fetched page's body as `{{page}}` / `{{page.status}}`) to get
+/// the next URL, stopping when it renders blank, unchanged, or `max_pages` is hit. Each
+/// page's `pg.items` array (or its whole body, when `items` is unset) is appended.
+/// Returns `(items_json, last_status, page_count)`.
+fn http_paginate(
+    spec: &HttpSpec,
+    pg: &PaginateSpec,
+    first_url: &str,
+    vars: &HashMap<String, String>,
+) -> Result<(String, u16, usize)> {
+    let mut collected: Vec<serde_json::Value> = Vec::new();
+    let mut url = first_url.to_string();
+    let mut last_status: u16;
+    let mut pages = 0usize;
+
+    loop {
+        let (body, status) = http_request(spec, &url, vars)?;
+        last_status = status;
+        pages += 1;
+
+        match &pg.items {
+            Some(path) => {
+                if let Some(picked) = apply_json_filter(&body, path)
+                    && let Ok(serde_json::Value::Array(a)) =
+                        serde_json::from_str::<serde_json::Value>(&picked)
+                {
+                    collected.extend(a);
+                }
+            }
+            None => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    collected.push(v);
+                } else {
+                    collected.push(serde_json::Value::String(body.clone()));
+                }
+            }
+        }
+
+        if pages >= pg.max_pages {
+            break;
+        }
+        // Render pg.next against the current page's body.
+        let mut page_vars = vars.clone();
+        page_vars.insert("page".to_string(), body);
+        page_vars.insert("page.status".to_string(), status.to_string());
+        let next = render(&pg.next, &page_vars);
+        let next = next.trim();
+        if next.is_empty() || next.contains("{{") || next == url {
+            break;
+        }
+        url = next.to_string();
+    }
+
+    Ok((
+        serde_json::Value::Array(collected).to_string(),
+        last_status,
+        pages,
+    ))
+}
+
 /// `http: {download: ...}`'s engine — same request as `http_request`, but reads the
 /// response as raw bytes (`resp.bytes()`, never `.text()`) and writes them straight to
 /// `out_path`, so a binary response (PDF/zip/image) survives intact instead of being
@@ -7131,14 +7677,14 @@ fn resolve_token(token: &str, vars: &HashMap<String, String>) -> Option<String> 
 }
 
 /// Single-pass `{{token}}` substitution shared by `render()` and `render_for_display()` —
-/// the scan is identical, only how a resolved *token* (post `split_filter`) is turned into
-/// a replacement string differs (real value vs. masked). A trailing `| json:<path>` or
-/// `| quote` filter (see `split_filter`/`apply_json_filter`/`shell_quote`) is applied
-/// uniformly regardless of `resolve`, so `render_for_display` masks-then-filters too: a
-/// masked secret piped through `| json:...` never parses as JSON and just stays
-/// unresolved, while one piped through `| quote` becomes `'***'` — either way the real
-/// value never leaks. Unresolvable tokens (unknown name, bad filter) are left exactly as
-/// written, same as the old known-vars-only replace loop this superseded.
+/// the scan is identical, only how a resolved *token* (post `parse_pipeline`) is turned
+/// into a replacement string differs (real value vs. masked). The `| a | b | c` filter
+/// pipeline (see `parse_pipeline`/`apply_filter_op`) is applied left to right, uniformly
+/// regardless of `resolve`, so `render_for_display` masks-then-filters too: a masked
+/// secret piped through `| json:...` never parses as JSON and just stays unresolved,
+/// while one piped through `| quote` becomes `'***'` — either way the real value never
+/// leaks. `| default:X` is the one stage that produces a value from an unresolved token.
+/// Anything still unresolved at the end is left exactly as written.
 fn render_with(s: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -7151,46 +7697,155 @@ fn render_with(s: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
             continue;
         };
         let inner = after[..end].trim();
-        let (token, filter) = split_filter(inner);
-        let resolved = resolve(token).and_then(|v| match filter {
-            Some(Filter::Json(path)) => apply_json_filter(&v, path),
-            Some(Filter::Quote) => Some(shell_quote(&v)),
-            None => Some(v),
-        });
-        out.push_str(&resolved.unwrap_or_else(|| format!("{{{{{inner}}}}}")));
+        let (token, ops) = parse_pipeline(inner);
+        let mut cur = resolve(token);
+        for op in &ops {
+            cur = match (cur, op) {
+                // `default:` is the only op that produces a value from nothing.
+                (None, FilterOp::Default(d)) => Some((*d).to_string()),
+                (None, _) => None,
+                (Some(v), op) => apply_filter_op(op, v),
+            };
+        }
+        out.push_str(&cur.unwrap_or_else(|| format!("{{{{{inner}}}}}")));
         rest = &after[end + 2..];
     }
     out.push_str(rest);
     out
 }
 
-/// A `{{token | ...}}` render filter — see `split_filter`. Only one filter is recognized
-/// per token (no chaining `json:` into `quote`); a value that needs both goes through
-/// `set_fact:` first to compute an intermediate var, same two-step workaround the DSL
-/// already uses for anything else that needs more than one transform.
-enum Filter<'a> {
+/// One stage of a `{{token | a | b | c}}` render pipeline — see `parse_pipeline`.
+/// Applied left to right in `render_with`. Every op except `Default` is a
+/// `String -> Option<String>` transform (a shape mismatch — bad JSON, wrong type —
+/// yields `None`, which leaves the whole `{{...}}` token literal, same fail-soft rule a
+/// bad `json:` path already has); `Default` is the one that runs when the token itself
+/// didn't resolve.
+#[derive(Debug, PartialEq)]
+enum FilterOp<'a> {
     /// `| json:<path>` — see `apply_json_filter`.
     Json(&'a str),
-    /// `| quote` — see `shell_quote`.
+    /// `| quote` — POSIX single-quote for a shell command line (see `shell_quote`).
     Quote,
+    /// `| default:<value>` — substitute `<value>` when the token didn't resolve.
+    Default(&'a str),
+    /// `| pluck:<field>` — a JSON array of objects → a JSON array of that field's values.
+    Pluck(&'a str),
+    /// `| where:<field>==<value>` / `| where:<field>!=<value>` — filter a JSON array of
+    /// objects, comparing each object's `<field>` (stringified) to `<value>`.
+    Where(&'a str, bool, &'a str),
+    /// `| join:<sep>` — a JSON array → its elements joined by `<sep>`.
+    Join(&'a str),
+    /// `| first` / `| last` — a JSON array → its first / last element (rendered like a
+    /// `json:` leaf).
+    First,
+    Last,
+    /// `| upper` / `| lower` / `| trim` — plain string transforms.
+    Upper,
+    Lower,
+    Trim,
 }
 
-/// Splits a `{{...}}` token's trimmed inner text on an optional trailing `| json:<path>`
-/// or `| quote` filter — e.g. `"resp | json:data.id"` -> `("resp", Some(Filter::Json("data.id")))`,
-/// `"item | quote"` -> `("item", Some(Filter::Quote))`. Only these two filters are
-/// recognized; anything else after a `|` is left as part of the token name (so a stray
-/// `|` doesn't silently vanish) and will simply fail to resolve like any unknown token.
-fn split_filter(inner: &str) -> (&str, Option<Filter<'_>>) {
-    if let Some((token, filter)) = inner.split_once('|') {
-        let filter = filter.trim();
-        if let Some(path) = filter.strip_prefix("json:") {
-            return (token.trim(), Some(Filter::Json(path.trim())));
-        }
-        if filter == "quote" {
-            return (token.trim(), Some(Filter::Quote));
-        }
+/// Splits a `{{...}}` token's trimmed inner text into `(base token, pipeline)` on `|` —
+/// e.g. `"rows | where:active==true | pluck:name | join:,"` →
+/// `("rows", [Where("active", true, "true"), Pluck("name"), Join(",")])`. An unrecognized
+/// filter word leaves the rest of the `|…` as part of the token name (so a stray `|`
+/// never silently vanishes — it just fails to resolve like any unknown token).
+fn parse_pipeline(inner: &str) -> (&str, Vec<FilterOp<'_>>) {
+    let mut parts = inner.split('|');
+    let token = parts.next().unwrap_or("").trim();
+    let mut ops = Vec::new();
+    for raw in parts {
+        let f = raw.trim();
+        let op = if let Some(p) = f.strip_prefix("json:") {
+            FilterOp::Json(p.trim())
+        } else if let Some(v) = f.strip_prefix("default:") {
+            FilterOp::Default(v.trim())
+        } else if let Some(v) = f.strip_prefix("pluck:") {
+            FilterOp::Pluck(v.trim())
+        } else if let Some(v) = f.strip_prefix("where:") {
+            let v = v.trim();
+            if let Some((field, val)) = v.split_once("==") {
+                FilterOp::Where(field.trim(), true, val.trim())
+            } else if let Some((field, val)) = v.split_once("!=") {
+                FilterOp::Where(field.trim(), false, val.trim())
+            } else {
+                // Malformed where: — abandon the pipeline, token resolves as-is.
+                return (token, ops);
+            }
+        } else if let Some(v) = f.strip_prefix("join:") {
+            FilterOp::Join(v)
+        } else {
+            match f {
+                "quote" => FilterOp::Quote,
+                "first" => FilterOp::First,
+                "last" => FilterOp::Last,
+                "upper" => FilterOp::Upper,
+                "lower" => FilterOp::Lower,
+                "trim" => FilterOp::Trim,
+                // Unknown word — stop here; the leftover text isn't a valid token name
+                // either, so the whole `{{...}}` will render literal, same as today.
+                _ => return (token, ops),
+            }
+        };
+        ops.push(op);
     }
-    (inner, None)
+    (token, ops)
+}
+
+/// Applies one pipeline stage to an already-resolved string value.
+fn apply_filter_op(op: &FilterOp, v: String) -> Option<String> {
+    match op {
+        FilterOp::Json(path) => apply_json_filter(&v, path),
+        FilterOp::Quote => Some(shell_quote(&v)),
+        // Default only matters on the None path (handled in render_with); on a value it's
+        // a no-op.
+        FilterOp::Default(_) => Some(v),
+        FilterOp::Pluck(field) => {
+            let arr = serde_json::from_str::<serde_json::Value>(&v).ok()?;
+            let out: Vec<serde_json::Value> = arr
+                .as_array()?
+                .iter()
+                .filter_map(|el| el.get(field).cloned())
+                .collect();
+            Some(serde_json::Value::Array(out).to_string())
+        }
+        FilterOp::Where(field, want_eq, value) => {
+            let arr = serde_json::from_str::<serde_json::Value>(&v).ok()?;
+            let out: Vec<serde_json::Value> = arr
+                .as_array()?
+                .iter()
+                .filter(|el| {
+                    let cell = el.get(field).map(json_cell_to_string).unwrap_or_default();
+                    (&cell == value) == *want_eq
+                })
+                .cloned()
+                .collect();
+            Some(serde_json::Value::Array(out).to_string())
+        }
+        FilterOp::Join(sep) => {
+            let arr = serde_json::from_str::<serde_json::Value>(&v).ok()?;
+            Some(
+                arr.as_array()?
+                    .iter()
+                    .map(json_cell_to_string)
+                    .collect::<Vec<_>>()
+                    .join(sep),
+            )
+        }
+        FilterOp::First | FilterOp::Last => {
+            let arr = serde_json::from_str::<serde_json::Value>(&v).ok()?;
+            let a = arr.as_array()?;
+            let el = if matches!(op, FilterOp::First) {
+                a.first()
+            } else {
+                a.last()
+            }?;
+            Some(json_cell_to_string(el))
+        }
+        FilterOp::Upper => Some(v.to_uppercase()),
+        FilterOp::Lower => Some(v.to_lowercase()),
+        FilterOp::Trim => Some(v.trim().to_string()),
+    }
 }
 
 /// POSIX single-quote escaping for a value about to be interpolated into a `run:`/`ssh:`/
@@ -8394,6 +9049,8 @@ mod tests {
             vars: HashMap::new(),
             handlers: vec![],
             on_failure: vec![],
+            mcp_tool: None,
+            params: HashMap::new(),
             single_instance: false,
             lock_timeout: 21600,
             tasks: vec![Task {
@@ -8417,6 +9074,8 @@ mod tests {
                 ..Default::default()
             }],
             on_failure: vec![],
+            mcp_tool: None,
+            params: HashMap::new(),
             single_instance: false,
             lock_timeout: 21600,
             tasks: vec![Task {
@@ -8960,6 +9619,8 @@ mod tests {
             vars: vars(&[("host", "localhost")]),
             handlers: vec![],
             on_failure: vec![],
+            mcp_tool: None,
+            params: HashMap::new(),
             single_instance: false,
             lock_timeout: 21600,
             tasks: vec![],
@@ -8986,6 +9647,8 @@ mod tests {
             vars: HashMap::new(),
             handlers: vec![],
             on_failure: vec![],
+            mcp_tool: None,
+            params: HashMap::new(),
             single_instance: false,
             lock_timeout: 21600,
             tasks: vec![Task {
@@ -9008,5 +9671,82 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("nonexistent"), "error was: {err}");
+    }
+
+    #[test]
+    fn parse_pipeline_splits_token_and_ops() {
+        let (tok, ops) = parse_pipeline("rows | where:active==true | pluck:name | join:,");
+        assert_eq!(tok, "rows");
+        assert_eq!(
+            ops,
+            vec![
+                FilterOp::Where("active", true, "true"),
+                FilterOp::Pluck("name"),
+                FilterOp::Join(","),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_pipeline_stops_at_an_unknown_filter_word() {
+        let (tok, ops) = parse_pipeline("x | bogus | upper");
+        assert_eq!(tok, "x");
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn apply_filter_op_pluck_and_where_and_join() {
+        let rows = r#"[{"n":"a","ok":"y"},{"n":"b","ok":"n"},{"n":"c","ok":"y"}]"#;
+        let plucked = apply_filter_op(&FilterOp::Pluck("n"), rows.to_string()).unwrap();
+        assert_eq!(plucked, r#"["a","b","c"]"#);
+        let filtered =
+            apply_filter_op(&FilterOp::Where("ok", true, "y"), rows.to_string()).unwrap();
+        let names = apply_filter_op(&FilterOp::Pluck("n"), filtered).unwrap();
+        assert_eq!(apply_filter_op(&FilterOp::Join("-"), names).unwrap(), "a-c");
+    }
+
+    #[test]
+    fn apply_filter_op_on_a_non_array_yields_none() {
+        assert!(apply_filter_op(&FilterOp::Pluck("x"), "not json".to_string()).is_none());
+        assert!(apply_filter_op(&FilterOp::First, "42".to_string()).is_none());
+    }
+
+    #[test]
+    fn render_default_only_fires_on_an_unresolved_token() {
+        let v = vars(&[("known", "here")]);
+        assert_eq!(render("{{known | default:x}}", &v), "here");
+        assert_eq!(render("{{missing | default:x}}", &v), "x");
+    }
+
+    #[test]
+    fn playbook_tool_defs_reads_mcp_tool_and_params() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("deploy.yml"),
+            "name: Deploy\nmcp_tool: {description: \"Deploy the app\"}\n\
+             params:\n  env: {type: string, required: true, enum: [prod, staging]}\n  \
+             dry: {type: boolean, default: false}\n\
+             tasks:\n  - name: go\n    db_exec: {server: db1, sql: \"UPDATE x SET y=1\", confirm: true}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("plain.yml"),
+            "name: Plain\ntasks:\n  - name: x\n    run: echo hi\n",
+        )
+        .unwrap();
+
+        let defs = playbook_tool_defs(dir.path());
+        assert_eq!(defs.len(), 1, "only the mcp_tool: one is exposed");
+        let d = &defs[0];
+        assert_eq!(d.name, "tooler_pb_deploy");
+        assert_eq!(d.description, "Deploy the app");
+        let schema = &d.input_schema;
+        assert_eq!(schema["required"], serde_json::json!(["env"]));
+        assert_eq!(
+            schema["properties"]["env"]["enum"],
+            serde_json::json!(["prod", "staging"])
+        );
+        // has a confirm-gated db_exec: -> the schema offers a `confirm` toggle.
+        assert_eq!(schema["properties"]["confirm"]["type"], "boolean");
     }
 }

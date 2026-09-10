@@ -4928,3 +4928,208 @@ fn db_load_dry_run_previews_without_connecting() {
         "stdout was: {out}"
     );
 }
+
+// ── rich template filters ────────────────────────────────────────────────────
+
+fn run_debug_line(dir: &std::path::Path, body: &str) -> String {
+    std::fs::write(
+        dir.join("playbook.yml"),
+        format!("name: F\ntasks:\n  - name: rows\n    set_fact:\n      rows: '[{{\"name\":\"a\",\"active\":\"true\"}},{{\"name\":\"b\",\"active\":\"false\"}},{{\"name\":\"c\",\"active\":\"true\"}}]'\n  - name: show\n    debug: \"{body}\"\n"),
+    )
+    .unwrap();
+    stdout_of(
+        tooler_in(dir)
+            .args(["play", "playbook.yml"])
+            .assert()
+            .success(),
+    )
+}
+
+#[test]
+fn default_fills_in_an_unresolved_token() {
+    let (_c, dir) = tooler();
+    let out = run_debug_line(dir.path(), "v=[{{nope | default:fallback}}]");
+    assert!(out.contains("v=[fallback]"), "{out}");
+}
+
+#[test]
+fn pluck_where_join_chain_left_to_right() {
+    let (_c, dir) = tooler();
+    let out = run_debug_line(
+        dir.path(),
+        "{{rows | where:active==true | pluck:name | join:- }}",
+    );
+    assert!(out.contains("a-c"), "{out}");
+}
+
+#[test]
+fn first_last_and_string_ops() {
+    let (_c, dir) = tooler();
+    let out = run_debug_line(
+        dir.path(),
+        "f={{rows | first | json:name | upper}} l={{rows | last | json:name}}",
+    );
+    assert!(out.contains("f=A l=c"), "{out}");
+}
+
+#[test]
+fn a_bad_shape_in_a_filter_leaves_the_token_literal() {
+    let (_c, dir) = tooler();
+    // "hello" isn't a JSON array — pluck can't apply, token stays literal.
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: F\nvars: {s: hello}\ntasks:\n  - name: show\n    debug: \"{{s | pluck:x}}\"\n",
+    )
+    .unwrap();
+    let out = stdout_of(
+        tooler_in(dir.path())
+            .args(["play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("{{s | pluck:x}}"), "{out}");
+}
+
+#[test]
+fn quote_anywhere_in_a_pipeline_satisfies_the_injection_lint() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: F\ntasks:\n  - name: fetch\n    http: {url: \"http://127.0.0.1:1/x\", ignore_status: true}\n    register: r\n  - name: use\n    run: \"echo {{r | json:msg | quote}}\"\n",
+    )
+    .unwrap();
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["message"].as_str().unwrap().contains("shell injection")),
+        "{out}"
+    );
+}
+
+// ── http: pagination ─────────────────────────────────────────────────────────
+
+/// A server that answers sequential GETs with `make_bodies(port)[i]` (so a body can
+/// embed its own server's URL), then closes.
+fn serve_sequence(make_bodies: impl FnOnce(u16) -> Vec<String>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let bodies = make_bodies(port);
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for body in bodies {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    port
+}
+
+#[test]
+fn paginate_concatenates_pages_until_next_is_blank() {
+    let (mut cmd, dir) = tooler();
+    // Each page's `next` carries the full URL of the next one; the last is "" -> stop.
+    let port = serve_sequence(|p| {
+        let base = format!("http://127.0.0.1:{p}");
+        vec![
+            format!(r#"{{"results":[1,2],"next":"{base}/2"}}"#),
+            format!(r#"{{"results":[3,4],"next":"{base}/3"}}"#),
+            r#"{"results":[5],"next":""}"#.to_string(),
+        ]
+    });
+    let base = format!("http://127.0.0.1:{port}");
+
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        format!(
+            "name: P\ntasks:\n  - name: all\n    http:\n      url: \"{base}/1\"\n      paginate:\n        next: \"{{{{page | json:next}}}}\"\n        items: results\n    register: r\n  - name: show\n    debug: \"got={{{{r}}}} pages={{{{r.pages}}}}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    assert!(out.contains("got=[1,2,3,4,5]"), "{out}");
+    assert!(out.contains("pages=3"), "{out}");
+}
+
+#[test]
+fn paginate_and_download_together_is_rejected() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: P\ntasks:\n  - name: x\n    http:\n      url: http://127.0.0.1:1/a\n      download: out.bin\n      paginate: {next: \"\"}\n",
+    )
+    .unwrap();
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("can't combine download: and paginate:"),
+        "{out}"
+    );
+}
+
+// ── --explain ────────────────────────────────────────────────────────────────
+
+#[test]
+fn explain_resolves_vars_and_shows_the_concrete_command() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: E\nvars: {env: prod}\ntasks:\n  - name: build\n    run: \"make deploy ENV={{env}}\"\n  - name: mig\n    db_exec: {server: db1, sql: \"UPDATE f SET v=1 WHERE e='{{env}}'\", confirm: true}\n",
+    )
+    .unwrap();
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--explain"])
+            .assert()
+            .success(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["tasks"][0]["explain"]["command"], "make deploy ENV=prod");
+    assert_eq!(
+        v["tasks"][1]["explain"]["sql"],
+        "UPDATE f SET v=1 WHERE e='prod'"
+    );
+}
+
+#[test]
+fn explain_makes_no_connection_and_exits_zero() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: E\ntasks:\n  - name: x\n    ssh: {server: ghost, command: whoami}\n",
+    )
+    .unwrap();
+    // ghost is unconfigured; a real run would fail, --explain must not.
+    cmd.args(["play", "playbook.yml", "--explain"])
+        .assert()
+        .success();
+}
+
+// ── playbook params: defaults ────────────────────────────────────────────────
+
+#[test]
+fn params_defaults_seed_vars_on_a_plain_cli_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: P\nparams:\n  greeting: {type: string, default: hola}\ntasks:\n  - name: show\n    debug: \"{{greeting}} {{name | default:world}}\"\n",
+    )
+    .unwrap();
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
+    assert!(out.contains("hola world"), "{out}");
+}

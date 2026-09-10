@@ -38,9 +38,30 @@ pub struct McpArgs {
     /// Append a JSON line per MCP tool call to this file [env: TOOLER_MCP_AUDIT_LOG]
     #[arg(long, env = "TOOLER_MCP_AUDIT_LOG")]
     pub audit_log: Option<std::path::PathBuf>,
+    /// Print the playbook-backed tools (`tooler_pb_*`, from `./playbooks/*.yml` declaring
+    /// `mcp_tool:`) this server would expose, then exit without starting it.
+    #[arg(long)]
+    pub list_playbook_tools: bool,
 }
 
 pub fn run(args: McpArgs, _ctx: &Context) -> Result<()> {
+    if args.list_playbook_tools {
+        let tools = discover_playbook_tools();
+        let list: Vec<_> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.tool.name,
+                    "description": t.tool.description,
+                    "file": t.file.display().to_string(),
+                    "input_schema": &*t.tool.input_schema,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "playbook_tools": list }));
+        return Ok(());
+    }
+
     if args.http && args.token.is_none() {
         anyhow::bail!(
             "tooler mcp --http requires a bearer token: pass --token or set TOOLER_MCP_TOKEN. \
@@ -552,6 +573,11 @@ struct PlayMcpArgs {
     /// playbook.
     #[serde(default)]
     schema: bool,
+    /// Resolve every task's vars and print the concrete action each would take (exact
+    /// command/SQL/URL/target/path) as JSON, without running anything or connecting.
+    /// Between dry (shape) and lint (problems).
+    #[serde(default)]
+    explain: bool,
     /// Inline playbook YAML instead of a file on disk -- written to a short-lived temp
     /// file for this call only, then deleted. Mutually exclusive with file. Only valid
     /// combined with dry=true, lint=true, list_tasks=true, or list_tags=true -- a real
@@ -1147,11 +1173,39 @@ struct SshSslArgs {
 
 // ── server ────────────────────────────────────────────────────────────────
 
+/// A playbook exposed as its own MCP tool (via `mcp_tool:` in the YAML) — discovered
+/// once at startup from `./playbooks/`. See `commands::play::playbook_tool_defs`.
+#[derive(Clone)]
+struct PlaybookTool {
+    tool: rmcp::model::Tool,
+    file: PathBuf,
+}
+
 #[derive(Clone)]
 pub struct ToolerMcp {
     tool_router: ToolRouter<ToolerMcp>,
     prompt_router: PromptRouter<ToolerMcp>,
     audit_log: Option<std::path::PathBuf>,
+    playbook_tools: Vec<PlaybookTool>,
+}
+
+/// Scans `./playbooks/` (relative to the process's launch cwd) for playbooks declaring
+/// `mcp_tool:` and turns each into a `PlaybookTool`. Fixed for the life of the server.
+fn discover_playbook_tools() -> Vec<PlaybookTool> {
+    let dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("playbooks");
+    crate::commands::play::playbook_tool_defs(&dir)
+        .into_iter()
+        .map(|def| PlaybookTool {
+            tool: rmcp::model::Tool::new(
+                def.name,
+                def.description,
+                std::sync::Arc::new(def.input_schema.as_object().cloned().unwrap_or_default()),
+            ),
+            file: def.file,
+        })
+        .collect()
 }
 
 impl ToolerMcp {
@@ -1160,6 +1214,7 @@ impl ToolerMcp {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             audit_log: None,
+            playbook_tools: discover_playbook_tools(),
         }
     }
 
@@ -1645,10 +1700,10 @@ impl ToolerMcp {
                     None,
                 ));
             }
-            if !(args.dry || args.lint || args.list_tasks || args.list_tags) {
+            if !(args.dry || args.lint || args.list_tasks || args.list_tags || args.explain) {
                 return Err(McpError::invalid_params(
-                    "content: requires dry=true, lint=true, list_tasks=true, or \
-                     list_tags=true -- a real run needs a real file",
+                    "content: requires dry=true, lint=true, list_tasks=true, \
+                     list_tags=true, or explain=true -- a real run needs a real file",
                     None,
                 ));
             }
@@ -1680,6 +1735,7 @@ impl ToolerMcp {
         push_flag(&mut argv, "--list-tags", args.list_tags);
         push_flag(&mut argv, "--lint", args.lint);
         push_flag(&mut argv, "--schema", args.schema);
+        push_flag(&mut argv, "--explain", args.explain);
         self.exec_self(argv, &args.cwd).await
     }
 
@@ -3034,6 +3090,58 @@ impl ToolerMcp {
 #[tool_handler(router = self.tool_router)]
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for ToolerMcp {
+    // Hand-written (the #[tool_handler] macro only generates these when absent) so the
+    // static #[tool] router and the dynamically-discovered playbook tools (tooler_pb_*)
+    // are merged into one surface.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        let mut tools = self.tool_router.list_all();
+        tools.extend(self.playbook_tools.iter().map(|p| p.tool.clone()));
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if request.name.starts_with("tooler_pb_")
+            && let Some(pb) = self
+                .playbook_tools
+                .iter()
+                .find(|p| p.tool.name == request.name)
+        {
+            let mut argv = vec!["play".to_string(), pb.file.to_string_lossy().to_string()];
+            let args = request.arguments.unwrap_or_default();
+            let mut allow_confirm = false;
+            for (k, v) in &args {
+                if k == "confirm" {
+                    allow_confirm = v.as_bool().unwrap_or(false);
+                    continue;
+                }
+                let val = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                argv.push("--var".to_string());
+                argv.push(format!("{k}={val}"));
+            }
+            if allow_confirm {
+                argv.push("--yes".to_string());
+            }
+            return self.exec_self(argv, &None).await;
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -3174,6 +3282,7 @@ mod tests {
             "list_tags",
             "lint",
             "schema",
+            "explain",
             "cwd",
         ];
 
