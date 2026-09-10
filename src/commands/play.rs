@@ -158,6 +158,16 @@ struct Playbook {
     /// succeed, in first-notified order. Matched by `name` — see `validate_handlers`.
     #[serde(default)]
     handlers: Vec<Task>,
+    /// Tasks run when this playbook's task loop hits a non-ignored failure, right before
+    /// it reports and bails — a playbook-level counterpart to `block:`'s `rescue:`, for
+    /// "if anything fails, send an alert / hit a webhook / record it in `state_set:`".
+    /// Best-effort: a failing `on_failure:` task is logged and the remaining ones still
+    /// run — it never re-triggers itself and never changes the original failure (the run
+    /// still exits non-zero). Not fired by a handler failure or in `--dry`. Two vars are
+    /// set for these tasks: `{{failed_task}}` and `{{failure_reason}}`. See
+    /// `run_failure_hook`.
+    #[serde(default)]
+    on_failure: Vec<Task>,
 }
 
 #[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
@@ -387,6 +397,14 @@ struct Task {
     /// Deliberately requires `confirm: true`, same gate every other action that
     /// mutates or restarts remote state already has. See `DeploySpec`.
     deploy: Option<DeploySpec>,
+    /// Push a local file to an absolute remote path over scp — the same
+    /// `commands::ssh::run_scp` `tooler ssh copy` uses. Deliberately requires
+    /// `confirm: true`, same gate `fs_write:` uses. See `UploadSpec`.
+    upload: Option<UploadSpec>,
+    /// Manage a remote server's crontab — the same `tooler cron` engine. Exactly one of
+    /// `add`/`remove`/`list`; `add`/`remove` require `confirm: true`, `list` is
+    /// read-only. See `CronSpec`.
+    cron: Option<CronSpec>,
     /// Cap concurrent `loop:` iterations to N at a time (processed in chunks of N) instead
     /// of the default strictly-sequential execution. Only valid combined with `loop:`. See
     /// `run_loop_parallel`.
@@ -1199,6 +1217,55 @@ impl RequiresConfirm for DeploySpec {
     }
 }
 
+/// `upload:` — push a local file to an absolute remote path over scp, the same
+/// `commands::ssh::run_scp` `tooler ssh copy` uses. `local` resolves relative to this
+/// playbook's own directory (an absolute path is honored as-is, unconfined — an
+/// author-time path like a build artifact, same rationale as `include_vars:`). `remote`
+/// is the absolute destination path on the server. Deliberately requires `confirm:
+/// true`, same gate `fs_write:` uses — it writes to the remote filesystem.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UploadSpec {
+    server: String,
+    local: String,
+    remote: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+impl RequiresConfirm for UploadSpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
+}
+
+/// `cron:` — manage a remote server's crontab, the same `tooler cron` engine. Exactly
+/// one of `add`/`remove`/`list` (validated in `exec_cron`). `add` appends a full
+/// crontab line; `remove` drops every line containing the given fixed substring; `list`
+/// captures the parsed entries. `add`/`remove` mutate the crontab and require `confirm:
+/// true`; `list` is read-only and needs no confirm. `register:` (if set) captures:
+/// `add` → `"true"`, `remove` → the count of removed lines, `list` → a JSON array of
+/// entries — directly `loop: {from: "{{reg}}"}`-chainable, same as `db_query:`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CronSpec {
+    server: String,
+    #[serde(default)]
+    add: Option<String>,
+    #[serde(default)]
+    remove: Option<String>,
+    #[serde(default)]
+    list: bool,
+    #[serde(default)]
+    confirm: bool,
+}
+
+impl RequiresConfirm for CronSpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
+}
+
 /// `mail:` — every field is renderable via `render()` (so `{{secret.<profile>.password}}`
 /// or any `{{var}}` works anywhere here, same as `db_query:`). `to`/`cc`/`bcc` accept a
 /// comma-separated list of addresses. Credentials resolve through `resolve_mail_creds`:
@@ -1716,6 +1783,8 @@ fn task_profile_refs(task: &Task) -> Vec<ProfileRef<'_>> {
     ssh_ref!(task.sync_db.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.sync_files.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.deploy.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.upload.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.cron.as_ref().map(|s| s.server.as_str()));
     if let Some(spec) = &task.fleet {
         if let Some(servers) = &spec.servers
             && lit(servers)
@@ -1752,7 +1821,12 @@ fn task_profile_refs(task: &Task) -> Vec<ProfileRef<'_>> {
 /// server:/mail-profile lookups (`ctx.config`, already in memory) and the OS keychain
 /// existence probe (`secrets::get_secret`) -- both read-only, no connections, matching
 /// the zero-side-effect promise every other `--lint` check already makes.
-fn lint_playbook(playbook: &Playbook, playbook_dir: &Path, ctx: &Context) -> Vec<LintFinding> {
+fn lint_playbook(
+    playbook: &Playbook,
+    playbook_dir: &Path,
+    project_root: &Path,
+    ctx: &Context,
+) -> Vec<LintFinding> {
     let mut known: std::collections::HashSet<String> = playbook.vars.keys().cloned().collect();
     for vf in &playbook.vars_files {
         if let Ok(loaded) = load_vars_file(&playbook_dir.join(vf)) {
@@ -1770,7 +1844,118 @@ fn lint_playbook(playbook: &Playbook, playbook_dir: &Path, ctx: &Context) -> Vec
         &mut findings,
         ctx,
     );
+    // on_failure: tasks run in the same var scope as the main run — lint them with the
+    // running known/tainted state as it stands after every regular task.
+    lint_tasks(
+        &playbook.on_failure,
+        &mut known,
+        &mut tainted,
+        &mut saw_include_vars,
+        &mut findings,
+        ctx,
+    );
+    check_d(playbook, playbook_dir, project_root, &mut findings);
     findings
+}
+
+/// Check D — static resolution of names and paths that only fail (or silently
+/// mis-resolve) at run time: a `notify:` that matches no handler, and an `include:` /
+/// `include_vars:` / `vars_files:` path that resolves to no file. Advisory only, like
+/// every other `--lint` check.
+fn check_d(
+    playbook: &Playbook,
+    playbook_dir: &Path,
+    project_root: &Path,
+    findings: &mut Vec<LintFinding>,
+) {
+    let handler_names: std::collections::HashSet<&str> =
+        playbook.handlers.iter().map(|h| h.name.as_str()).collect();
+
+    // `include:` resolution mirrors `resolve_include_path` — a bare name is looked up
+    // under `<project_root>/playbooks/`, anything with a `/` or a `.yml`/`.yaml`
+    // extension is treated as a path relative to this playbook's own directory.
+    let include_resolves = |file: &str| -> bool {
+        if is_literal_path(file) {
+            playbook_dir.join(file).exists()
+        } else {
+            ["yml", "yaml"].iter().any(|ext| {
+                project_root
+                    .join("playbooks")
+                    .join(format!("{file}.{ext}"))
+                    .exists()
+            })
+        }
+    };
+
+    fn walk(
+        tasks: &[Task],
+        handler_names: &std::collections::HashSet<&str>,
+        playbook_dir: &Path,
+        include_resolves: &impl Fn(&str) -> bool,
+        findings: &mut Vec<LintFinding>,
+    ) {
+        for task in tasks {
+            for n in &task.notify {
+                if !n.contains("{{") && !handler_names.contains(n.as_str()) {
+                    findings.push(LintFinding {
+                        task: task.name.clone(),
+                        message: format!(
+                            "notify: '{n}' matches no handler in handlers: -- this fails at runtime"
+                        ),
+                    });
+                }
+            }
+            if let Some(spec) = &task.include {
+                let file = spec.file();
+                if !file.contains("{{") && !include_resolves(file) {
+                    findings.push(LintFinding {
+                        task: task.name.clone(),
+                        message: format!("include: '{file}' resolves to no file"),
+                    });
+                }
+            }
+            if let Some(file) = &task.include_vars
+                && !file.contains("{{")
+                && !playbook_dir.join(file).exists()
+            {
+                findings.push(LintFinding {
+                    task: task.name.clone(),
+                    message: format!("include_vars: '{file}' not found"),
+                });
+            }
+            for branch in [&task.block, &task.rescue, &task.always]
+                .into_iter()
+                .flatten()
+            {
+                walk(
+                    branch,
+                    handler_names,
+                    playbook_dir,
+                    include_resolves,
+                    findings,
+                );
+            }
+        }
+    }
+
+    for tasks in [&playbook.tasks, &playbook.handlers, &playbook.on_failure] {
+        walk(
+            tasks,
+            &handler_names,
+            playbook_dir,
+            &include_resolves,
+            findings,
+        );
+    }
+
+    for vf in &playbook.vars_files {
+        if !playbook_dir.join(vf).exists() {
+            findings.push(LintFinding {
+                task: format!("vars_files: {vf}"),
+                message: format!("vars_files: '{vf}' not found -- vars from it won't be available"),
+            });
+        }
+    }
 }
 
 /// Walks `tasks` in execution order, threading the same running `known`/`tainted` state
@@ -2182,7 +2367,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         let playbook: Playbook =
             serde_yaml::from_str(&content).with_context(|| format!("Invalid YAML in {file}"))?;
         let playbook_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let findings = lint_playbook(&playbook, &playbook_dir, ctx);
+        let findings = lint_playbook(&playbook, &playbook_dir, &project_root, ctx);
         return print_lint_findings(&playbook.name, &findings, ctx);
     }
 
@@ -2774,7 +2959,8 @@ fn validate_handlers(playbook: &Playbook) -> Result<()> {
         }
         Ok(())
     }
-    walk(&playbook.tasks, &handler_names)
+    walk(&playbook.tasks, &handler_names)?;
+    walk(&playbook.on_failure, &handler_names)
 }
 
 /// Whether a task passes `--tags`/`--skip-tags` filtering: matches `--tags` (if set,
@@ -3015,6 +3201,7 @@ fn execute_playbook(
                     });
                 } else {
                     failed += 1;
+                    let reason = msg.clone();
                     outcomes.push(TaskOutcome {
                         name: task.name.clone(),
                         status: "failed",
@@ -3023,6 +3210,20 @@ fn execute_playbook(
                         error_kind: Some(kind),
                         duration_ms,
                     });
+
+                    run_failure_hook(
+                        playbook,
+                        &task.name,
+                        &reason,
+                        vars,
+                        include_stack,
+                        env,
+                        json,
+                        &sep,
+                        &mut ok,
+                        &mut failed,
+                        &mut outcomes,
+                    );
 
                     if json {
                         println!(
@@ -3132,6 +3333,81 @@ fn execute_playbook(
         outcomes.iter().filter(|o| o.changed).count(),
     );
     Ok(())
+}
+
+/// Runs the playbook's `on_failure:` tasks after its task loop hit a non-ignored
+/// failure, right before `execute_playbook` reports and bails. Best-effort by design:
+/// a failing `on_failure:` task is logged and counted but never aborts the hook or
+/// re-triggers it, and the run still exits non-zero on the original failure regardless.
+/// A no-op when `on_failure:` is empty or in `--dry`. `{{failed_task}}` and
+/// `{{failure_reason}}` are set for these tasks. Its outcomes are appended to
+/// `outcomes` so they show in the same JSON `tasks` array / recap that then reports
+/// `success: false`.
+#[allow(clippy::too_many_arguments)]
+fn run_failure_hook(
+    playbook: &Playbook,
+    failed_task: &str,
+    reason: &str,
+    vars: &mut HashMap<String, String>,
+    include_stack: &mut Vec<PathBuf>,
+    env: &RunEnv,
+    json: bool,
+    sep: &str,
+    ok: &mut usize,
+    failed: &mut usize,
+    outcomes: &mut Vec<TaskOutcome>,
+) {
+    if playbook.on_failure.is_empty() || env.dry {
+        return;
+    }
+
+    vars.insert("failed_task".to_string(), failed_task.to_string());
+    vars.insert("failure_reason".to_string(), reason.to_string());
+
+    if !json {
+        println!("\n{}", sep.dimmed());
+    }
+
+    for t in &playbook.on_failure {
+        if !json {
+            println!("\n{} [{}]", "ON_FAILURE".bold().magenta(), t.name.bold());
+        }
+        let start = Instant::now();
+        let result = run_task(t, vars, include_stack, env);
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match result {
+            Ok(()) => {
+                *ok += 1;
+                outcomes.push(TaskOutcome {
+                    name: t.name.clone(),
+                    status: "ok",
+                    changed: false,
+                    error: None,
+                    error_kind: None,
+                    duration_ms,
+                });
+            }
+            Err(e) => {
+                *failed += 1;
+                let msg = e.to_string();
+                if !json {
+                    println!(
+                        "  {} on_failure task failed (ignored): {e}",
+                        "!".yellow().bold()
+                    );
+                }
+                let kind = classify_error(&msg);
+                outcomes.push(TaskOutcome {
+                    name: t.name.clone(),
+                    status: "failed",
+                    changed: false,
+                    error: Some(msg),
+                    error_kind: Some(kind),
+                    duration_ms,
+                });
+            }
+        }
+    }
 }
 
 /// Runs every currently-pending `notify:`ed handler and drains `notified` — shared by
@@ -3815,6 +4091,93 @@ fn exec_deploy(
         confirmed.sudo,
         sudo_pass.as_deref(),
     )
+}
+
+/// The only place `upload:` actually runs — `commands::ssh::run_scp`, the exact
+/// primitive `tooler ssh copy` uses. Returns the local file's byte size for `register:`.
+fn exec_upload(
+    confirmed: &Confirmed<UploadSpec>,
+    vars: &HashMap<String, String>,
+    env: &RunEnv,
+) -> Result<u64> {
+    let local = env.playbook_dir.join(render(&confirmed.local, vars));
+    let meta = std::fs::metadata(&local)
+        .with_context(|| format!("upload: local file not found: {}", local.display()))?;
+    if !meta.is_file() {
+        bail!("upload: not a regular file: {}", local.display());
+    }
+    let server = crate::commands::ssh::resolve_server(env.ctx, &render(&confirmed.server, vars))?;
+    crate::commands::ssh::run_scp(&server, &local, &render(&confirmed.remote, vars))?;
+    Ok(meta.len())
+}
+
+/// The only place `cron:` actually runs — the extracted `commands::cron` helpers, the
+/// same ones `tooler cron list/add/remove` call. Validates exactly-one-of
+/// `add`/`remove`/`list` first. Returns the value `register:` should capture.
+fn exec_cron(
+    task: &Task,
+    spec: &CronSpec,
+    vars: &HashMap<String, String>,
+    env: &RunEnv,
+) -> Result<String> {
+    let n = spec.add.is_some() as u8 + spec.remove.is_some() as u8 + spec.list as u8;
+    if n != 1 {
+        bail!("cron: needs exactly one of add/remove/list");
+    }
+
+    // The confirm gate for a mutation is checked before anything resolves a server or
+    // opens a connection, same promise the Trust model makes for every other gated action.
+    if spec.add.is_some() || spec.remove.is_some() {
+        let _ = Confirmed::require(spec, "cron", &task.name)?;
+    }
+    let server = crate::commands::ssh::resolve_server(env.ctx, &render(&spec.server, vars))?;
+
+    if let Some(line) = &spec.add {
+        let line = render(line, vars);
+        if !env.quiet {
+            println!("  {} cron add {}", "→".bold(), line.dimmed());
+        }
+        crate::commands::cron::add_cron_line(&server, &line)?;
+        if !env.quiet {
+            println!("  {} added", "✓ ok".green().bold());
+        }
+        return Ok("true".to_string());
+    }
+
+    if let Some(pattern) = &spec.remove {
+        let pattern = render(pattern, vars);
+        if !env.quiet {
+            println!("  {} cron remove /{}/", "→".bold(), pattern.dimmed());
+        }
+        let removed = crate::commands::cron::remove_cron_lines(&server, &pattern)?;
+        if !env.quiet {
+            if removed.is_empty() {
+                println!("  {}", "(no lines matched)".dimmed());
+            } else {
+                println!(
+                    "  {} removed {} line(s)",
+                    "✓ ok".green().bold(),
+                    removed.len()
+                );
+            }
+        }
+        return Ok(removed.len().to_string());
+    }
+
+    // list
+    if !env.quiet {
+        println!("  {} cron list", "→".bold());
+    }
+    let entries = crate::commands::cron::list_cron_entries(&server)?;
+    if !env.quiet {
+        let noun = if entries.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        println!("  {} {} {noun}", "✓ ok".green().bold(), entries.len());
+    }
+    Ok(serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string()))
 }
 
 fn run_task_once(
@@ -5198,6 +5561,50 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.upload {
+        let local = render(&spec.local, vars);
+        let server_name = render(&spec.server, vars);
+        let remote = render(&spec.remote, vars);
+        if !env.quiet {
+            println!(
+                "  {} upload {} → {}:{}",
+                "→".bold(),
+                local.dimmed(),
+                server_name.dimmed(),
+                remote.dimmed()
+            );
+        }
+        if !env.dry {
+            let confirmed = Confirmed::require(spec, "upload", &task.name)?;
+            let bytes = exec_upload(&confirmed, vars, env)?;
+            if !env.quiet {
+                println!("  {} uploaded ({bytes} bytes)", "✓ ok".green().bold());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), bytes.to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.cron {
+        // exec_cron does its own per-operation preview/echo (like ssh:'s command line),
+        // and validates exactly-one-of add/remove/list before touching the server.
+        if !env.dry {
+            let captured = exec_cron(task, spec, vars, env)?;
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), captured);
+            }
+        } else if !env.quiet {
+            println!(
+                "  {} cron on {}",
+                "→".bold(),
+                render(&spec.server, vars).dimmed()
+            );
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.mail {
         let to = render(&spec.to, vars);
         let subject = render(&spec.subject, vars);
@@ -5399,8 +5806,8 @@ fn run_task_once(
          report, env_check, ssh, fleet, fs_cat, fs_write, systemd_restart, systemd_status, \
          logs_tail, logs_grep, ps_list, ps_kill, stat, include, assert, block, debug, \
          confirm, set_fact, include_vars, state_set, sync_db, sync_files, write_file, \
-         read_csv, write_csv, db_query, db_exec, secret_set, deploy, mail, mail_check, \
-         git_summary, git_changelog, gh_prs)",
+         read_csv, write_csv, db_query, db_exec, secret_set, deploy, upload, cron, mail, \
+         mail_check, git_summary, git_changelog, gh_prs)",
         task.name
     );
 }
@@ -5410,11 +5817,12 @@ fn run_task_once(
 /// Same field list its "no action" error enumerates, checked in the same order; a task
 /// with no action field set never reaches here in practice (`run_task_once` rejects it
 /// first), so `"unknown"` is just a safe fallback, not an expected case.
-/// Whether `task` is one of the 5 confirm:-gated destructive actions
-/// (fs_write:/systemd_restart:/ps_kill:/db_exec:/secret_set: -- see `Confirmed<T>`/
-/// `RequiresConfirm` above), and if so, whether its own YAML already sets that gate.
-/// `None` for every other action -- most tasks aren't destructive at all, so
-/// --list-tasks's output only carries this where it means something.
+/// Whether `task` is one of the confirm:-gated destructive actions (fs_write:/
+/// systemd_restart:/ps_kill:/db_exec:/secret_set:/deploy:/upload:, and cron: when it
+/// adds or removes a line -- see `Confirmed<T>`/`RequiresConfirm` above), and if so,
+/// whether its own YAML already sets that gate. `None` for every other action -- most
+/// tasks aren't destructive at all, so --list-tasks's output only carries this where it
+/// means something.
 fn confirm_gate(task: &Task) -> Option<bool> {
     if let Some(s) = &task.fs_write {
         return Some(s.is_confirmed());
@@ -5433,6 +5841,15 @@ fn confirm_gate(task: &Task) -> Option<bool> {
     }
     if let Some(s) = &task.deploy {
         return Some(s.is_confirmed());
+    }
+    if let Some(s) = &task.upload {
+        return Some(s.is_confirmed());
+    }
+    if let Some(s) = &task.cron {
+        // list-only is read-only -- not a destructive action, so no gate to report.
+        if s.add.is_some() || s.remove.is_some() {
+            return Some(s.is_confirmed());
+        }
     }
     None
 }
@@ -5484,6 +5901,8 @@ fn task_action_label(task: &Task) -> &'static str {
         db_exec,
         secret_set,
         deploy,
+        upload,
+        cron,
         mail,
         mail_check,
         git_summary,
@@ -7469,6 +7888,7 @@ mod tests {
             vars_files: Vec::new(),
             vars: HashMap::new(),
             handlers: vec![],
+            on_failure: vec![],
             tasks: vec![Task {
                 name: "t1".to_string(),
                 notify: vec!["nonexistent_handler".to_string()],
@@ -7489,6 +7909,7 @@ mod tests {
                 name: "restart".to_string(),
                 ..Default::default()
             }],
+            on_failure: vec![],
             tasks: vec![Task {
                 name: "t1".to_string(),
                 notify: vec!["restart".to_string()],
@@ -8026,6 +8447,7 @@ mod tests {
             vars_files: Vec::new(),
             vars: vars(&[("host", "localhost")]),
             handlers: vec![],
+            on_failure: vec![],
             tasks: vec![],
         };
         let merged = load_playbook_vars(&playbook, Path::new(".")).unwrap();
@@ -8049,6 +8471,7 @@ mod tests {
             vars_files: Vec::new(),
             vars: HashMap::new(),
             handlers: vec![],
+            on_failure: vec![],
             tasks: vec![Task {
                 name: "only task".to_string(),
                 debug: Some("hi".to_string()),

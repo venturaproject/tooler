@@ -78,17 +78,17 @@ fn fail(json: bool, message: String) -> Result<()> {
 }
 
 #[derive(Serialize)]
-struct CronLine {
-    line: String,
-    schedule: Option<String>,
-    command: Option<String>,
+pub(crate) struct CronLine {
+    pub(crate) line: String,
+    pub(crate) schedule: Option<String>,
+    pub(crate) command: Option<String>,
 }
 
 /// Splits `crontab -l` output into lines, pulling a `schedule`/`command` pair out of
 /// entries that look like standard 5-field cron lines. Comments, blank lines, and
 /// env-var assignments (e.g. `MAILTO=root`) keep `schedule`/`command` as `None` --
 /// they're still returned as raw lines so nothing silently disappears.
-fn parse_crontab(output: &str) -> Vec<CronLine> {
+pub(crate) fn parse_crontab(output: &str) -> Vec<CronLine> {
     output
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -300,6 +300,50 @@ fn fetch_crontab(server: &crate::config::Server) -> Result<String> {
     }
 }
 
+/// Fetch and parse a server's crontab. Shared by the `tooler cron list` CLI command and
+/// the playbook `cron: {list: true}` task, so both see the same parsed shape.
+pub(crate) fn list_cron_entries(server: &crate::config::Server) -> Result<Vec<CronLine>> {
+    Ok(parse_crontab(&fetch_crontab(server)?))
+}
+
+/// Append a line to a server's crontab (no-op-safe: a duplicate line is added again,
+/// same as the CLI). Shared by `tooler cron add` and the playbook `cron: {add: ...}`
+/// task.
+pub(crate) fn add_cron_line(server: &crate::config::Server, line: &str) -> Result<()> {
+    let mut new_crontab = fetch_crontab(server)?;
+    if !new_crontab.is_empty() && !new_crontab.ends_with('\n') {
+        new_crontab.push('\n');
+    }
+    new_crontab.push_str(line.trim_end());
+    new_crontab.push('\n');
+    let command = format!("printf %s {} | crontab -", db::shell_quote(&new_crontab));
+    db::ssh_exec_capture(server, &command)?;
+    Ok(())
+}
+
+/// Drop every crontab line containing `pattern` (a fixed substring, not a regex) and
+/// return the removed lines. An empty result means nothing matched — the crontab is
+/// left untouched in that case. Shared by `tooler cron remove` and the playbook
+/// `cron: {remove: ...}` task.
+pub(crate) fn remove_cron_lines(
+    server: &crate::config::Server,
+    pattern: &str,
+) -> Result<Vec<String>> {
+    let existing = fetch_crontab(server)?;
+    let (kept, removed): (Vec<&str>, Vec<&str>) =
+        existing.lines().partition(|l| !l.contains(pattern));
+    if removed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut new_crontab = kept.join("\n");
+    if !new_crontab.is_empty() {
+        new_crontab.push('\n');
+    }
+    let command = format!("printf %s {} | crontab -", db::shell_quote(&new_crontab));
+    db::ssh_exec_capture(server, &command)?;
+    Ok(removed.into_iter().map(str::to_string).collect())
+}
+
 fn list(server_name: &str, ctx: &Context) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
 
@@ -307,11 +351,10 @@ fn list(server_name: &str, ctx: &Context) -> Result<()> {
         Ok(s) => s,
         Err(e) => return fail(json, format!("{e:#}")),
     };
-    let output = match fetch_crontab(&server) {
-        Ok(o) => o,
+    let entries = match list_cron_entries(&server) {
+        Ok(e) => e,
         Err(e) => return fail(json, format!("{e:#}")),
     };
-    let entries = parse_crontab(&output);
 
     if json {
         println!(
@@ -345,19 +388,7 @@ fn add(server_name: &str, line: &str, ctx: &Context) -> Result<()> {
         Ok(s) => s,
         Err(e) => return fail(json, format!("{e:#}")),
     };
-    let existing = match fetch_crontab(&server) {
-        Ok(o) => o,
-        Err(e) => return fail(json, format!("{e:#}")),
-    };
-    let mut new_crontab = existing;
-    if !new_crontab.is_empty() && !new_crontab.ends_with('\n') {
-        new_crontab.push('\n');
-    }
-    new_crontab.push_str(line.trim_end());
-    new_crontab.push('\n');
-
-    let command = format!("printf %s {} | crontab -", db::shell_quote(&new_crontab));
-    if let Err(e) = db::ssh_exec_capture(&server, &command) {
+    if let Err(e) = add_cron_line(&server, line) {
         return fail(json, format!("{e:#}"));
     }
 
@@ -384,17 +415,10 @@ fn remove(server_name: &str, pattern: &str, ctx: &Context) -> Result<()> {
         Ok(s) => s,
         Err(e) => return fail(json, format!("{e:#}")),
     };
-    let existing = match fetch_crontab(&server) {
-        Ok(o) => o,
+    let removed = match remove_cron_lines(&server, pattern) {
+        Ok(r) => r,
         Err(e) => return fail(json, format!("{e:#}")),
     };
-
-    let (kept, removed): (Vec<&str>, Vec<&str>) =
-        existing.lines().partition(|l| !l.contains(pattern));
-    let mut new_crontab = kept.join("\n");
-    if !new_crontab.is_empty() {
-        new_crontab.push('\n');
-    }
 
     if removed.is_empty() {
         if json {
@@ -406,11 +430,6 @@ fn remove(server_name: &str, pattern: &str, ctx: &Context) -> Result<()> {
         }
         println!("{}", "No crontab lines matched.".dimmed());
         return Ok(());
-    }
-
-    let command = format!("printf %s {} | crontab -", db::shell_quote(&new_crontab));
-    if let Err(e) = db::ssh_exec_capture(&server, &command) {
-        return fail(json, format!("{e:#}"));
     }
 
     if json {

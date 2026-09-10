@@ -98,7 +98,7 @@ fn run_ssh(server: &Server, command: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_scp(server: &Server, local: &Path, remote_path: &str) -> Result<()> {
+pub(crate) fn run_scp(server: &Server, local: &Path, remote_path: &str) -> Result<()> {
     let dest = format!("{}:{}", server.host_target(), remote_path);
     let scp_args = server.scp_args();
 

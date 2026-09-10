@@ -1091,6 +1091,9 @@ fn lint_does_not_flag_vars_defined_by_vars_or_earlier_register_or_special_prefix
 #[test]
 fn lint_suppresses_undefined_var_check_after_an_include_vars_task() {
     let (mut cmd, dir) = tooler();
+    // extra.yml must exist so Check D's path resolution doesn't flag it — this test is
+    // about the undefined-var check being suppressed after include_vars:, nothing else.
+    std::fs::write(dir.path().join("extra.yml"), "whatever_it_defined: x\n").unwrap();
     std::fs::write(
         dir.path().join("playbook.yml"),
         "name: LintIncludeVars\ntasks:\n  - name: load\n    include_vars: extra.yml\n  - \
@@ -4285,4 +4288,273 @@ fn lint_does_not_flag_fleet_targeting_all() {
     );
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value["findings"].as_array().unwrap().len(), 0);
+}
+
+// ── upload: ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn upload_without_confirm_fails_clearly_and_makes_no_connection() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("artifact.bin"), b"hello").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Upload\ntasks:\n  - name: push it\n    upload:\n      \
+         server: ghost\n      local: artifact.bin\n      remote: /tmp/artifact.bin\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn upload_missing_local_file_fails_before_connecting() {
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args(["server", "add", "up1", "--host", "127.0.0.1"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Upload\ntasks:\n  - name: push it\n    upload:\n      \
+         server: up1\n      local: nope.bin\n      remote: /tmp/nope.bin\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("upload: local file not found"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn upload_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Upload\ntasks:\n  - name: push it\n    upload:\n      \
+         server: ghost\n      local: artifact.bin\n      remote: /srv/app/artifact.bin\n      \
+         confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("/srv/app/artifact.bin"), "stdout was: {out}");
+}
+
+// ── cron: ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn cron_add_without_confirm_fails_before_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Cron\ntasks:\n  - name: schedule it\n    cron:\n      \
+         server: ghost\n      add: \"0 3 * * * /srv/backup.sh\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn cron_rejects_more_than_one_of_add_remove_list() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Cron\ntasks:\n  - name: confused\n    cron:\n      \
+         server: ghost\n      add: \"0 3 * * * x\"\n      list: true\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("exactly one of add/remove/list"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn cron_list_against_an_unconfigured_server_fails_clearly() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Cron\ntasks:\n  - name: read it\n    cron:\n      server: ghost\n      list: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("ghost"), "stdout was: {out}");
+}
+
+// ── on_failure: ───────────────────────────────────────────────────────────────
+
+#[test]
+fn on_failure_hook_runs_when_a_task_fails() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: WithHook\n\
+         on_failure:\n  - name: record it\n    write_file:\n      path: failed.txt\n      \
+         content: \"{{failed_task}}\"\n\
+         tasks:\n  - name: fine\n    run: echo ok\n  - name: boom\n    run: \"exit 3\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .failure(),
+    );
+    let summary = last_line_json(&out);
+    assert_eq!(summary["success"], false);
+    assert!(
+        summary["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "record it"),
+        "on_failure task missing from tasks: {out}"
+    );
+    let recorded = std::fs::read_to_string(dir.path().join("failed.txt")).unwrap();
+    assert_eq!(recorded.trim(), "boom");
+}
+
+#[test]
+fn on_failure_hook_does_not_run_on_full_success() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: WithHook\n\
+         on_failure:\n  - name: record it\n    write_file:\n      path: failed.txt\n      \
+         content: nope\n\
+         tasks:\n  - name: fine\n    run: echo ok\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    assert!(!dir.path().join("failed.txt").exists());
+}
+
+#[test]
+fn on_failure_hook_skipped_in_dry_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: WithHook\n\
+         on_failure:\n  - name: record it\n    write_file:\n      path: failed.txt\n      \
+         content: nope\n\
+         tasks:\n  - name: boom\n    run: \"exit 3\"\n",
+    )
+    .unwrap();
+
+    // --dry never really runs a task, so nothing fails and the hook never fires.
+    cmd.args(["play", "playbook.yml", "--dry"])
+        .assert()
+        .success();
+    assert!(!dir.path().join("failed.txt").exists());
+}
+
+// ── Lint Check D ──────────────────────────────────────────────────────────────
+
+#[test]
+fn lint_flags_notify_with_no_matching_handler() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintNotify\ntasks:\n  - name: do a thing\n    run: echo hi\n    notify: [nope]\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        value["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["message"]
+                .as_str()
+                .unwrap()
+                .contains("matches no handler")),
+        "findings were: {out}"
+    );
+}
+
+#[test]
+fn lint_flags_missing_include_and_vars_files_paths() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintPaths\nvars_files: [missing.yml]\ntasks:\n  - name: pull in a sub\n    \
+         include: sub.yml\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let msgs: Vec<&str> = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("'sub.yml' resolves to no file")),
+        "findings were: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("'missing.yml' not found")),
+        "findings were: {msgs:?}"
+    );
+}
+
+#[test]
+fn lint_does_not_flag_a_templated_include_path() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: LintTemplatedInclude\nvars:\n  which: sub\ntasks:\n  - name: pull in a sub\n    \
+         include: \"{{which}}.yml\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        !value["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["message"]
+                .as_str()
+                .unwrap()
+                .contains("resolves to no file")),
+        "findings were: {out}"
+    );
 }
