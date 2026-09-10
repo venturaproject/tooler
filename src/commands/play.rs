@@ -547,6 +547,10 @@ struct Task {
     /// writing a `.env` file). `register:` (if set) captures the byte count written. See
     /// `WriteFileSpec`.
     write_file: Option<WriteFileSpec>,
+    /// Render a Jinja-style template file (`{% for %}`/`{% if %}`) against the playbook's
+    /// vars and write it locally, or push it to a remote path (`server:`, requires
+    /// `confirm: true`). See `TemplateSpec`.
+    template: Option<TemplateSpec>,
     /// Parse a local CSV file at `path` (relative to this playbook's own directory).
     /// `register:` (if set) captures a JSON array of rows — same directly-`loop:
     /// {from: "{{reg}}"}`-chainable convention `db_query:`/`scrape:`/`mail_check:` all
@@ -1308,6 +1312,33 @@ struct WriteFileSpec {
     /// Append instead of overwrite.
     #[serde(default)]
     append: bool,
+}
+
+/// `template:` — render a Jinja-style template file (`{% for %}`/`{% if %}`/`{{ }}`,
+/// minijinja) against the playbook's vars and write the result. Each var is exposed to
+/// the template as parsed JSON when it parses (so `{% for r in rows %}` works on a
+/// `register:`ed array), otherwise as a plain string; `{{ now }}` (RFC3339 UTC) is
+/// always available. `src` and — for a local write — `dest` are confined to the
+/// playbook's own directory (same as `write_file:`). Set `server:` to push the rendered
+/// file to a remote path over SSH instead (same mechanism `fs_write:` uses); that form
+/// requires `confirm: true`. `register:` (if set) captures the byte count written.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TemplateSpec {
+    src: String,
+    dest: String,
+    /// Push the rendered file to this server profile's `dest` path over SSH (as the SSH
+    /// user, same as `fs_write:` — no `sudo`). Omit to write `dest` locally.
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+impl RequiresConfirm for TemplateSpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
 }
 
 /// `read_csv:` — the read-side counterpart to `write_file:`. `path` is confined to the
@@ -2199,6 +2230,7 @@ fn task_profile_refs(task: &Task) -> Vec<ProfileRef<'_>> {
     ssh_ref!(task.deploy.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.upload.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.cron.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.template.as_ref().and_then(|s| s.server.as_deref()));
     if let Some(spec) = &task.fleet {
         if let Some(servers) = &spec.servers
             && lit(servers)
@@ -2392,6 +2424,10 @@ fn lint_tasks(
         if !*saw_include_vars {
             for field in lintable_fields(task) {
                 for (token, _) in find_tokens(field) {
+                    // A quoted string literal (`{{ '[1,2]' | sum }}`) isn't a var ref.
+                    if token.starts_with('\'') || token.starts_with('"') {
+                        continue;
+                    }
                     let base = token_base_name(token);
                     if matches!(base, "item" | "batch" | "batch_index" | "batch_size") {
                         if task.loop_spec.is_none() {
@@ -2430,7 +2466,7 @@ fn lint_tasks(
                         }
                         continue;
                     }
-                    if base == "state" || base == "env" {
+                    if base == "state" || base == "env" || base == "now" {
                         continue;
                     }
                     if !known.contains(base) {
@@ -2750,6 +2786,13 @@ fn explain_task(
     }
     if let Some(spec) = &task.write_file {
         return json!({"path": r(&spec.path), "append": spec.append});
+    }
+    if let Some(spec) = &task.template {
+        return json!({
+            "src": r(&spec.src),
+            "dest": r(&spec.dest),
+            "server": spec.server.as_deref().map(r),
+        });
     }
     if let Some(spec) = &task.write_csv {
         return json!({"path": r(&spec.path)});
@@ -4876,6 +4919,31 @@ fn exec_fs_write(
     Ok(content)
 }
 
+/// Renders a `template:` task's `src` file with minijinja. Each playbook var is exposed
+/// as parsed JSON where it parses (so `{% for r in rows %}` iterates a `register:`ed
+/// array), otherwise as a plain string; `now` (RFC3339 UTC) is always available. A
+/// template syntax or render error is surfaced verbatim (minijinja points at the line).
+fn render_template(src: &Path, vars: &HashMap<String, String>) -> Result<String> {
+    let template = std::fs::read_to_string(src)
+        .with_context(|| format!("template: reading {}", src.display()))?;
+
+    let mut ctx = serde_json::Map::new();
+    for (k, v) in vars {
+        let val = serde_json::from_str::<serde_json::Value>(v)
+            .unwrap_or_else(|_| serde_json::Value::String(v.clone()));
+        ctx.insert(k.clone(), val);
+    }
+    ctx.entry("now".to_string())
+        .or_insert_with(|| serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+
+    let mut env = minijinja::Environment::new();
+    env.add_template("t", &template)
+        .map_err(|e| anyhow!("template: {e}"))?;
+    env.get_template("t")
+        .and_then(|t| t.render(minijinja::Value::from_serialize(&ctx)))
+        .map_err(|e| anyhow!("template: {e}"))
+}
+
 /// The only place `systemd_restart:` actually restarts a remote unit — see
 /// `exec_fs_write`'s doc comment for why this takes `&Confirmed<SystemdRestartSpec>`.
 fn exec_systemd_restart(
@@ -5695,6 +5763,85 @@ fn run_task_once(
             }
             if let Some(reg) = &task.register {
                 vars.insert(reg.clone(), bytes_written.to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = &task.template {
+        let src = join_confined(&env.playbook_dir, &render(&spec.src, vars))?;
+        let dest = render(&spec.dest, vars);
+        let server_name = spec.server.as_deref().map(|s| render(s, vars));
+        if !env.quiet {
+            match &server_name {
+                Some(s) => println!(
+                    "  {} {} → {}:{}",
+                    "→ template".bold(),
+                    src.display().to_string().dimmed(),
+                    s.dimmed(),
+                    dest.dimmed()
+                ),
+                None => println!(
+                    "  {} {} → {}",
+                    "→ template".bold(),
+                    src.display().to_string().dimmed(),
+                    dest.dimmed()
+                ),
+            }
+        }
+        if !env.dry {
+            let rendered = render_template(&src, vars)?;
+            let bytes = rendered.len();
+            match &server_name {
+                Some(sn) => {
+                    let confirmed = Confirmed::require(spec, "template", &task.name)?;
+                    let _ = &confirmed;
+                    let server = crate::commands::ssh::resolve_server(env.ctx, sn)?;
+                    if env.diff {
+                        let old = crate::db::ssh_exec_capture(
+                            &server,
+                            &crate::commands::fs::cat_cmd(&dest),
+                        )
+                        .unwrap_or_default();
+                        print_diff_if_enabled(env, &old, &rendered);
+                    }
+                    let (_, stderr, ok) = crate::db::ssh_exec_with_stdin(
+                        &server,
+                        &crate::commands::fs::write_cmd(&dest),
+                        rendered.as_bytes(),
+                    )?;
+                    if !ok {
+                        let e = stderr.trim();
+                        bail!(
+                            "{}",
+                            if e.is_empty() {
+                                "template write failed"
+                            } else {
+                                e
+                            }
+                        );
+                    }
+                }
+                None => {
+                    let out_path = join_confined(&env.playbook_dir, &dest)?;
+                    if env.diff {
+                        let old = std::fs::read(&out_path)
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                            .unwrap_or_default();
+                        print_diff_if_enabled(env, &old, &rendered);
+                    }
+                    if let Some(parent) = out_path.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    std::fs::write(&out_path, &rendered)
+                        .with_context(|| format!("writing {}", out_path.display()))?;
+                }
+            }
+            if !env.quiet {
+                println!("  {} {bytes} bytes", "✓ ok".green().bold());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), bytes.to_string());
             }
         }
         return Ok(());
@@ -6790,7 +6937,7 @@ fn run_task_once(
          report, env_check, ssh, fleet, fs_cat, fs_write, systemd_restart, systemd_status, \
          logs_tail, logs_grep, ps_list, ps_kill, stat, include, assert, block, parallel, \
          debug, confirm, set_fact, include_vars, state_set, sync_db, sync_files, write_file, \
-         read_csv, write_csv, db_query, db_exec, db_load, secret_set, deploy, upload, cron, \
+         template, read_csv, write_csv, db_query, db_exec, db_load, secret_set, deploy, upload, cron, \
          mail, mail_check, git_summary, git_changelog, gh_prs)",
         task.name
     );
@@ -6835,6 +6982,12 @@ fn confirm_gate(task: &Task) -> Option<bool> {
     if let Some(s) = &task.cron {
         // list-only is read-only -- not a destructive action, so no gate to report.
         if s.add.is_some() || s.remove.is_some() {
+            return Some(s.is_confirmed());
+        }
+    }
+    if let Some(s) = &task.template {
+        // A local render isn't destructive; only a push to a server is gated.
+        if s.server.is_some() {
             return Some(s.is_confirmed());
         }
     }
@@ -6883,6 +7036,7 @@ fn task_action_label(task: &Task) -> &'static str {
         sync_db,
         sync_files,
         write_file,
+        template,
         read_csv,
         write_csv,
         db_query,
@@ -7666,6 +7820,11 @@ fn resolve_token(token: &str, vars: &HashMap<String, String>) -> Option<String> 
     if let Some(v) = vars.get(token) {
         return Some(v.clone());
     }
+    // `{{now}}` — the current instant as RFC3339 (UTC). Chain `| date:`/`| shift:`/`| unix`
+    // to reformat. A playbook var named `now` still wins (checked above).
+    if token == "now" {
+        return Some(chrono::Utc::now().to_rfc3339());
+    }
     if let Some(name) = token.strip_prefix("env.") {
         return std::env::var(name).ok();
     }
@@ -7698,13 +7857,15 @@ fn render_with(s: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
         };
         let inner = after[..end].trim();
         let (token, ops) = parse_pipeline(inner);
-        let mut cur = resolve(token);
+        // A quoted token is a string literal — lets `{{ '[1,2,3]' | sum }}` /
+        // `{{ 'x' | sha256 }}` feed a filter pipeline without a throwaway var.
+        let mut cur = string_literal(token).or_else(|| resolve(token));
         for op in &ops {
             cur = match (cur, op) {
                 // `default:` is the only op that produces a value from nothing.
                 (None, FilterOp::Default(d)) => Some((*d).to_string()),
                 (None, _) => None,
-                (Some(v), op) => apply_filter_op(op, v),
+                (Some(v), op) => apply_filter_op(op, v, &resolve),
             };
         }
         out.push_str(&cur.unwrap_or_else(|| format!("{{{{{inner}}}}}")));
@@ -7743,6 +7904,61 @@ enum FilterOp<'a> {
     Upper,
     Lower,
     Trim,
+
+    // ── date/time (parse the value as RFC3339 / unix seconds / `%Y-%m-%d[ %H:%M:%S]`) ──
+    /// `| date:<strftime>` — reformat with a `chrono` format string.
+    Date(&'a str),
+    /// `| shift:<±N[smhdw]>` — add/subtract a duration, keep RFC3339 output.
+    Shift(&'a str),
+    /// `| unix` — epoch seconds.
+    Unix,
+
+    // ── encoding / hash ──
+    Base64,
+    Base64d,
+    UrlEncode,
+    Sha256,
+    Sha1,
+    Md5,
+    /// `| hmac_sha256:<keyref>` — hex HMAC-SHA256; `<keyref>` resolves as a var name.
+    HmacSha256(&'a str),
+
+    // ── numeric (parse value, and the arg, as f64) ──
+    Add(&'a str),
+    Sub(&'a str),
+    Mul(&'a str),
+    Div(&'a str),
+    /// `| round` → nearest integer; `| round:<n>` → n decimal places.
+    Round(Option<&'a str>),
+
+    // ── array aggregate / reshape (value parsed as a JSON array) ──
+    Sum,
+    Min,
+    Max,
+    Avg,
+    Count,
+    Sort,
+    /// `| sort_by:<field>` — array of objects, ascending by that field.
+    SortBy(&'a str),
+    Unique,
+    Reverse,
+    /// `| slice:<a>:<b>` — Python-ish half-open slice, negative indices allowed; either
+    /// bound may be empty (`slice:5:`, `slice::3`).
+    Slice(&'a str),
+}
+
+/// A `'…'` / `"…"` quoted token → its unquoted content, else `None`. Used so a filter
+/// pipeline can start from a literal (`{{ '[1,2]' | sum }}`) rather than a var.
+fn string_literal(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        Some(token[1..token.len() - 1].to_string())
+    } else {
+        None
+    }
 }
 
 /// Splits a `{{...}}` token's trimmed inner text into `(base token, pipeline)` on `|` —
@@ -7774,6 +7990,26 @@ fn parse_pipeline(inner: &str) -> (&str, Vec<FilterOp<'_>>) {
             }
         } else if let Some(v) = f.strip_prefix("join:") {
             FilterOp::Join(v)
+        } else if let Some(v) = f.strip_prefix("date:") {
+            FilterOp::Date(v.trim())
+        } else if let Some(v) = f.strip_prefix("shift:") {
+            FilterOp::Shift(v.trim())
+        } else if let Some(v) = f.strip_prefix("hmac_sha256:") {
+            FilterOp::HmacSha256(v.trim())
+        } else if let Some(v) = f.strip_prefix("add:") {
+            FilterOp::Add(v.trim())
+        } else if let Some(v) = f.strip_prefix("sub:") {
+            FilterOp::Sub(v.trim())
+        } else if let Some(v) = f.strip_prefix("mul:") {
+            FilterOp::Mul(v.trim())
+        } else if let Some(v) = f.strip_prefix("div:") {
+            FilterOp::Div(v.trim())
+        } else if let Some(v) = f.strip_prefix("round:") {
+            FilterOp::Round(Some(v.trim()))
+        } else if let Some(v) = f.strip_prefix("sort_by:") {
+            FilterOp::SortBy(v.trim())
+        } else if let Some(v) = f.strip_prefix("slice:") {
+            FilterOp::Slice(v.trim())
         } else {
             match f {
                 "quote" => FilterOp::Quote,
@@ -7782,6 +8018,22 @@ fn parse_pipeline(inner: &str) -> (&str, Vec<FilterOp<'_>>) {
                 "upper" => FilterOp::Upper,
                 "lower" => FilterOp::Lower,
                 "trim" => FilterOp::Trim,
+                "unix" => FilterOp::Unix,
+                "base64" => FilterOp::Base64,
+                "base64d" => FilterOp::Base64d,
+                "urlencode" => FilterOp::UrlEncode,
+                "sha256" => FilterOp::Sha256,
+                "sha1" => FilterOp::Sha1,
+                "md5" => FilterOp::Md5,
+                "round" => FilterOp::Round(None),
+                "sum" => FilterOp::Sum,
+                "min" => FilterOp::Min,
+                "max" => FilterOp::Max,
+                "avg" => FilterOp::Avg,
+                "count" => FilterOp::Count,
+                "sort" => FilterOp::Sort,
+                "unique" => FilterOp::Unique,
+                "reverse" => FilterOp::Reverse,
                 // Unknown word — stop here; the leftover text isn't a valid token name
                 // either, so the whole `{{...}}` will render literal, same as today.
                 _ => return (token, ops),
@@ -7792,8 +8044,87 @@ fn parse_pipeline(inner: &str) -> (&str, Vec<FilterOp<'_>>) {
     (token, ops)
 }
 
-/// Applies one pipeline stage to an already-resolved string value.
-fn apply_filter_op(op: &FilterOp, v: String) -> Option<String> {
+/// Formats an `f64` the way this DSL stringifies numbers everywhere else — no trailing
+/// `.0` on a whole number.
+fn fmt_num(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Parses a string as a datetime for the `date:`/`shift:`/`unix` filters: RFC3339, then a
+/// bare unix-seconds integer, then `%Y-%m-%d %H:%M:%S`, then `%Y-%m-%d`.
+fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+    let s = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(secs) = s.parse::<i64>() {
+        return Utc.timestamp_opt(secs, 0).single();
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(Utc.from_utc_datetime(&ndt));
+    }
+    if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(Utc.from_utc_datetime(&nd.and_hms_opt(0, 0, 0)?));
+    }
+    None
+}
+
+/// Parses a `shift:` argument like `-7d` / `+2h` / `30m` into a `chrono::Duration`.
+fn parse_shift(arg: &str) -> Option<chrono::Duration> {
+    let arg = arg.trim();
+    let (sign, rest) = match arg.strip_prefix('-') {
+        Some(r) => (-1i64, r),
+        None => (1i64, arg.strip_prefix('+').unwrap_or(arg)),
+    };
+    let (num, unit) = rest.split_at(rest.find(|c: char| !c.is_ascii_digit())?);
+    let n: i64 = num.parse().ok()?;
+    let secs = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 604800,
+        _ => return None,
+    };
+    Some(chrono::Duration::seconds(sign * n * secs))
+}
+
+/// Hex-encodes bytes (lowercase) — for the hash filters.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Applies one pipeline stage to an already-resolved string value. `resolve` is threaded
+/// in for the one op (`hmac_sha256:<keyref>`) whose argument is a var reference.
+fn apply_filter_op(
+    op: &FilterOp,
+    v: String,
+    resolve: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    // Value parsed as a JSON array of numbers, for the numeric aggregates.
+    let as_num_array = |v: &str| -> Option<Vec<f64>> {
+        let arr = serde_json::from_str::<serde_json::Value>(v).ok()?;
+        arr.as_array()?
+            .iter()
+            .map(|el| match el {
+                serde_json::Value::Number(n) => n.as_f64(),
+                serde_json::Value::String(s) => s.parse().ok(),
+                _ => None,
+            })
+            .collect()
+    };
+    let as_json_array = |v: &str| -> Option<Vec<serde_json::Value>> {
+        serde_json::from_str::<serde_json::Value>(v)
+            .ok()?
+            .as_array()
+            .cloned()
+    };
+
     match op {
         FilterOp::Json(path) => apply_json_filter(&v, path),
         FilterOp::Quote => Some(shell_quote(&v)),
@@ -7845,6 +8176,165 @@ fn apply_filter_op(op: &FilterOp, v: String) -> Option<String> {
         FilterOp::Upper => Some(v.to_uppercase()),
         FilterOp::Lower => Some(v.to_lowercase()),
         FilterOp::Trim => Some(v.trim().to_string()),
+
+        FilterOp::Date(fmt) => Some(parse_datetime(&v)?.format(fmt).to_string()),
+        FilterOp::Shift(arg) => {
+            let shifted = parse_datetime(&v)? + parse_shift(arg)?;
+            Some(shifted.to_rfc3339())
+        }
+        FilterOp::Unix => Some(parse_datetime(&v)?.timestamp().to_string()),
+
+        FilterOp::Base64 => {
+            use base64::Engine;
+            Some(base64::engine::general_purpose::STANDARD.encode(v.as_bytes()))
+        }
+        FilterOp::Base64d => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(v.trim())
+                .ok()?;
+            String::from_utf8(bytes).ok()
+        }
+        FilterOp::UrlEncode => Some(
+            percent_encoding::utf8_percent_encode(&v, percent_encoding::NON_ALPHANUMERIC)
+                .to_string(),
+        ),
+        FilterOp::Sha256 => {
+            use sha2::Digest;
+            Some(hex(&sha2::Sha256::digest(v.as_bytes())))
+        }
+        FilterOp::Sha1 => {
+            use sha1::Digest;
+            Some(hex(&sha1::Sha1::digest(v.as_bytes())))
+        }
+        FilterOp::Md5 => {
+            use md5::Digest;
+            Some(hex(&md5::Md5::digest(v.as_bytes())))
+        }
+        FilterOp::HmacSha256(keyref) => {
+            use hmac::Mac;
+            let key = resolve(keyref)?;
+            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).ok()?;
+            mac.update(v.as_bytes());
+            Some(hex(&mac.finalize().into_bytes()))
+        }
+
+        FilterOp::Add(n) => Some(fmt_num(
+            v.trim().parse::<f64>().ok()? + n.parse::<f64>().ok()?,
+        )),
+        FilterOp::Sub(n) => Some(fmt_num(
+            v.trim().parse::<f64>().ok()? - n.parse::<f64>().ok()?,
+        )),
+        FilterOp::Mul(n) => Some(fmt_num(
+            v.trim().parse::<f64>().ok()? * n.parse::<f64>().ok()?,
+        )),
+        FilterOp::Div(n) => {
+            let d = n.parse::<f64>().ok()?;
+            if d == 0.0 {
+                return None;
+            }
+            Some(fmt_num(v.trim().parse::<f64>().ok()? / d))
+        }
+        FilterOp::Round(places) => {
+            let x = v.trim().parse::<f64>().ok()?;
+            match places {
+                None => Some(fmt_num(x.round())),
+                Some(p) => {
+                    let f = 10f64.powi(p.parse::<i32>().ok()?);
+                    Some(fmt_num((x * f).round() / f))
+                }
+            }
+        }
+
+        FilterOp::Sum => Some(fmt_num(as_num_array(&v)?.iter().sum())),
+        FilterOp::Min => as_num_array(&v)?.into_iter().reduce(f64::min).map(fmt_num),
+        FilterOp::Max => as_num_array(&v)?.into_iter().reduce(f64::max).map(fmt_num),
+        FilterOp::Avg => {
+            let a = as_num_array(&v)?;
+            if a.is_empty() {
+                return None;
+            }
+            Some(fmt_num(a.iter().sum::<f64>() / a.len() as f64))
+        }
+        FilterOp::Count => {
+            let val = serde_json::from_str::<serde_json::Value>(&v).ok()?;
+            let n = match &val {
+                serde_json::Value::Array(a) => a.len(),
+                serde_json::Value::Object(o) => o.len(),
+                serde_json::Value::String(s) => s.chars().count(),
+                _ => return None,
+            };
+            Some(n.to_string())
+        }
+        FilterOp::Sort => {
+            let mut a = as_json_array(&v)?;
+            let all_num = a.iter().all(|e| {
+                matches!(e, serde_json::Value::Number(_))
+                    || e.as_str().is_some_and(|s| s.parse::<f64>().is_ok())
+            });
+            if all_num {
+                a.sort_by(|x, y| {
+                    let xn = x
+                        .as_f64()
+                        .or_else(|| x.as_str()?.parse().ok())
+                        .unwrap_or(0.0);
+                    let yn = y
+                        .as_f64()
+                        .or_else(|| y.as_str()?.parse().ok())
+                        .unwrap_or(0.0);
+                    xn.partial_cmp(&yn).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                a.sort_by_key(json_cell_to_string);
+            }
+            Some(serde_json::Value::Array(a).to_string())
+        }
+        FilterOp::SortBy(field) => {
+            let mut a = as_json_array(&v)?;
+            a.sort_by(|x, y| {
+                let xk = x.get(field).map(json_cell_to_string).unwrap_or_default();
+                let yk = y.get(field).map(json_cell_to_string).unwrap_or_default();
+                match (xk.parse::<f64>(), yk.parse::<f64>()) {
+                    (Ok(xn), Ok(yn)) => xn.partial_cmp(&yn).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => xk.cmp(&yk),
+                }
+            });
+            Some(serde_json::Value::Array(a).to_string())
+        }
+        FilterOp::Unique => {
+            let a = as_json_array(&v)?;
+            let mut seen = std::collections::HashSet::new();
+            let out: Vec<_> = a
+                .into_iter()
+                .filter(|e| seen.insert(e.to_string()))
+                .collect();
+            Some(serde_json::Value::Array(out).to_string())
+        }
+        FilterOp::Reverse => {
+            let mut a = as_json_array(&v)?;
+            a.reverse();
+            Some(serde_json::Value::Array(a).to_string())
+        }
+        FilterOp::Slice(arg) => {
+            let a = as_json_array(&v)?;
+            let len = a.len() as i64;
+            let norm = |raw: &str, default: i64| -> i64 {
+                if raw.is_empty() {
+                    return default;
+                }
+                let n: i64 = raw.parse().unwrap_or(default);
+                if n < 0 { (len + n).max(0) } else { n.min(len) }
+            };
+            let (a_raw, b_raw) = arg.split_once(':').unwrap_or((arg, ""));
+            let start = norm(a_raw.trim(), 0);
+            let end = norm(b_raw.trim(), len).max(start);
+            let out: Vec<_> = a
+                .into_iter()
+                .skip(start as usize)
+                .take((end - start) as usize)
+                .collect();
+            Some(serde_json::Value::Array(out).to_string())
+        }
     }
 }
 
@@ -9694,21 +10184,102 @@ mod tests {
         assert!(ops.is_empty());
     }
 
+    /// A no-op resolver for the filter unit tests (only `hmac_sha256:` uses it).
+    fn no_resolve(_: &str) -> Option<String> {
+        None
+    }
+    fn filt(op: FilterOp, v: &str) -> Option<String> {
+        apply_filter_op(&op, v.to_string(), &no_resolve)
+    }
+
     #[test]
     fn apply_filter_op_pluck_and_where_and_join() {
         let rows = r#"[{"n":"a","ok":"y"},{"n":"b","ok":"n"},{"n":"c","ok":"y"}]"#;
-        let plucked = apply_filter_op(&FilterOp::Pluck("n"), rows.to_string()).unwrap();
-        assert_eq!(plucked, r#"["a","b","c"]"#);
-        let filtered =
-            apply_filter_op(&FilterOp::Where("ok", true, "y"), rows.to_string()).unwrap();
-        let names = apply_filter_op(&FilterOp::Pluck("n"), filtered).unwrap();
-        assert_eq!(apply_filter_op(&FilterOp::Join("-"), names).unwrap(), "a-c");
+        assert_eq!(
+            filt(FilterOp::Pluck("n"), rows).unwrap(),
+            r#"["a","b","c"]"#
+        );
+        let filtered = filt(FilterOp::Where("ok", true, "y"), rows).unwrap();
+        let names = filt(FilterOp::Pluck("n"), &filtered).unwrap();
+        assert_eq!(filt(FilterOp::Join("-"), &names).unwrap(), "a-c");
     }
 
     #[test]
     fn apply_filter_op_on_a_non_array_yields_none() {
-        assert!(apply_filter_op(&FilterOp::Pluck("x"), "not json".to_string()).is_none());
-        assert!(apply_filter_op(&FilterOp::First, "42".to_string()).is_none());
+        assert!(filt(FilterOp::Pluck("x"), "not json").is_none());
+        assert!(filt(FilterOp::First, "42").is_none());
+    }
+
+    #[test]
+    fn date_time_filters_round_trip() {
+        // 2021-01-01T00:00:00Z is unix 1609459200.
+        assert_eq!(
+            filt(FilterOp::Unix, "2021-01-01T00:00:00Z").unwrap(),
+            "1609459200"
+        );
+        assert_eq!(
+            filt(FilterOp::Date("%Y-%m-%d"), "1609459200").unwrap(),
+            "2021-01-01"
+        );
+        let shifted = filt(FilterOp::Shift("-1d"), "2021-01-02T00:00:00Z").unwrap();
+        assert_eq!(
+            filt(FilterOp::Date("%Y-%m-%d"), &shifted).unwrap(),
+            "2021-01-01"
+        );
+    }
+
+    #[test]
+    fn encoding_and_hash_filters() {
+        assert_eq!(filt(FilterOp::Base64, "hello").unwrap(), "aGVsbG8=");
+        assert_eq!(filt(FilterOp::Base64d, "aGVsbG8=").unwrap(), "hello");
+        assert_eq!(
+            filt(FilterOp::Sha256, "abc").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            filt(FilterOp::Md5, "abc").unwrap(),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+        assert_eq!(filt(FilterOp::UrlEncode, "a b&c").unwrap(), "a%20b%26c");
+        // Known HMAC-SHA256 vector (key "key", msg "The quick brown fox jumps over the lazy dog").
+        let sig = apply_filter_op(
+            &FilterOp::HmacSha256("k"),
+            "The quick brown fox jumps over the lazy dog".to_string(),
+            &|name: &str| (name == "k").then(|| "key".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            sig,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn numeric_and_aggregate_filters() {
+        assert_eq!(filt(FilterOp::Add("5"), "10").unwrap(), "15");
+        assert_eq!(
+            filt(FilterOp::Div("3"), "10").unwrap(),
+            "3.3333333333333335"
+        );
+        assert_eq!(filt(FilterOp::Round(Some("2")), "3.14159").unwrap(), "3.14");
+        assert_eq!(filt(FilterOp::Sum, "[1,2,3,4]").unwrap(), "10");
+        assert_eq!(filt(FilterOp::Avg, "[2,4]").unwrap(), "3");
+        assert_eq!(filt(FilterOp::Count, r#"["a","b"]"#).unwrap(), "2");
+        assert_eq!(filt(FilterOp::Sort, "[3,1,2]").unwrap(), "[1,2,3]");
+        assert_eq!(filt(FilterOp::Unique, "[1,1,2,2,3]").unwrap(), "[1,2,3]");
+        assert_eq!(filt(FilterOp::Reverse, "[1,2,3]").unwrap(), "[3,2,1]");
+        assert_eq!(
+            filt(FilterOp::Slice("1:3"), "[0,1,2,3,4]").unwrap(),
+            "[1,2]"
+        );
+        assert_eq!(
+            filt(FilterOp::Slice("-2:"), "[0,1,2,3,4]").unwrap(),
+            "[3,4]"
+        );
+        assert_eq!(
+            filt(FilterOp::SortBy("p"), r#"[{"p":3},{"p":1},{"p":2}]"#).unwrap(),
+            r#"[{"p":1},{"p":2},{"p":3}]"#
+        );
     }
 
     #[test]

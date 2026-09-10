@@ -5133,3 +5133,141 @@ fn params_defaults_seed_vars_on_a_plain_cli_run() {
     let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().success());
     assert!(out.contains("hola world"), "{out}");
 }
+
+// ── date / encoding / numeric filters ────────────────────────────────────────
+
+#[test]
+fn now_var_and_date_filters() {
+    let (_c, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: N\ntasks:\n  - name: show\n    write_file:\n      path: out.txt\n      \
+         content: \"d={{now | date:%Y}} e={{now | unix}} past={{now | shift:-365d | date:%Y}}\"\n",
+    )
+    .unwrap();
+    tooler_in(dir.path())
+        .args(["play", "playbook.yml"])
+        .assert()
+        .success();
+    let out = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
+    // year is 4 digits, epoch is a 10-digit number, past year is this year minus 1.
+    let year: i64 = out
+        .split("d=")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let past: i64 = out.rsplit("past=").next().unwrap().trim().parse().unwrap();
+    assert!(year >= 2025 && past == year - 1, "out was: {out}");
+    assert!(
+        out.contains("e=1")
+            && out
+                .split("e=")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap()
+                .len()
+                == 10
+    );
+}
+
+#[test]
+fn hash_encoding_and_numeric_filters_end_to_end() {
+    let (_c, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: H\ntasks:\n  - name: d\n    set_fact:\n      nums: '[10,20,30]'\n  \
+         - name: show\n    write_file:\n      path: out.txt\n      content: |\n        \
+         sha={{ 'abc' | sha256 }}\n        b64={{ 'abc' | base64 }}\n        \
+         sum={{nums | sum}}\n        avg={{nums | avg}}\n        inc={{ '41' | add:1 }}\n",
+    )
+    .unwrap();
+    tooler_in(dir.path())
+        .args(["play", "playbook.yml"])
+        .assert()
+        .success();
+    let out = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
+    assert!(out.contains("sha=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    assert!(out.contains("b64=YWJj"));
+    assert!(out.contains("sum=60"));
+    assert!(out.contains("avg=20"));
+    assert!(out.contains("inc=42"));
+}
+
+// ── template: task ──────────────────────────────────────────────────────────
+
+#[test]
+fn template_renders_a_loop_to_a_local_file() {
+    let (_c, dir) = tooler();
+    std::fs::write(
+        dir.path().join("conf.j2"),
+        "{% for u in users %}user {{ u.name }} = {{ u.role }}\n{% endfor %}",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: T\ntasks:\n  - name: d\n    set_fact:\n      users: '[{\"name\":\"a\",\"role\":\"admin\"},{\"name\":\"b\",\"role\":\"ro\"}]'\n  \
+         - name: render\n    template: {src: conf.j2, dest: conf.out}\n",
+    )
+    .unwrap();
+    tooler_in(dir.path())
+        .args(["play", "playbook.yml"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("conf.out")).unwrap(),
+        "user a = admin\nuser b = ro\n"
+    );
+}
+
+#[test]
+fn template_to_a_server_requires_confirm() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("c.j2"), "hi {{ x }}").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: T\nvars: {x: there}\ntasks:\n  - name: push\n    template: {src: c.j2, dest: /etc/c, server: ghost}\n",
+    )
+    .unwrap();
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "{out}"
+    );
+}
+
+#[test]
+fn template_syntax_error_is_reported() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("c.j2"), "{% for x in %}broken").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: T\ntasks:\n  - name: render\n    template: {src: c.j2, dest: c.out}\n",
+    )
+    .unwrap();
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("template:"), "{out}");
+}
+
+#[test]
+fn explain_shows_a_template_tasks_src_and_dest() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("c.j2"), "x").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: T\nvars: {env: prod}\ntasks:\n  - name: render\n    template: {src: c.j2, dest: \"conf-{{env}}.out\"}\n",
+    )
+    .unwrap();
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--explain"])
+            .assert()
+            .success(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["tasks"][0]["explain"]["dest"], "conf-prod.out");
+}
