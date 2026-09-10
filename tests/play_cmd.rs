@@ -4558,3 +4558,373 @@ fn lint_does_not_flag_a_templated_include_path() {
         "findings were: {out}"
     );
 }
+
+// ── single_instance: lock ─────────────────────────────────────────────────────
+
+/// A far-future RFC3339 timestamp — comfortably inside any `lock_timeout` window, so a
+/// hand-written lock reads as "fresh". Avoids pulling chrono into the test crate.
+fn fresh_lock_timestamp() -> &'static str {
+    "3000-01-01T00:00:00+00:00"
+}
+
+#[test]
+fn single_instance_refusal_names_the_holding_pid() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Locked\nsingle_instance: true\ntasks:\n  - name: t\n    run: echo hi\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml.lock"),
+        format!(
+            "{{\"pid\":424242,\"started_at\":\"{}\",\"playbook\":\"Locked\",\"host\":\"h\"}}\n",
+            fresh_lock_timestamp()
+        ),
+    )
+    .unwrap();
+
+    let assert = cmd.args(["play", "playbook.yml"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("already running (pid 424242"),
+        "stderr was: {stderr}"
+    );
+    // The playbook never ran.
+    assert!(!dir.path().join("ran.txt").exists());
+}
+
+#[test]
+fn single_instance_takes_over_a_stale_lock() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Locked\nsingle_instance: true\nlock_timeout: 1\ntasks:\n  - name: t\n    \
+         write_file:\n      path: ran.txt\n      content: ok\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml.lock"),
+        "{\"pid\":1,\"started_at\":\"2020-01-01T00:00:00+00:00\",\"playbook\":\"Locked\",\"host\":\"h\"}\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    assert!(dir.path().join("ran.txt").exists());
+    assert!(
+        !dir.path().join("playbook.yml.lock").exists(),
+        "lock should be released"
+    );
+}
+
+#[test]
+fn single_instance_releases_the_lock_on_success_and_on_failure() {
+    let (_c, dir) = tooler();
+    std::fs::write(
+        dir.path().join("ok.yml"),
+        "name: Ok\nsingle_instance: true\ntasks:\n  - name: t\n    run: echo hi\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("bad.yml"),
+        "name: Bad\nsingle_instance: true\ntasks:\n  - name: t\n    run: \"exit 1\"\n",
+    )
+    .unwrap();
+
+    tooler_in(dir.path())
+        .args(["play", "ok.yml"])
+        .assert()
+        .success();
+    assert!(!dir.path().join("ok.yml.lock").exists());
+
+    tooler_in(dir.path())
+        .args(["play", "bad.yml"])
+        .assert()
+        .failure();
+    assert!(!dir.path().join("bad.yml.lock").exists());
+
+    // JSON-mode failure exits via process::exit — the lock must still be gone.
+    tooler_in(dir.path())
+        .args(["--output", "json", "play", "bad.yml"])
+        .assert()
+        .failure();
+    assert!(!dir.path().join("bad.yml.lock").exists());
+}
+
+#[test]
+fn single_instance_ignores_the_lock_in_dry_run() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Locked\nsingle_instance: true\ntasks:\n  - name: t\n    run: echo hi\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml.lock"),
+        format!(
+            "{{\"pid\":424242,\"started_at\":\"{}\",\"playbook\":\"Locked\",\"host\":\"h\"}}\n",
+            fresh_lock_timestamp()
+        ),
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml", "--dry"])
+        .assert()
+        .success();
+}
+
+// ── loop: batch: ─────────────────────────────────────────────────────────────
+
+#[test]
+fn loop_batch_groups_items_and_exposes_batch_as_a_json_array() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Batch\ntasks:\n  - name: rows\n    set_fact:\n      rows: '[1,2,3,4,5,6,7]'\n  \
+         - name: chunk\n    loop: {from: \"{{rows}}\", batch: 3}\n    \
+         write_file:\n      path: \"b{{batch_index}}.txt\"\n      content: \"{{batch_size}}:{{batch}}\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b0.txt")).unwrap(),
+        "3:[\"1\",\"2\",\"3\"]"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b2.txt")).unwrap(),
+        "1:[\"7\"]"
+    );
+    assert!(!dir.path().join("b3.txt").exists());
+}
+
+#[test]
+fn loop_batch_composes_with_max_parallel() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: BatchPar\ntasks:\n  - name: rows\n    set_fact:\n      rows: '[1,2,3,4,5]'\n  \
+         - name: chunk\n    loop: {from: \"{{rows}}\", batch: 2}\n    max_parallel: 2\n    \
+         write_file:\n      path: \"p{{batch_index}}.txt\"\n      content: \"{{batch_size}}\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("p0.txt")).unwrap(),
+        "2"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("p1.txt")).unwrap(),
+        "2"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("p2.txt")).unwrap(),
+        "1"
+    );
+}
+
+#[test]
+fn loop_batch_var_outside_a_loop_is_flagged_by_lint() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: L\ntasks:\n  - name: t\n    debug: \"{{batch_index}}\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--lint"])
+            .assert()
+            .success(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["message"].as_str().unwrap().contains("has no loop:")),
+        "findings were: {out}"
+    );
+}
+
+// ── parallel: ────────────────────────────────────────────────────────────────
+
+#[test]
+fn parallel_runs_children_and_merges_their_registered_vars() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Par\ntasks:\n  - name: fan out\n    parallel:\n      - name: a\n        \
+         run: echo AA\n        register: ra\n      - name: b\n        run: echo BB\n        \
+         register: rb\n  - name: use\n    write_file:\n      path: out.txt\n      \
+         content: \"{{ra}}-{{rb}}\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "AA-BB"
+    );
+}
+
+#[test]
+fn parallel_first_failing_child_fails_the_task_and_names_it() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Par\ntasks:\n  - name: fan out\n    parallel:\n      - name: good\n        \
+         run: echo ok\n      - name: bad\n        run: \"exit 3\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .failure(),
+    );
+    let summary = last_line_json(&out);
+    assert_eq!(summary["success"], false);
+    assert!(
+        summary["tasks"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("child task 'bad'"),
+        "error was: {out}"
+    );
+}
+
+#[test]
+fn parallel_rejects_a_confirm_pause_child() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Par\ntasks:\n  - name: p\n    parallel:\n      - name: x\n        confirm: \"ok?\"\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("uses confirm:"), "stdout was: {out}");
+}
+
+#[test]
+fn parallel_counts_as_one_recap_outcome() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Par\ntasks:\n  - name: fan out\n    parallel:\n      - {name: a, run: echo a}\n      \
+         - {name: b, run: echo b}\n      - {name: c, run: echo c}\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let summary = last_line_json(&out);
+    assert_eq!(summary["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(summary["ok"], 1);
+}
+
+#[test]
+fn list_tasks_shows_children_of_a_parallel_block() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Par\ntasks:\n  - name: fan out\n    parallel:\n      - {name: a, run: echo a}\n      \
+         - {name: b, run: echo b}\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml", "--list-tasks"])
+            .assert()
+            .success(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let kids = v["tasks"][0]["parallel"].as_array().unwrap();
+    assert_eq!(kids.len(), 2);
+    assert_eq!(kids[0]["name"], "a");
+}
+
+// ── db_load: ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn db_load_without_confirm_fails_before_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("rows.csv"), "id,total\n1,10\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Load\ntasks:\n  - name: load\n    db_load:\n      server: ghost\n      \
+         table: orders\n      file: rows.csv\n      engine: mysql\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("refused to run without confirm: true"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn db_load_missing_file_fails_before_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Load\ntasks:\n  - name: load\n    db_load:\n      server: ghost\n      \
+         table: orders\n      file: nope.csv\n      engine: mysql\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(
+        out.contains("db_load: reading local file"),
+        "stdout was: {out}"
+    );
+}
+
+#[test]
+fn db_load_rejects_a_bad_table_identifier() {
+    let (mut cmd, dir) = tooler();
+    tooler_in(dir.path())
+        .args(["server", "add", "db1", "--host", "127.0.0.1"])
+        .assert()
+        .success();
+    std::fs::write(dir.path().join("rows.csv"), "id\n1\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Load\ntasks:\n  - name: load\n    db_load:\n      server: db1\n      \
+         table: \"orders; DROP TABLE x\"\n      file: rows.csv\n      engine: mysql\n      \
+         host: h\n      database: d\n      user: u\n      password: p\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(cmd.args(["play", "playbook.yml"]).assert().failure());
+    assert!(out.contains("invalid SQL identifier"), "stdout was: {out}");
+}
+
+#[test]
+fn db_load_dry_run_previews_without_connecting() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(dir.path().join("rows.csv"), "id\n1\n").unwrap();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Load\ntasks:\n  - name: load\n    db_load:\n      server: ghost\n      \
+         table: orders\n      file: rows.csv\n      engine: mysql\n      confirm: true\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["play", "playbook.yml", "--dry"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        out.contains("load rows.csv → ghost:orders"),
+        "stdout was: {out}"
+    );
+}

@@ -168,6 +168,24 @@ struct Playbook {
     /// `run_failure_hook`.
     #[serde(default)]
     on_failure: Vec<Task>,
+    /// When true, a real (non-dry) top-level run of this playbook file takes an exclusive
+    /// lock (`<file>.lock`) for its duration. A second `tooler play` of the same file
+    /// while that lock is held and still fresh exits non-zero with a clear message
+    /// instead of racing the first run's `state_set:` writes — the guard a
+    /// `tooler cron local`-scheduled playbook needs when a run occasionally overruns its
+    /// interval. A lock older than `lock_timeout` seconds is assumed abandoned (the
+    /// previous run was killed) and taken over with a warning. Ignored in `--dry` and for
+    /// `include:`d sub-playbooks (only the top-level run locks). See `run()`/`LockGuard`.
+    #[serde(default)]
+    single_instance: bool,
+    /// Seconds after which a held `<file>.lock` is treated as stale and taken over —
+    /// only meaningful with `single_instance: true`. Default 21600 (6h).
+    #[serde(default = "default_lock_timeout")]
+    lock_timeout: u64,
+}
+
+fn default_lock_timeout() -> u64 {
+    21600
 }
 
 #[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
@@ -306,6 +324,15 @@ struct Task {
     /// Always run after `block:`/`rescue:`, regardless of outcome; a failure here fails
     /// the block even after a successful rescue.
     always: Option<Vec<Task>>,
+    /// Run these tasks concurrently (each its own thread with a cloned vars/include_stack,
+    /// the same model as a `max_parallel:` `loop:`), joining before the next task —
+    /// e.g. extract from several sources at once. `max_parallel:` on this same task caps
+    /// how many run at a time (default: all). Each child's `register:`ed var is merged
+    /// back into the parent afterwards, in child order (deterministic despite the
+    /// concurrency); the first child that fails in that order fails the `parallel:` task.
+    /// Counts as one outcome in the recap, like `block:`. A `confirm:` (interactive
+    /// pause) child isn't allowed — an agent-run playbook uses `--yes` anyway.
+    parallel: Option<Vec<Task>>,
     /// Print a rendered message; no side effects.
     debug: Option<String>,
     /// Compute/override vars from rendered expressions (supports the `| json:<path>`
@@ -384,6 +411,9 @@ struct Task {
     /// Deliberately requires `confirm: true` in the YAML itself — never runs silently.
     /// See `DbExecSpec`.
     db_exec: Option<DbExecSpec>,
+    /// Bulk-load a local file into a remote table over SSH (`psql \copy` / `mysql LOAD
+    /// DATA LOCAL INFILE`) — the ETL "L". Requires `confirm: true`. See `DbLoadSpec`.
+    db_load: Option<DbLoadSpec>,
     /// Write a value into the OS keychain (`{{secret.<profile>.<key>}}`'s own backing
     /// store) — the write-side counterpart to reading `{{secret.*}}`, so a playbook can
     /// generate/rotate a credential end-to-end without dropping out to `tooler config
@@ -466,7 +496,23 @@ enum LoopSpec {
         from: String,
         #[serde(default)]
         split: Option<String>,
+        /// Process the resolved items in groups of N instead of one at a time. Each
+        /// iteration then exposes the whole group as `{{batch}}` (a JSON array, the same
+        /// shape `from:` accepted), plus `{{batch_index}}` (0-based) and `{{batch_size}}`
+        /// (that group's actual count — the last group may be smaller). Lets a task do
+        /// one bulk operation per group — a chunked `run:`/`db_load:` instead of N
+        /// per-row round trips. Composes with `max_parallel:` (the groups become the
+        /// units run concurrently).
+        #[serde(default)]
+        batch: Option<usize>,
     },
+}
+
+/// One unit of `loop:` work: a single item (the default), or — with `batch: N` — a group
+/// of up to N items handled together. See `resolve_loop_units`.
+enum LoopUnit {
+    Item(LoopItem),
+    Batch { items: Vec<LoopItem>, index: usize },
 }
 
 /// `assert:`'s two shapes — a bare condition string (unchanged), or a structured form
@@ -506,7 +552,7 @@ enum RunSpec {
 fn resolve_loop_items(spec: &LoopSpec, vars: &HashMap<String, String>) -> Vec<LoopItem> {
     match spec {
         LoopSpec::Static(items) => items.clone(),
-        LoopSpec::Dynamic { from, split } => {
+        LoopSpec::Dynamic { from, split, .. } => {
             let rendered = render(from, vars);
             if let Ok(serde_json::Value::Array(elements)) =
                 serde_json::from_str::<serde_json::Value>(&rendered)
@@ -538,6 +584,47 @@ fn resolve_loop_items(spec: &LoopSpec, vars: &HashMap<String, String>) -> Vec<Lo
                 .map(|s| LoopItem::Scalar(s.to_string()))
                 .collect()
         }
+    }
+}
+
+/// The batch size a `LoopSpec` asks for, if any (`Some(n)` only for `Dynamic { batch:
+/// Some(n) }` with `n >= 1`).
+fn loop_batch_size(spec: &LoopSpec) -> Option<usize> {
+    match spec {
+        LoopSpec::Dynamic { batch: Some(n), .. } if *n >= 1 => Some(*n),
+        _ => None,
+    }
+}
+
+/// Resolves a `LoopSpec` into the units `run_task`/`run_loop_parallel` iterate: one
+/// `LoopUnit::Item` per item normally, or — with `batch: N` — the items regrouped into
+/// `LoopUnit::Batch` chunks of up to N (the last chunk may be smaller).
+fn resolve_loop_units(spec: &LoopSpec, vars: &HashMap<String, String>) -> Vec<LoopUnit> {
+    let items = resolve_loop_items(spec, vars);
+    match loop_batch_size(spec) {
+        None => items.into_iter().map(LoopUnit::Item).collect(),
+        Some(n) => items
+            .chunks(n)
+            .enumerate()
+            .map(|(index, chunk)| LoopUnit::Batch {
+                items: chunk.to_vec(),
+                index,
+            })
+            .collect(),
+    }
+}
+
+/// Rebuilds a `LoopItem` back into the JSON value it came from — the inverse of
+/// `resolve_loop_items`' own parse — so `{{batch}}` round-trips a `db_query:`/`scrape:`
+/// result unchanged.
+fn loop_item_to_json(item: &LoopItem) -> serde_json::Value {
+    match item {
+        LoopItem::Scalar(s) => serde_json::Value::String(s.clone()),
+        LoopItem::Map(m) => serde_json::Value::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect(),
+        ),
     }
 }
 
@@ -1072,6 +1159,49 @@ fn json_cell_to_string(value: &serde_json::Value) -> String {
     }
 }
 
+/// Flattens a JSON array into CSV bytes: an array of objects writes a header row from
+/// the first object's keys (unless `headers` is false) then one row per object in that
+/// key order; an array of plain values/arrays is written as raw rows. Shared by
+/// `write_csv:` and `db_load: {format: json}`.
+fn json_array_to_csv(
+    elements: &[serde_json::Value],
+    headers: bool,
+    delimiter: u8,
+) -> Result<Vec<u8>> {
+    let mut writer = csv::WriterBuilder::new()
+        .delimiter(delimiter)
+        .from_writer(Vec::new());
+    if let Some(serde_json::Value::Object(first)) = elements.first() {
+        let cols: Vec<String> = first.keys().cloned().collect();
+        if headers {
+            writer
+                .write_record(&cols)
+                .context("writing CSV header row")?;
+        }
+        for el in elements {
+            let obj = el.as_object();
+            let record: Vec<String> = cols
+                .iter()
+                .map(|c| {
+                    obj.and_then(|o| o.get(c))
+                        .map(json_cell_to_string)
+                        .unwrap_or_default()
+                })
+                .collect();
+            writer.write_record(&record).context("writing CSV row")?;
+        }
+    } else {
+        for el in elements {
+            let record: Vec<String> = match el {
+                serde_json::Value::Array(items) => items.iter().map(json_cell_to_string).collect(),
+                other => vec![json_cell_to_string(other)],
+            };
+            writer.write_record(&record).context("writing CSV row")?;
+        }
+    }
+    writer.into_inner().context("finalizing CSV output")
+}
+
 /// `db_query:` — mirrors `commands::db::DbSubcommand::Query`'s fields exactly, so the
 /// mental model transfers 1:1 from the standalone `tooler db query` command.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1136,6 +1266,78 @@ struct DbExecSpec {
 }
 
 impl RequiresConfirm for DbExecSpec {
+    fn is_confirmed(&self) -> bool {
+        self.confirm
+    }
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum DbLoadFormat {
+    #[default]
+    Csv,
+    Tsv,
+    /// The file is a JSON array (typically a `db_query:`/`read_csv:` result written with
+    /// `write_file:`) — converted to CSV in-process before streaming.
+    Json,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum DbLoadMode {
+    /// Append rows to whatever is already in the table (the default).
+    #[default]
+    Append,
+    /// `TRUNCATE` the table first, then load.
+    Truncate,
+    /// MySQL only: a row whose PK/unique key already exists overwrites the existing row
+    /// (`LOAD DATA REPLACE`). Not supported for Postgres.
+    Upsert,
+}
+
+/// `db_load:` — bulk-load a local file into a remote table over one SSH connection
+/// (`psql \copy` / `mysql LOAD DATA LOCAL INFILE`), covering the ETL "L" that `db_exec:`
+/// (one statement) and `sync_db:` (whole database) don't. `file` resolves relative to
+/// the playbook's own directory (confined, same as `write_csv:`) — typically a
+/// `write_csv:`/`write_file:` output from an earlier task. Requires `confirm: true`,
+/// same gate `db_exec:` uses. `register:` (if set) captures the client's summary line
+/// (`COPY 42` on Postgres). Connection fields mirror `db_exec:`/`db_query:` exactly.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DbLoadSpec {
+    server: String,
+    table: String,
+    file: String,
+    #[serde(default)]
+    format: DbLoadFormat,
+    #[serde(default)]
+    mode: DbLoadMode,
+    /// Explicit target column list, in file-column order. Omit to load every column in
+    /// table order.
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+    /// The file's first line is a header row (CSV/TSV only; always true for `json`).
+    #[serde(default = "default_true")]
+    headers: bool,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+impl RequiresConfirm for DbLoadSpec {
     fn is_confirmed(&self) -> bool {
         self.confirm
     }
@@ -1520,6 +1722,8 @@ struct TaskListEntry {
     rescue: Vec<TaskListEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     always: Vec<TaskListEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    parallel: Vec<TaskListEntry>,
 }
 
 /// Builds the `--list-tasks` tree from a task list, recursing into `block:`/`rescue:`/
@@ -1539,6 +1743,11 @@ fn build_task_list<'a>(tasks: impl IntoIterator<Item = &'a Task>) -> Vec<TaskLis
             block: t.block.as_deref().map(build_task_list).unwrap_or_default(),
             rescue: t.rescue.as_deref().map(build_task_list).unwrap_or_default(),
             always: t.always.as_deref().map(build_task_list).unwrap_or_default(),
+            parallel: t
+                .parallel
+                .as_deref()
+                .map(build_task_list)
+                .unwrap_or_default(),
         })
         .collect()
 }
@@ -1589,6 +1798,7 @@ fn print_task_list(playbook_name: &str, tasks: &[&Task], ctx: &Context) -> Resul
                 ("block:", &e.block),
                 ("rescue:", &e.rescue),
                 ("always:", &e.always),
+                ("parallel:", &e.parallel),
             ] {
                 if !sub.is_empty() {
                     println!("{}{}", "  ".repeat(depth + 2), label.dimmed());
@@ -1618,6 +1828,9 @@ fn collect_tags<'a>(
         }
         if let Some(a) = &t.always {
             collect_tags(a, out);
+        }
+        if let Some(p) = &t.parallel {
+            collect_tags(p, out);
         }
     }
 }
@@ -1780,6 +1993,7 @@ fn task_profile_refs(task: &Task) -> Vec<ProfileRef<'_>> {
     ssh_ref!(task.stat.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.db_query.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.db_exec.as_ref().map(|s| s.server.as_str()));
+    ssh_ref!(task.db_load.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.sync_db.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.sync_files.as_ref().map(|s| s.server.as_str()));
     ssh_ref!(task.deploy.as_ref().map(|s| s.server.as_str()));
@@ -1923,7 +2137,7 @@ fn check_d(
                     message: format!("include_vars: '{file}' not found"),
                 });
             }
-            for branch in [&task.block, &task.rescue, &task.always]
+            for branch in [&task.block, &task.rescue, &task.always, &task.parallel]
                 .into_iter()
                 .flatten()
             {
@@ -1979,7 +2193,7 @@ fn lint_tasks(
             for field in lintable_fields(task) {
                 for (token, _) in find_tokens(field) {
                     let base = token_base_name(token);
-                    if base == "item" {
+                    if matches!(base, "item" | "batch" | "batch_index" | "batch_size") {
                         if task.loop_spec.is_none() {
                             findings.push(LintFinding {
                                 task: task.name.clone(),
@@ -2103,6 +2317,9 @@ fn lint_tasks(
         if let Some(always) = &task.always {
             lint_tasks(always, known, tainted, saw_include_vars, findings, ctx);
         }
+        if let Some(parallel) = &task.parallel {
+            lint_tasks(parallel, known, tainted, saw_include_vars, findings, ctx);
+        }
     }
 }
 
@@ -2183,6 +2400,11 @@ struct RunEnv<'a> {
     /// run. Only ever matters when `state_path.is_some()`, so same top-level-only scope
     /// as `state_path`/`start_at`/`data_path`.
     keep_checkpoint: bool,
+    /// The `single_instance:` lock file (`<file>.lock`) to clean up right before the two
+    /// JSON-mode `std::process::exit(1)` paths, which bypass `LockGuard`'s `Drop`.
+    /// `Some(...)` only when the top-level playbook set `single_instance: true` and this
+    /// isn't a `--dry` run; `None` otherwise (and always for an `include:`'s `sub_env`).
+    lock_path: Option<PathBuf>,
     ctx: &'a Context,
 }
 
@@ -2317,6 +2539,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
             state_path: None,
             data_path: None,
             keep_checkpoint: args.keep_checkpoint,
+            lock_path: None,
             ctx,
         };
         return run_repl(vars, env);
@@ -2445,6 +2668,18 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         .as_deref()
         .map(|t| t.split(',').map(str::trim).collect());
 
+    // single_instance: take the lock before any task runs. Real runs only — a --dry
+    // inspection or a run of a playbook that didn't opt in never touches the lock. The
+    // guard releases it on every return/panic from here on; env.lock_path covers the two
+    // JSON-mode process::exit(1) paths that skip Drop.
+    let (lock_guard, lock_path) = if playbook.single_instance && !args.dry {
+        let guard = acquire_lock(&file_path, &playbook.name, playbook.lock_timeout)?;
+        let p = guard.0.clone();
+        (Some(guard), Some(p))
+    } else {
+        (None, None)
+    };
+
     let mut include_stack: Vec<PathBuf> = vec![file_path];
     let env = RunEnv {
         playbook_dir,
@@ -2459,10 +2694,11 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         state_path: Some(state_path),
         data_path: Some(data_path),
         keep_checkpoint: args.keep_checkpoint,
+        lock_path,
         ctx,
     };
 
-    execute_playbook(
+    let result = execute_playbook(
         &playbook,
         &tag_filter,
         &skip_tag_filter,
@@ -2471,7 +2707,9 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         &mut include_stack,
         true,
         &env,
-    )
+    );
+    drop(lock_guard);
+    result
 }
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
@@ -2835,6 +3073,116 @@ fn data_path_for(file_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The `single_instance:` lock path for a playbook file: `<file>.lock`, a sibling of the
+/// `.state.json`/`.data.json` files. Gitignore `*.lock` alongside those.
+fn lock_path_for(file_path: &Path) -> PathBuf {
+    let mut s = file_path.as_os_str().to_os_string();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// What a `<file>.lock` holds — one JSON line, so a human (or a `--dry` inspection) can
+/// see which process claims the playbook and since when.
+#[derive(Serialize, Deserialize)]
+struct LockInfo {
+    pid: u32,
+    started_at: String,
+    playbook: String,
+    host: String,
+}
+
+/// Removes the lock file it owns on drop — covers a clean finish, any `Err` return, and
+/// a panic. The two JSON-mode `std::process::exit(1)` paths bypass `Drop`, so they clean
+/// `env.lock_path` explicitly; a hard kill is covered by `lock_timeout` staleness.
+struct LockGuard(PathBuf);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn best_effort_hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Acquires the `single_instance:` lock for `file_path`. Returns a `LockGuard` that
+/// releases it on drop. Fails if a fresh lock (younger than `lock_timeout` seconds) is
+/// already held; takes over — with a warning — a lock older than that (the previous run
+/// was killed without cleaning up) or one that's corrupt/unparseable.
+fn acquire_lock(file_path: &Path, playbook_name: &str, lock_timeout: u64) -> Result<LockGuard> {
+    use std::io::Write;
+    let path = lock_path_for(file_path);
+
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                let info = LockInfo {
+                    pid: std::process::id(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    playbook: playbook_name.to_string(),
+                    host: best_effort_hostname(),
+                };
+                let _ = writeln!(f, "{}", serde_json::to_string(&info).unwrap_or_default());
+                return Ok(LockGuard(path));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let held = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<LockInfo>(s.trim()).ok());
+                let stale = match &held {
+                    Some(info) => chrono::DateTime::parse_from_rfc3339(&info.started_at)
+                        .map(|t| {
+                            (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds()
+                                > lock_timeout as i64
+                        })
+                        .unwrap_or(true),
+                    None => true,
+                };
+                if !stale {
+                    let info = held.expect("non-stale implies parsed");
+                    bail!(
+                        "'{playbook_name}' is already running (pid {}, on {}, since {}) — \
+                         {} is held. If that run is dead, delete the lock file.",
+                        info.pid,
+                        info.host,
+                        info.started_at,
+                        path.display()
+                    );
+                }
+                eprintln!(
+                    "  {} {} looks stale{} — taking over",
+                    "!".yellow().bold(),
+                    path.display(),
+                    held.map(|i| format!(" (pid {}, since {})", i.pid, i.started_at))
+                        .unwrap_or_else(|| " (unparseable)".to_string())
+                );
+                let _ = std::fs::remove_file(&path);
+                if attempt == 1 {
+                    bail!(
+                        "could not acquire {} after taking over a stale lock",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(anyhow!("creating lock file {}: {e}", path.display()));
+            }
+        }
+    }
+    unreachable!("loop returns or bails within 2 attempts")
+}
+
 /// Loads `<file>.data.json` if it exists (a missing file is an empty map, not an error --
 /// the common case on a playbook's first run) into a flat, unprefixed `HashMap`. Callers
 /// insert each entry into `vars` under a `state.<key>` prefix so `{{state.<key>}}`
@@ -2955,6 +3303,9 @@ fn validate_handlers(playbook: &Playbook) -> Result<()> {
             }
             if let Some(a) = &t.always {
                 walk(a, handler_names)?;
+            }
+            if let Some(p) = &t.parallel {
+                walk(p, handler_names)?;
             }
         }
         Ok(())
@@ -3241,6 +3592,10 @@ fn execute_playbook(
                             })
                         );
                         if is_top_level {
+                            // Drop is skipped by process::exit — release the lock by hand.
+                            if let Some(p) = &env.lock_path {
+                                let _ = std::fs::remove_file(p);
+                            }
                             std::process::exit(1);
                         }
                         bail!("playbook failed");
@@ -3492,6 +3847,9 @@ fn run_notified_handlers(
                         })
                     );
                     if is_top_level {
+                        if let Some(p) = &env.lock_path {
+                            let _ = std::fs::remove_file(p);
+                        }
                         std::process::exit(1);
                     }
                     bail!("playbook failed");
@@ -3570,8 +3928,8 @@ fn run_task(
     include_stack: &mut Vec<PathBuf>,
     env: &RunEnv,
 ) -> Result<()> {
-    if task.max_parallel.is_some() && task.loop_spec.is_none() {
-        bail!("max_parallel: is only supported combined with loop:");
+    if task.max_parallel.is_some() && task.loop_spec.is_none() && task.parallel.is_none() {
+        bail!("max_parallel: is only supported combined with loop: or parallel:");
     }
     if task.continue_on_error && task.loop_spec.is_none() {
         bail!("continue_on_error: is only supported combined with loop:");
@@ -3579,12 +3937,12 @@ fn run_task(
     let Some(spec) = &task.loop_spec else {
         return run_task_once_with_retries(task, vars, include_stack, env);
     };
-    let items = resolve_loop_items(spec, vars);
+    let units = resolve_loop_units(spec, vars);
 
     if let Some(chunk_size) = task.max_parallel.filter(|&n| n > 1) {
         return run_loop_parallel(
             task,
-            &items,
+            &units,
             chunk_size,
             vars,
             include_stack.as_slice(),
@@ -3594,9 +3952,9 @@ fn run_task(
 
     let mut results: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    for (index, item) in items.iter().enumerate() {
+    for (index, unit) in units.iter().enumerate() {
         let mut loop_vars = vars.clone();
-        apply_loop_item(item, &mut loop_vars, env.quiet);
+        apply_loop_unit(unit, &mut loop_vars, env.quiet);
         match run_task_once_with_retries(task, &mut loop_vars, include_stack, env) {
             Ok(()) => {
                 if let Some(reg) = &task.register {
@@ -3606,7 +3964,7 @@ fn run_task(
                 }
             }
             Err(e) if task.continue_on_error => {
-                failures.push(format!("{}: {e}", loop_item_label(index + 1, item)));
+                failures.push(format!("{}: {e}", loop_unit_label(index + 1, unit)));
                 if task.register.is_some() {
                     results.push(String::new());
                 }
@@ -3623,36 +3981,39 @@ fn run_task(
         bail!(
             "{} of {} loop item(s) failed: {}",
             failures.len(),
-            items.len(),
+            units.len(),
             failures.join("; ")
         );
     }
     Ok(())
 }
 
-/// A short label for a loop item in a `continue_on_error:` failure summary — the item's
-/// own value for a scalar, or just its position for a map (whose fields vary task to
-/// task, so there's no one obviously-right field to show). Shared by `run_task`/
-/// `run_loop_parallel`.
-fn loop_item_label(index: usize, item: &LoopItem) -> String {
-    match item {
-        LoopItem::Scalar(s) => format!("item {index} ({s})"),
-        LoopItem::Map(_) => format!("item {index}"),
+/// A short label for a loop unit in a `continue_on_error:` failure summary — the item's
+/// own value for a scalar, its position for a map (whose fields vary task to task), or
+/// the batch's index/size. Shared by `run_task`/`run_loop_parallel`.
+fn loop_unit_label(index: usize, unit: &LoopUnit) -> String {
+    match unit {
+        LoopUnit::Item(LoopItem::Scalar(s)) => format!("item {index} ({s})"),
+        LoopUnit::Item(LoopItem::Map(_)) => format!("item {index}"),
+        LoopUnit::Batch { items, index: bi } => {
+            format!("batch {bi} ({} item(s))", items.len())
+        }
     }
 }
 
-/// Inserts one `loop:` item's `{{item}}`/`{{item.<field>}}` var(s) into `loop_vars` and
-/// echoes the `→ item=...` line — the per-iteration setup shared by both the sequential
-/// and the parallel (`max_parallel:`) `loop:` paths.
-fn apply_loop_item(item: &LoopItem, loop_vars: &mut HashMap<String, String>, quiet: bool) {
-    match item {
-        LoopItem::Scalar(s) => {
+/// Inserts one `loop:` unit's vars into `loop_vars` and echoes the `→ ...` line — the
+/// per-iteration setup shared by both the sequential and the parallel (`max_parallel:`)
+/// `loop:` paths. An `Item` sets `{{item}}`/`{{item.<field>}}`; a `Batch` sets
+/// `{{batch}}` (a JSON array), `{{batch_index}}`, and `{{batch_size}}`.
+fn apply_loop_unit(unit: &LoopUnit, loop_vars: &mut HashMap<String, String>, quiet: bool) {
+    match unit {
+        LoopUnit::Item(LoopItem::Scalar(s)) => {
             loop_vars.insert("item".to_string(), s.clone());
             if !quiet {
                 println!("  {} item={}", "→".dimmed(), s.dimmed());
             }
         }
-        LoopItem::Map(m) => {
+        LoopUnit::Item(LoopItem::Map(m)) => {
             for (k, v) in m {
                 loop_vars.insert(format!("item.{k}"), v.clone());
             }
@@ -3663,6 +4024,15 @@ fn apply_loop_item(item: &LoopItem, loop_vars: &mut HashMap<String, String>, qui
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!("  {} {joined}", "→".dimmed());
+            }
+        }
+        LoopUnit::Batch { items, index } => {
+            let json = serde_json::Value::Array(items.iter().map(loop_item_to_json).collect());
+            loop_vars.insert("batch".to_string(), json.to_string());
+            loop_vars.insert("batch_index".to_string(), index.to_string());
+            loop_vars.insert("batch_size".to_string(), items.len().to_string());
+            if !quiet {
+                println!("  {} batch {index} ({} item(s))", "→".dimmed(), items.len());
             }
         }
     }
@@ -3685,7 +4055,7 @@ fn apply_loop_item(item: &LoopItem, loop_vars: &mut HashMap<String, String>, qui
 /// can't be cancelled mid-flight) even though the task as a whole is reported failed.
 fn run_loop_parallel(
     task: &Task,
-    items: &[LoopItem],
+    units: &[LoopUnit],
     chunk_size: usize,
     vars: &mut HashMap<String, String>,
     include_stack: &[PathBuf],
@@ -3695,14 +4065,14 @@ fn run_loop_parallel(
     let mut all_registered: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     let mut index = 0usize;
-    for chunk in items.chunks(chunk_size) {
+    for chunk in units.chunks(chunk_size) {
         let results: Vec<Result<Option<String>>> = std::thread::scope(|scope| {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|item| {
+                .map(|unit| {
                     let mut loop_vars = vars.clone();
                     let mut stack = include_stack.to_vec();
-                    apply_loop_item(item, &mut loop_vars, env.quiet);
+                    apply_loop_unit(unit, &mut loop_vars, env.quiet);
                     scope.spawn(move || {
                         run_task_once_with_retries(task, &mut loop_vars, &mut stack, env)?;
                         Ok(task
@@ -3714,7 +4084,7 @@ fn run_loop_parallel(
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        for (item, r) in chunk.iter().zip(results) {
+        for (unit, r) in chunk.iter().zip(results) {
             index += 1;
             match r {
                 Ok(val) => {
@@ -3726,7 +4096,7 @@ fn run_loop_parallel(
                     }
                 }
                 Err(e) if task.continue_on_error => {
-                    failures.push(format!("{}: {e}", loop_item_label(index, item)));
+                    failures.push(format!("{}: {e}", loop_unit_label(index, unit)));
                     if task.register.is_some() {
                         all_registered.push(String::new());
                     }
@@ -3747,9 +4117,57 @@ fn run_loop_parallel(
         bail!(
             "{} of {} loop item(s) failed: {}",
             failures.len(),
-            items.len(),
+            units.len(),
             failures.join("; ")
         );
+    }
+    Ok(())
+}
+
+/// Runs `children` concurrently (each its own thread with a cloned vars/include_stack,
+/// the same `std::thread::scope` model as a `max_parallel:` `loop:`), in chunks of `cap`
+/// — the next chunk only starts once the current one fully joins. After each chunk, every
+/// key a child added or changed vs. the parent's `vars` is merged back in child order
+/// (a deterministic last-writer-wins on a collision), so a later chunk and the tasks
+/// after the `parallel:` block see it. The first child that fails in child order fails
+/// the whole `parallel:` task; a chunk's other already-started children still run to
+/// completion (they can't be cancelled mid-flight).
+fn run_parallel_block(
+    children: &[Task],
+    cap: Option<usize>,
+    vars: &mut HashMap<String, String>,
+    include_stack: &[PathBuf],
+    env: &RunEnv,
+) -> Result<()> {
+    let cap = cap.unwrap_or(children.len()).max(1);
+    for chunk in children.chunks(cap) {
+        let before = vars.clone();
+        let results: Vec<Result<HashMap<String, String>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|child| {
+                    let mut child_vars = vars.clone();
+                    let mut stack = include_stack.to_vec();
+                    if !env.quiet {
+                        println!("    {} {}", "•".dimmed(), child.name.dimmed());
+                    }
+                    scope.spawn(move || {
+                        run_task(child, &mut child_vars, &mut stack, env)?;
+                        Ok(child_vars)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (child, r) in chunk.iter().zip(results) {
+            let child_vars =
+                r.with_context(|| format!("parallel: child task '{}' failed", child.name))?;
+            for (k, v) in child_vars {
+                if before.get(&k) != Some(&v) {
+                    vars.insert(k, v);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -4049,6 +4467,58 @@ fn exec_db_exec(
     crate::db::run_exec(&server, &creds, sql)
 }
 
+/// The only place `db_load:` actually runs — reads the local file (confined to the
+/// playbook dir), converts a `format: json` array to CSV first, then streams it into the
+/// remote table via `db::run_load`. Returns the client's summary line, for `register:`.
+fn exec_db_load(
+    confirmed: &Confirmed<DbLoadSpec>,
+    vars: &HashMap<String, String>,
+    env: &RunEnv,
+) -> Result<String> {
+    let file = join_confined(&env.playbook_dir, &render(&confirmed.file, vars))?;
+    let raw = std::fs::read(&file)
+        .with_context(|| format!("db_load: reading local file {}", file.display()))?;
+
+    let (delimiter, data, has_header) = match confirmed.format {
+        DbLoadFormat::Csv => (b',', raw, confirmed.headers),
+        DbLoadFormat::Tsv => (b'\t', raw, confirmed.headers),
+        DbLoadFormat::Json => {
+            let text =
+                String::from_utf8(raw).context("db_load: format: json file is not valid UTF-8")?;
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .context("db_load: format: json file is not valid JSON")?;
+            let serde_json::Value::Array(elements) = value else {
+                bail!("db_load: format: json file must contain a JSON array");
+            };
+            // A JSON object array always writes a header row here, so load it back with one.
+            (b',', json_array_to_csv(&elements, true, b',')?, true)
+        }
+    };
+
+    let server = crate::commands::ssh::resolve_server(env.ctx, &render(&confirmed.server, vars))?;
+    let creds = resolve_conn_creds(
+        &server,
+        confirmed.env.as_deref(),
+        confirmed.engine.as_deref(),
+        confirmed.host.as_deref(),
+        confirmed.port,
+        confirmed.database.as_deref(),
+        confirmed.user.as_deref(),
+        confirmed.password.as_deref(),
+        vars,
+    )?;
+    let table = render(&confirmed.table, vars);
+    let opts = crate::db::LoadOpts {
+        table: &table,
+        columns: confirmed.columns.as_deref(),
+        truncate: matches!(confirmed.mode, DbLoadMode::Truncate),
+        replace: matches!(confirmed.mode, DbLoadMode::Upsert),
+        has_header,
+        delimiter: delimiter as char,
+    };
+    crate::db::run_load(&server, &creds, &data, &opts)
+}
+
 /// The only place `secret_set:` actually writes to the OS keychain — see
 /// `exec_fs_write`'s doc comment for why this takes `&Confirmed<SecretSetSpec>`. The
 /// value is never printed or returned, matching every other secret-shaped value's
@@ -4204,6 +4674,7 @@ fn run_task_once(
             || task.include.is_some()
             || task.assert.is_some()
             || task.block.is_some()
+            || task.parallel.is_some()
             || task.debug.is_some()
             || task.set_fact.is_some()
             || task.wait_for.is_some()
@@ -4211,7 +4682,7 @@ fn run_task_once(
             || task.include_vars.is_some())
     {
         bail!(
-            "register: is not supported for check_url/check_port/env_check/include/assert/block/debug/set_fact/wait_for/confirm/include_vars tasks"
+            "register: is not supported for check_url/check_port/env_check/include/assert/block/parallel/debug/set_fact/wait_for/confirm/include_vars tasks"
         );
     }
 
@@ -4223,6 +4694,35 @@ fn run_task_once(
         && task.sync_files.is_none()
     {
         bail!("timeout: is only supported on run:/ssh:/fleet:/sync_db:/sync_files: tasks");
+    }
+
+    if let Some(children) = &task.parallel {
+        if task.loop_spec.is_some() {
+            bail!(
+                "parallel: can't be combined with loop: (task '{}')",
+                task.name
+            );
+        }
+        if task.block.is_some() || task.rescue.is_some() || task.always.is_some() {
+            bail!(
+                "parallel: can't be combined with block:/rescue:/always: (task '{}')",
+                task.name
+            );
+        }
+        if let Some(bad) = children.iter().find(|c| c.confirm.is_some()) {
+            bail!(
+                "parallel: child '{}' uses confirm: — an interactive pause from a worker \
+                 thread isn't supported; move it out of parallel: or run with --yes",
+                bad.name
+            );
+        }
+        return run_parallel_block(
+            children,
+            task.max_parallel,
+            vars,
+            include_stack.as_slice(),
+            env,
+        );
     }
 
     if let Some(spec) = &task.wait_for {
@@ -4811,41 +5311,8 @@ fn run_task_once(
                 );
             };
 
-            let mut writer = csv::WriterBuilder::new()
-                .delimiter(delimiter)
-                .from_writer(Vec::new());
             let row_count = elements.len();
-            if let Some(serde_json::Value::Object(first)) = elements.first() {
-                let cols: Vec<String> = first.keys().cloned().collect();
-                if spec.headers {
-                    writer
-                        .write_record(&cols)
-                        .context("writing CSV header row")?;
-                }
-                for el in &elements {
-                    let obj = el.as_object();
-                    let record: Vec<String> = cols
-                        .iter()
-                        .map(|c| {
-                            obj.and_then(|o| o.get(c))
-                                .map(json_cell_to_string)
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    writer.write_record(&record).context("writing CSV row")?;
-                }
-            } else {
-                for el in &elements {
-                    let record: Vec<String> = match el {
-                        serde_json::Value::Array(items) => {
-                            items.iter().map(json_cell_to_string).collect()
-                        }
-                        other => vec![json_cell_to_string(other)],
-                    };
-                    writer.write_record(&record).context("writing CSV row")?;
-                }
-            }
-            let bytes = writer.into_inner().context("finalizing CSV output")?;
+            let bytes = json_array_to_csv(&elements, spec.headers, delimiter)?;
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!("creating parent directory for {}", out_path.display())
@@ -5513,6 +5980,37 @@ fn run_task_once(
         return Ok(());
     }
 
+    if let Some(spec) = &task.db_load {
+        let server_name = render(&spec.server, vars);
+        let table = render(&spec.table, vars);
+        let file = render(&spec.file, vars);
+        if !env.quiet {
+            println!(
+                "  {} load {} → {}:{}",
+                "→".bold(),
+                file.dimmed(),
+                server_name.dimmed(),
+                table.dimmed()
+            );
+        }
+        if !env.dry {
+            let confirmed = Confirmed::require(spec, "db_load", &task.name)?;
+            let output = exec_db_load(&confirmed, vars, env)?;
+            if !env.quiet {
+                let summary = if output.is_empty() {
+                    "loaded"
+                } else {
+                    output.as_str()
+                };
+                println!("  {} {}", "✓ ok".green().bold(), summary.dimmed());
+            }
+            if let Some(reg) = &task.register {
+                vars.insert(reg.clone(), output);
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(spec) = &task.secret_set {
         let profile = render(&spec.profile, vars);
         let key = render(&spec.key, vars);
@@ -5768,6 +6266,7 @@ fn run_task_once(
                 state_path: None,
                 data_path: None,
                 keep_checkpoint: false,
+                lock_path: None,
                 ctx: env.ctx,
             };
             include_stack.push(include_path);
@@ -5804,10 +6303,10 @@ fn run_task_once(
     bail!(
         "task '{}' has no action (run, check_url, check_port, http, scrape, wait_for, \
          report, env_check, ssh, fleet, fs_cat, fs_write, systemd_restart, systemd_status, \
-         logs_tail, logs_grep, ps_list, ps_kill, stat, include, assert, block, debug, \
-         confirm, set_fact, include_vars, state_set, sync_db, sync_files, write_file, \
-         read_csv, write_csv, db_query, db_exec, secret_set, deploy, upload, cron, mail, \
-         mail_check, git_summary, git_changelog, gh_prs)",
+         logs_tail, logs_grep, ps_list, ps_kill, stat, include, assert, block, parallel, \
+         debug, confirm, set_fact, include_vars, state_set, sync_db, sync_files, write_file, \
+         read_csv, write_csv, db_query, db_exec, db_load, secret_set, deploy, upload, cron, \
+         mail, mail_check, git_summary, git_changelog, gh_prs)",
         task.name
     );
 }
@@ -5834,6 +6333,9 @@ fn confirm_gate(task: &Task) -> Option<bool> {
         return Some(s.is_confirmed());
     }
     if let Some(s) = &task.db_exec {
+        return Some(s.is_confirmed());
+    }
+    if let Some(s) = &task.db_load {
         return Some(s.is_confirmed());
     }
     if let Some(s) = &task.secret_set {
@@ -5887,6 +6389,7 @@ fn task_action_label(task: &Task) -> &'static str {
         include,
         assert,
         block,
+        parallel,
         debug,
         confirm,
         set_fact,
@@ -5899,6 +6402,7 @@ fn task_action_label(task: &Task) -> &'static str {
         write_csv,
         db_query,
         db_exec,
+        db_load,
         secret_set,
         deploy,
         upload,
@@ -7108,6 +7612,7 @@ mod tests {
             state_path: None,
             data_path: None,
             keep_checkpoint: false,
+            lock_path: None,
             ctx,
         }
     }
@@ -7889,6 +8394,8 @@ mod tests {
             vars: HashMap::new(),
             handlers: vec![],
             on_failure: vec![],
+            single_instance: false,
+            lock_timeout: 21600,
             tasks: vec![Task {
                 name: "t1".to_string(),
                 notify: vec!["nonexistent_handler".to_string()],
@@ -7910,6 +8417,8 @@ mod tests {
                 ..Default::default()
             }],
             on_failure: vec![],
+            single_instance: false,
+            lock_timeout: 21600,
             tasks: vec![Task {
                 name: "t1".to_string(),
                 notify: vec!["restart".to_string()],
@@ -7941,6 +8450,7 @@ mod tests {
         let spec = LoopSpec::Dynamic {
             from: "{{jobs}}".to_string(),
             split: None,
+            batch: None,
         };
         let items = resolve_loop_items(&spec, &v);
         assert_eq!(items.len(), 2);
@@ -7957,6 +8467,7 @@ mod tests {
         let spec = LoopSpec::Dynamic {
             from: "{{names}}".to_string(),
             split: None,
+            batch: None,
         };
         let items = resolve_loop_items(&spec, &v);
         assert_eq!(items.len(), 3);
@@ -7970,6 +8481,7 @@ mod tests {
         let spec = LoopSpec::Dynamic {
             from: "{{names}}".to_string(),
             split: Some(",".to_string()),
+            batch: None,
         };
         let items = resolve_loop_items(&spec, &v);
         assert_eq!(items.len(), 3);
@@ -8448,6 +8960,8 @@ mod tests {
             vars: vars(&[("host", "localhost")]),
             handlers: vec![],
             on_failure: vec![],
+            single_instance: false,
+            lock_timeout: 21600,
             tasks: vec![],
         };
         let merged = load_playbook_vars(&playbook, Path::new(".")).unwrap();
@@ -8472,6 +8986,8 @@ mod tests {
             vars: HashMap::new(),
             handlers: vec![],
             on_failure: vec![],
+            single_instance: false,
+            lock_timeout: 21600,
             tasks: vec![Task {
                 name: "only task".to_string(),
                 debug: Some("hi".to_string()),

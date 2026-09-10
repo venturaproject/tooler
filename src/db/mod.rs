@@ -450,6 +450,160 @@ pub fn restore_command(creds: &Credentials, gzipped_input: bool) -> String {
     }
 }
 
+/// Options for a `db_load:` bulk load — see `load_command`/`run_load`.
+pub struct LoadOpts<'a> {
+    pub table: &'a str,
+    pub columns: Option<&'a [String]>,
+    /// `TRUNCATE` the table before loading (a separate statement, same connection).
+    pub truncate: bool,
+    /// MySQL only: `LOAD DATA REPLACE` — rows with a duplicate PK/unique key overwrite
+    /// the existing row instead of erroring. Postgres has no equivalent for `\copy`.
+    pub replace: bool,
+    /// The input's first line is a header row (skipped on load).
+    pub has_header: bool,
+    /// Field delimiter — `','` (CSV) or `'\t'` (TSV).
+    pub delimiter: char,
+}
+
+/// A SQL identifier (table or column name) — letters, digits, `_`, and `.` (for
+/// `schema.table`), starting with a letter or `_`. These can't be parameterized in
+/// `\copy`/`LOAD DATA` and must never come from untrusted data, so anything else is
+/// rejected outright.
+fn validate_identifier(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    if !ok {
+        bail!(
+            "invalid SQL identifier '{name}' (letters/digits/_/. only, must start with a letter or _)"
+        );
+    }
+    Ok(())
+}
+
+/// Validates `opts`'s identifiers and returns the ` (col, col)` suffix (empty when no
+/// explicit column list). Shared by both engines' statement builders.
+fn load_col_list(opts: &LoadOpts) -> Result<String> {
+    validate_identifier(opts.table)?;
+    match opts.columns {
+        None => Ok(String::new()),
+        Some(cols) => {
+            for c in cols {
+                validate_identifier(c)?;
+            }
+            Ok(format!(" ({})", cols.join(", ")))
+        }
+    }
+}
+
+/// The raw `psql -c` argument(s) for a Postgres load — a `TRUNCATE` first (when asked),
+/// then the `\copy ... FROM STDIN` itself. Not shell-quoted; `load_command` does that.
+pub(crate) fn pg_load_statements(opts: &LoadOpts) -> Result<Vec<String>> {
+    if opts.replace {
+        bail!(
+            "db_load: mode upsert isn't supported for Postgres yet — load into a staging \
+             table and MERGE by hand"
+        );
+    }
+    let col_list = load_col_list(opts)?;
+    let delim = if opts.delimiter == '\t' {
+        "E'\\t'".to_string()
+    } else {
+        format!("'{}'", opts.delimiter)
+    };
+    let copy = format!(
+        "\\copy {}{} FROM STDIN WITH (FORMAT csv, HEADER {}, DELIMITER {})",
+        opts.table, col_list, opts.has_header, delim,
+    );
+    let mut out = Vec::new();
+    if opts.truncate {
+        out.push(format!("TRUNCATE {}", opts.table));
+    }
+    out.push(copy);
+    Ok(out)
+}
+
+/// The raw `mysql -e` statement for a MySQL load. Not shell-quoted.
+pub(crate) fn mysql_load_statement(opts: &LoadOpts) -> Result<String> {
+    let col_list = load_col_list(opts)?;
+    let delim = if opts.delimiter == '\t' { "\\t" } else { "," };
+    let mut stmt = String::new();
+    if opts.truncate {
+        stmt.push_str(&format!("TRUNCATE {}; ", opts.table));
+    }
+    stmt.push_str("LOAD DATA LOCAL INFILE '/dev/stdin' ");
+    if opts.replace {
+        stmt.push_str("REPLACE ");
+    }
+    stmt.push_str(&format!(
+        "INTO TABLE {} FIELDS TERMINATED BY '{}' OPTIONALLY ENCLOSED BY '\"' \
+         LINES TERMINATED BY '\\n'",
+        opts.table, delim
+    ));
+    if opts.has_header {
+        stmt.push_str(" IGNORE 1 LINES");
+    }
+    stmt.push_str(&col_list);
+    Ok(stmt)
+}
+
+/// Builds the remote command that reads CSV/TSV bytes from stdin and bulk-loads them
+/// into `opts.table`. Postgres: `psql -c "TRUNCATE ..." -c "\copy ... FROM STDIN"`.
+/// MySQL: `mysql --local-infile=1 -e "[TRUNCATE ...;] LOAD DATA LOCAL INFILE
+/// '/dev/stdin' [REPLACE] INTO TABLE ..."`. Errors on an invalid identifier or
+/// `replace: true` against Postgres.
+pub fn load_command(creds: &Credentials, opts: &LoadOpts) -> Result<String> {
+    match creds.engine {
+        Engine::Postgres => {
+            let mut cmd = format!(
+                "PGPASSWORD={} PGCONNECT_TIMEOUT=10 psql -v ON_ERROR_STOP=1 -h {} -p {} -U {} -d {}",
+                shell_quote(&creds.password),
+                shell_quote(&creds.host),
+                creds.port,
+                shell_quote(&creds.user),
+                shell_quote(&creds.database),
+            );
+            for stmt in pg_load_statements(opts)? {
+                cmd.push_str(&format!(" -c {}", shell_quote(&stmt)));
+            }
+            Ok(cmd)
+        }
+        Engine::MySql => Ok(format!(
+            "MYSQL_PWD={} mysql --local-infile=1 --connect-timeout=10 -h {} -P {} -u {} -D {} -e {}",
+            shell_quote(&creds.password),
+            shell_quote(&creds.host),
+            creds.port,
+            shell_quote(&creds.user),
+            shell_quote(&creds.database),
+            shell_quote(&mysql_load_statement(opts)?),
+        )),
+    }
+}
+
+/// Streams `data` (CSV/TSV bytes) into `opts.table` on `creds`'s database over one SSH
+/// connection (`ssh_exec_with_stdin`), via `load_command`. Returns the client's summary
+/// output trimmed (`COPY 42` on Postgres; MySQL's non-batch client usually prints
+/// nothing here, so an empty string means "succeeded" — follow up with a `db_query:` on
+/// `ROW_COUNT()` if the exact count matters).
+pub fn run_load(
+    server: &Server,
+    creds: &Credentials,
+    data: &[u8],
+    opts: &LoadOpts,
+) -> Result<String> {
+    let command = load_command(creds, opts)?;
+    let (stdout, stderr, ok) = ssh_exec_with_stdin(server, &command, data)?;
+    if !ok {
+        bail!("db_load failed: {}", stderr.trim());
+    }
+    Ok(stdout.trim().to_string())
+}
+
 /// Parses `KEY=value` lines (dotenv format: `#` comments, optional quotes).
 pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -1003,5 +1157,86 @@ mod tests {
         let cmd = restore_command(&mysql_creds(), false);
         assert!(cmd.starts_with("MYSQL_PWD='secret' mysql"));
         assert!(!cmd.contains("gunzip"));
+    }
+
+    fn load_opts(table: &'static str) -> LoadOpts<'static> {
+        LoadOpts {
+            table,
+            columns: None,
+            truncate: false,
+            replace: false,
+            has_header: true,
+            delimiter: ',',
+        }
+    }
+
+    #[test]
+    fn pg_load_append_is_a_single_copy_from_stdin() {
+        let stmts = pg_load_statements(&load_opts("orders")).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0],
+            "\\copy orders FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',')"
+        );
+    }
+
+    #[test]
+    fn pg_load_truncate_comes_before_the_copy() {
+        let mut opts = load_opts("orders");
+        opts.truncate = true;
+        let stmts = pg_load_statements(&opts).unwrap();
+        assert_eq!(stmts[0], "TRUNCATE orders");
+        assert!(stmts[1].starts_with("\\copy"));
+        // And the full command quotes each into its own -c.
+        assert!(
+            load_command(&pg_creds(), &opts)
+                .unwrap()
+                .contains("-c 'TRUNCATE orders' -c")
+        );
+    }
+
+    #[test]
+    fn pg_load_rejects_replace() {
+        let mut opts = load_opts("orders");
+        opts.replace = true;
+        assert!(pg_load_statements(&opts).is_err());
+    }
+
+    #[test]
+    fn mysql_load_append_uses_load_data_local_infile() {
+        let stmt = mysql_load_statement(&load_opts("orders")).unwrap();
+        assert!(stmt.starts_with("LOAD DATA LOCAL INFILE '/dev/stdin' INTO TABLE orders"));
+        assert!(stmt.contains("IGNORE 1 LINES"));
+        assert!(!stmt.contains("REPLACE"));
+        assert!(
+            load_command(&mysql_creds(), &load_opts("orders"))
+                .unwrap()
+                .contains("mysql --local-infile=1")
+        );
+    }
+
+    #[test]
+    fn mysql_load_truncate_and_replace_and_columns() {
+        let cols = vec!["id".to_string(), "total".to_string()];
+        let mut opts = load_opts("orders");
+        opts.truncate = true;
+        opts.replace = true;
+        opts.columns = Some(&cols);
+        opts.has_header = false;
+        let stmt = mysql_load_statement(&opts).unwrap();
+        assert!(stmt.starts_with(
+            "TRUNCATE orders; LOAD DATA LOCAL INFILE '/dev/stdin' REPLACE INTO TABLE orders"
+        ));
+        assert!(stmt.ends_with(" (id, total)"));
+        assert!(!stmt.contains("IGNORE 1 LINES"));
+    }
+
+    #[test]
+    fn load_rejects_a_bad_identifier() {
+        assert!(mysql_load_statement(&load_opts("orders; DROP TABLE x")).is_err());
+        let bad = vec!["id)".to_string()];
+        let mut opts = load_opts("orders");
+        opts.columns = Some(&bad);
+        assert!(pg_load_statements(&opts).is_err());
     }
 }
