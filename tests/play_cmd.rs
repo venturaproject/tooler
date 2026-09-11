@@ -5271,3 +5271,50 @@ fn explain_shows_a_template_tasks_src_and_dest() {
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["tasks"][0]["explain"]["dest"], "conf-prod.out");
 }
+
+// ── secret redaction in error output / --audit-log ──────────────────────────
+
+#[test]
+fn a_resolved_secret_leaking_into_a_task_error_is_redacted_from_json_output_and_audit_log() {
+    let (mut cmd, dir) = tooler();
+    let audit_path = dir.path().join("audit.jsonl");
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Leak\ntasks:\n  - name: store it\n    secret_set:\n      \
+         profile: __tooler_test_redact_it__\n      key: k\n      value: s3cr3t-leak-value\n      \
+         confirm: true\n  - name: leaky\n    http:\n      \
+         url: \"http://127.0.0.1:1/{{secret.__tooler_test_redact_it__.k}}\"\n      timeout: 2\n",
+    )
+    .unwrap();
+
+    let assert = cmd
+        .args(["--output", "json", "play", "playbook.yml", "--audit-log"])
+        .arg(&audit_path)
+        .assert();
+    let out = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+
+    // secret_set: itself may fail to write in an environment with no OS keychain
+    // backend at all -- same tolerant abstain the existing Check C secret tests use,
+    // rather than asserting a false failure here.
+    let summary = last_line_json(&out);
+    if summary["tasks"][0]["status"] != "ok" {
+        eprintln!("secret_set: didn't succeed here (no keychain backend?) -- skipping");
+        return;
+    }
+
+    let error_field = summary["tasks"][1]["error"].as_str().unwrap_or("");
+    assert!(
+        !error_field.contains("s3cr3t-leak-value"),
+        "the real secret value leaked into --output json's error field: {error_field}"
+    );
+    assert!(
+        error_field.contains("***"),
+        "expected the redaction marker in the error field: {error_field}"
+    );
+
+    let audit_content = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    assert!(
+        !audit_content.contains("s3cr3t-leak-value"),
+        "the real secret value leaked into --audit-log: {audit_content}"
+    );
+}

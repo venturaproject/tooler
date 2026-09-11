@@ -157,15 +157,62 @@ fn push_opt_num<T: ToString>(argv: &mut Vec<String>, flag: &str, value: Option<T
     }
 }
 
-fn is_profile_token_key(key: &str) -> bool {
-    crate::commands::config::parse_profile_key(key).is_some_and(|(_, field)| field == "token")
-}
-
 fn push_repeated(argv: &mut Vec<String>, flag: &str, values: &[String]) {
     for v in values {
         argv.push(flag.to_string());
         argv.push(v.clone());
     }
+}
+
+/// A `--var`/`-e` key that looks like it holds a credential, for `redact_argv`'s
+/// heuristic pass -- matched by substring since the actual set of var names a playbook
+/// author might choose is unbounded (`db_password`, `api_key`, `stripe_secret`, ...).
+fn looks_like_a_secret_var_name(name: &str) -> bool {
+    let name = name.to_lowercase();
+    [
+        "password",
+        "passwd",
+        "token",
+        "secret",
+        "api_key",
+        "apikey",
+        "credential",
+    ]
+    .iter()
+    .any(|pat| name.contains(pat))
+}
+
+/// Defense-in-depth redaction before an argv is written to `--audit-log`: the tool
+/// guards (`tooler_config_set`/`tooler_config_get` refuse keychain-backed keys outright,
+/// see `commands::config::is_secret_backed_key`) already stop the one designed path for
+/// a raw secret to reach an MCP argument, but this catches it a second time in case a
+/// guard is ever bypassed, plus the one path no guard covers: an agent handing
+/// `tooler_play` a `--var name=value` whose *value* is itself a secret the agent
+/// typed directly rather than referencing `{{secret.*}}`. Two rules, both exact-shape
+/// matches (not a general scan, to avoid redacting something that only coincidentally
+/// looks sensitive): a `config set <key> <value>` whose key is keychain-backed redacts
+/// `<value>`; a `--var`/`-e <name>=<value>` whose `<name>` looks like a credential (see
+/// `looks_like_a_secret_var_name`) redacts `<value>`.
+fn redact_argv(argv: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = argv.to_vec();
+    if let [cmd, sub, key, _value] = out.as_slice()
+        && cmd == "config"
+        && sub == "set"
+        && crate::commands::config::is_secret_backed_key(key)
+    {
+        out[3] = "***".to_string();
+        return out;
+    }
+    for i in 0..out.len().saturating_sub(1) {
+        if (out[i] == "--var" || out[i] == "-e")
+            && let Some((name, _)) = out[i + 1].split_once('=')
+            && looks_like_a_secret_var_name(name)
+        {
+            let name = name.to_string();
+            out[i + 1] = format!("{name}=***");
+        }
+    }
+    out
 }
 
 impl ToolerMcp {
@@ -238,6 +285,7 @@ impl ToolerMcp {
         let Some(path) = &self.audit_log else {
             return;
         };
+        let argv = redact_argv(argv);
         let line = serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339(),
             "argv": argv,
@@ -1562,10 +1610,12 @@ impl ToolerMcp {
         &self,
         Parameters(args): Parameters<ConfigGetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        if is_profile_token_key(&args.key) {
+        if crate::commands::config::is_secret_backed_key(&args.key) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "Refusing to read a profile token over MCP -- it would end up in plaintext in \
-                 the conversation. Run `tooler config get \"..\"` directly in a terminal instead.",
+                "Refusing to read a keychain-backed value (profile token/client_secret/\
+                 refresh_token, or a mail profile's password) over MCP -- it would end up in \
+                 plaintext in the conversation. Run `tooler config get \"..\"` directly in a \
+                 terminal instead.",
             )]));
         }
         let argv = vec!["config".to_string(), "get".to_string(), args.key.clone()];
@@ -1573,9 +1623,10 @@ impl ToolerMcp {
     }
 
     #[tool(
-        description = "Set a tooler config value by key, e.g. default.output json. Refuses \
-                        profile.<name>.token (set that directly in a terminal instead, so the \
-                        secret never enters the conversation).",
+        description = "Set a tooler config value by key, e.g. default.output json. Refuses any \
+                        keychain-backed key (profile.<name>.token/client_secret/refresh_token, \
+                        mail.<name>.password) -- set those directly in a terminal instead, so \
+                        the secret never enters the conversation.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1587,11 +1638,13 @@ impl ToolerMcp {
         &self,
         Parameters(args): Parameters<ConfigSetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        if is_profile_token_key(&args.key) {
+        if crate::commands::config::is_secret_backed_key(&args.key) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "Refusing to set a profile token over MCP -- it would sit in plaintext in the \
-                 conversation/tool-call history. Run `tooler config set profile.<name>.token ..` \
-                 directly in a terminal instead; it's stored encrypted in the OS keychain.",
+                "Refusing to set a keychain-backed value (profile token/client_secret/\
+                 refresh_token, or a mail profile's password) over MCP -- it would sit in \
+                 plaintext in the conversation/tool-call history. Run `tooler config set \
+                 <key> ..` directly in a terminal instead; it's stored encrypted in the OS \
+                 keychain.",
             )]));
         }
         let argv = vec![
@@ -3301,5 +3354,54 @@ mod tests {
                  exempt list above"
             );
         }
+    }
+
+    #[test]
+    fn redact_argv_scrubs_a_secret_backed_config_set_value() {
+        let argv = vec![
+            "config".to_string(),
+            "set".to_string(),
+            "mail.notify.password".to_string(),
+            "hunter2".to_string(),
+        ];
+        let redacted = redact_argv(&argv);
+        assert_eq!(redacted[3], "***");
+    }
+
+    #[test]
+    fn redact_argv_leaves_a_plain_config_set_alone() {
+        let argv = vec![
+            "config".to_string(),
+            "set".to_string(),
+            "default.output".to_string(),
+            "json".to_string(),
+        ];
+        assert_eq!(redact_argv(&argv), argv);
+    }
+
+    #[test]
+    fn redact_argv_scrubs_a_credential_shaped_var_value() {
+        let argv = vec![
+            "play".to_string(),
+            "deploy.yml".to_string(),
+            "--var".to_string(),
+            "db_password=hunter2".to_string(),
+            "-e".to_string(),
+            "api_key=abc123".to_string(),
+        ];
+        let redacted = redact_argv(&argv);
+        assert_eq!(redacted[3], "db_password=***");
+        assert_eq!(redacted[5], "api_key=***");
+    }
+
+    #[test]
+    fn redact_argv_leaves_an_ordinary_var_alone() {
+        let argv = vec![
+            "play".to_string(),
+            "deploy.yml".to_string(),
+            "--var".to_string(),
+            "env=prod".to_string(),
+        ];
+        assert_eq!(redact_argv(&argv), argv);
     }
 }

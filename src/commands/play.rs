@@ -4048,7 +4048,7 @@ fn execute_playbook(
                 }
             }
             Err(e) => {
-                let msg = e.to_string();
+                let msg = redact_secrets(&e.to_string(), &task_secret_values(task));
                 let kind = classify_error(&msg);
                 if task.ignore_errors {
                     if !json {
@@ -4257,7 +4257,7 @@ fn run_failure_hook(
             }
             Err(e) => {
                 *failed += 1;
-                let msg = e.to_string();
+                let msg = redact_secrets(&e.to_string(), &task_secret_values(t));
                 if !json {
                     println!(
                         "  {} on_failure task failed (ignored): {e}",
@@ -4333,7 +4333,7 @@ fn run_notified_handlers(
             }
             Err(e) => {
                 *failed += 1;
-                let msg = e.to_string();
+                let msg = redact_secrets(&e.to_string(), &task_secret_values(handler));
                 let kind = classify_error(&msg);
                 outcomes.push(TaskOutcome {
                     name: handler.name.clone(),
@@ -7065,6 +7065,52 @@ fn task_action_label(task: &Task) -> &'static str {
 /// `commands::mcp::ToolerMcp::write_audit`: one line per task attempt isn't a hot path,
 /// and a write failure here must never fail the task itself — it's only reported to
 /// stderr.
+/// Every value a task's own fields resolve `{{secret.<profile>.<key>}}` to — scanned by
+/// Debug-formatting the whole task (covers every field on every action, present or
+/// future, with no per-action-type enumeration to keep in sync) and pulling out each
+/// `{{secret.<profile>.<key>}}` token, then resolving it for real via the OS keychain.
+/// Used to scrub a captured error message before it's recorded anywhere (`--audit-log`,
+/// `--output json`'s `error` field) — a `run:`/`ssh:` task's own subprocess can echo an
+/// unmasked secret back in its stderr (its *argv* is real and unmasked, by necessity;
+/// only tooler's own *printed preview* of it is masked, see `render_for_display`), so
+/// redacting by known-value rather than by field name catches that too, not just
+/// tooler's own interpolation. Best-effort: a keychain lookup failure is skipped
+/// silently, same graceful-abstain `--lint`'s Check C already has.
+fn task_secret_values(task: &Task) -> Vec<String> {
+    let dump = format!("{task:?}");
+    let mut out = Vec::new();
+    let mut rest = dump.as_str();
+    while let Some(start) = rest.find("{{secret.") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let token = &after[..end];
+        rest = &after[end + 2..];
+        let Some(profile_key) = token.strip_prefix("secret.") else {
+            continue;
+        };
+        let Some((profile, key)) = profile_key.split_once('.') else {
+            continue;
+        };
+        if let Ok(Some(value)) = crate::secrets::get_secret(profile, key)
+            && !value.is_empty()
+        {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// Replaces every occurrence of each (non-empty) secret value with `***`.
+fn redact_secrets(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for s in secrets {
+        if !s.is_empty() {
+            out = out.replace(s.as_str(), "***");
+        }
+    }
+    out
+}
+
 fn write_audit_entry(
     env: &RunEnv,
     task: &Task,
@@ -7076,6 +7122,14 @@ fn write_audit_entry(
         return;
     };
     let error_kind = error.map(classify_error);
+    let redacted;
+    let error = match error {
+        Some(e) => {
+            redacted = redact_secrets(e, &task_secret_values(task));
+            Some(redacted.as_str())
+        }
+        None => None,
+    };
     let line = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "playbook": env.playbook_name,
@@ -10319,5 +10373,62 @@ mod tests {
         );
         // has a confirm-gated db_exec: -> the schema offers a `confirm` toggle.
         assert_eq!(schema["properties"]["confirm"]["type"], "boolean");
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn redact_secrets_replaces_every_occurrence_and_ignores_empty_strings() {
+        let text = "connecting with hunter2 to host, retrying hunter2 again";
+        let out = redact_secrets(text, &["hunter2".to_string(), "".to_string()]);
+        assert_eq!(out, "connecting with *** to host, retrying *** again");
+    }
+
+    #[test]
+    fn redact_secrets_is_a_no_op_with_no_secrets() {
+        let text = "plain error, nothing to hide";
+        assert_eq!(redact_secrets(text, &[]), text);
+    }
+
+    #[test]
+    fn task_secret_values_finds_and_resolves_a_referenced_secret() {
+        // Real OS keychain round-trip, same tolerant pattern Check C's own secret tests
+        // use elsewhere in this codebase -- if this environment has no working keychain
+        // backend at all, set_secret itself fails and the test abstains rather than
+        // asserting a false failure.
+        let profile = "tooler_test_redact";
+        let key = "k";
+        if crate::secrets::set_secret(profile, key, "s3cr3t-value").is_err() {
+            return;
+        }
+        let task = Task {
+            name: "t".to_string(),
+            run: Some(RunSpec::Simple(format!(
+                "echo {{{{secret.{profile}.{key}}}}}"
+            ))),
+            ..Default::default()
+        };
+        let found = task_secret_values(&task);
+        assert!(
+            found.contains(&"s3cr3t-value".to_string()),
+            "expected to find the resolved secret value, got: {found:?}"
+        );
+        assert_eq!(
+            redact_secrets("output was: s3cr3t-value", &found),
+            "output was: ***"
+        );
+    }
+
+    #[test]
+    fn task_secret_values_is_empty_when_the_task_references_no_secret() {
+        let task = Task {
+            name: "t".to_string(),
+            run: Some(RunSpec::Simple("echo hi".to_string())),
+            ..Default::default()
+        };
+        assert!(task_secret_values(&task).is_empty());
     }
 }

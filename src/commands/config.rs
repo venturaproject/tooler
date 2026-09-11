@@ -39,12 +39,30 @@ pub(crate) fn parse_profile_key(key: &str) -> Option<(&str, &str)> {
 }
 
 /// Splits a "mail.<name>.<field>" key into (name, field).
-fn parse_mail_key(key: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_mail_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix("mail.")?;
     rest.split_once('.')
 }
 
 const MAIL_KEYS: &str = "host, port, user, from, tls, imap_host, imap_port, password";
+
+/// Whether a `tooler config set <key> <value>` key routes `value` to the OS keychain
+/// rather than the plaintext config file — `profile.<name>.{token,client_secret,
+/// refresh_token}` (see `Set`'s `parse_profile_key` match below) and
+/// `mail.<name>.password` (`parse_mail_key`'s `"password"` arm). Used by `tooler mcp`'s
+/// `tooler_config_set` to refuse setting any of these over MCP at all — a raw secret
+/// value passed as a tool argument would sit in plaintext in the calling agent's
+/// conversation/tool-call history (and in `--audit-log`, if enabled), defeating the
+/// whole point of storing it in the keychain in the first place.
+pub(crate) fn is_secret_backed_key(key: &str) -> bool {
+    if let Some((_, field)) = parse_profile_key(key) {
+        return matches!(field, "token" | "client_secret" | "refresh_token");
+    }
+    if let Some((_, field)) = parse_mail_key(key) {
+        return field == "password";
+    }
+    false
+}
 
 pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
@@ -537,4 +555,35 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_secret_backed_key_flags_every_keychain_backed_profile_field() {
+        assert!(is_secret_backed_key("profile.exact.token"));
+        assert!(is_secret_backed_key("profile.exact.client_secret"));
+        assert!(is_secret_backed_key("profile.exact.refresh_token"));
+    }
+
+    #[test]
+    fn is_secret_backed_key_flags_mail_password() {
+        assert!(is_secret_backed_key("mail.notify.password"));
+    }
+
+    #[test]
+    fn is_secret_backed_key_does_not_flag_plaintext_profile_or_mail_fields() {
+        assert!(!is_secret_backed_key("profile.exact.base_url"));
+        assert!(!is_secret_backed_key("profile.exact.client_id"));
+        assert!(!is_secret_backed_key("mail.notify.host"));
+        assert!(!is_secret_backed_key("mail.notify.user"));
+    }
+
+    #[test]
+    fn is_secret_backed_key_does_not_flag_unrelated_keys() {
+        assert!(!is_secret_backed_key("default.output"));
+        assert!(!is_secret_backed_key("secret.exact.token"));
+    }
 }
