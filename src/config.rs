@@ -19,8 +19,18 @@ pub struct Config {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DefaultSection {
+    #[serde(default = "default_output")]
     pub output: String,
+    #[serde(default = "default_color")]
     pub color: bool,
+}
+
+fn default_output() -> String {
+    "plain".to_string()
+}
+
+fn default_color() -> bool {
+    true
 }
 
 impl Default for DefaultSection {
@@ -243,5 +253,20 @@ mod tests {
             "scp_args should accept-new, not disable host key checking: {args:?}"
         );
         assert!(!args.iter().any(|a| a.contains("StrictHostKeyChecking=no")));
+    }
+
+    #[test]
+    fn a_default_section_missing_output_or_color_falls_back_instead_of_failing_to_parse() {
+        let config: Config = toml::from_str("[default]\n").unwrap();
+        assert_eq!(config.default.output, "plain");
+        assert!(config.default.color);
+
+        let config: Config = toml::from_str("[default]\noutput = \"json\"\n").unwrap();
+        assert_eq!(config.default.output, "json");
+        assert!(config.default.color);
+
+        let config: Config = toml::from_str("[default]\ncolor = false\n").unwrap();
+        assert_eq!(config.default.output, "plain");
+        assert!(!config.default.color);
     }
 }
