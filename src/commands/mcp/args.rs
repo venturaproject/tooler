@@ -54,6 +54,9 @@ pub(crate) struct HttpGetArgs {
     /// Extra headers in "Key: Value" format
     #[serde(default)]
     pub(crate) headers: Vec<String>,
+    /// Query parameters in "key=value" format
+    #[serde(default)]
+    pub(crate) query: Vec<String>,
     /// Timeout in seconds
     pub(crate) timeout: Option<u64>,
     /// Config profile to use for base_url/token resolution
@@ -61,12 +64,15 @@ pub(crate) struct HttpGetArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub(crate) struct HttpPostArgs {
+pub(crate) struct HttpWriteArgs {
     pub(crate) url: String,
     /// JSON body string
     pub(crate) body: Option<String>,
     #[serde(default)]
     pub(crate) headers: Vec<String>,
+    /// Query parameters in "key=value" format
+    #[serde(default)]
+    pub(crate) query: Vec<String>,
     pub(crate) timeout: Option<u64>,
     pub(crate) profile: Option<String>,
 }

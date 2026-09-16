@@ -166,15 +166,49 @@ tooler env check .env.example .env        # verify .env has all keys from .env.e
 
 ### tooler http
 
-Make HTTP requests with optional profile-based auth.
+An ad-hoc REST client for testing APIs from the terminal — `get`/`head`/`delete`/
+`post`/`put`/`patch`, with optional profile-based auth.
 
 ```sh
 tooler http get https://api.example.com/users
 tooler http get /users --profile staging          # uses profile base_url
 tooler http get /health --token abc123            # Bearer auth (or set TOOLER_HTTP_TOKEN)
 tooler http get /users --header "X-Key: value"
+tooler http get /search -q q="hello world" -q page=2   # query params, URL-encoded
+tooler http get /private --basic alice:s3cret          # HTTP Basic auth
 tooler http post /users --body '{"name":"test"}'
 tooler http post /users --body '{"name":"test"}' --timeout 30
+tooler http post /users --body-file payload.json       # body from a file
+tooler http post /submit --form name=alice --form age=30   # x-www-form-urlencoded
+tooler http put /users/1 --body '{"name":"updated"}'
+tooler http patch /users/1 --body '{"name":"patched"}'
+tooler http delete /users/1
+tooler http get /users -v                          # show request + response headers, timing
+```
+
+`--body`, `--body-file`, and `--form` are mutually exclusive. Every response shows
+elapsed time (`200 (142ms)`); `-v`/`--verbose` also prints the outgoing headers and every
+response header before the body. `--output json` includes `elapsed_ms` and a `headers`
+object alongside `status`/`body`.
+
+#### Logging in against a JWT/bearer-token API
+
+Many APIs hand back a bearer token/JWT from a plain login endpoint rather than a full
+OAuth2 flow. `tooler http login` POSTs the credentials, extracts a field from the JSON
+response (`--token-field`, a dot-path, default `access_token`), and stores it as the
+active profile's token in the OS keychain — the same slot `config set
+profile.<name>.token` and `tooler http`'s auto-attach already use, so every later
+request against that profile picks it up automatically. The token is never printed.
+
+```sh
+tooler config set profile.myapi.base_url https://api.example.com
+tooler http login /login --body '{"user":"alice","pass":"s3cret"}' --profile myapi
+# -> ✓ token saved for profile myapi (200, 214ms)
+
+tooler http get /me --profile myapi   # Authorization: Bearer <the saved token>
+
+# nested field, e.g. {"data": {"jwt": "..."}}
+tooler http login /login --body '{"user":"alice"}' --token-field data.jwt --profile myapi
 ```
 
 Set a profile base URL and token once, use everywhere:
@@ -1413,7 +1447,7 @@ Most tools accept an optional `cwd` parameter so a single long-running server ca
 
 Tools are annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can distinguish safe reads (`tooler_info`, `tooler_env_show`, `tooler_check_url`, `tooler_stat`, `tooler_fleet_check`, ...) from destructive operations (`tooler_ssh_exec`, `tooler_ssh_ssl`, `tooler_git_clean`, `tooler_fleet_exec`, ...).
 
-`tooler_ssh_ssl`, `tooler_systemd_restart`, `tooler_ps_kill`, and `tooler_deploy_run` never accept `pfx_password`/`sudo_pass` as tool arguments, `tooler_http_get`/`tooler_http_post` never accept a bearer `token`, `tooler_db_query`/`tooler_db_backup`/`tooler_db_restore`/`tooler_db_exec` never accept a database `password`, and `tooler_mail_send`/`tooler_mail_check` never accept a mail `password` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` / `TOOLER_DB_PASSWORD` / `TOOLER_MAIL_PASSWORD` in the MCP server's own environment instead, e.g.:
+`tooler_ssh_ssl`, `tooler_systemd_restart`, `tooler_ps_kill`, and `tooler_deploy_run` never accept `pfx_password`/`sudo_pass` as tool arguments, `tooler_http_get`/`tooler_http_post`/`tooler_http_put`/`tooler_http_patch`/`tooler_http_delete` never accept a bearer `token`, `tooler_db_query`/`tooler_db_backup`/`tooler_db_restore`/`tooler_db_exec` never accept a database `password`, and `tooler_mail_send`/`tooler_mail_check` never accept a mail `password` (they'd otherwise sit in plaintext in the conversation/tool-call history, and in `http`'s case be forwarded to whatever URL the caller supplied). Set `TOOLER_PFX_PASS` / `TOOLER_SUDO_PASS` / `TOOLER_HTTP_TOKEN` / `TOOLER_DB_PASSWORD` / `TOOLER_MAIL_PASSWORD` in the MCP server's own environment instead, e.g.:
 
 ```json
 {

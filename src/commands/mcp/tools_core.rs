@@ -3,6 +3,22 @@ use super::*;
 
 #[tool_router(router = tool_router_core, vis = "pub(crate)")]
 impl ToolerMcp {
+    /// Shared by `tooler_http_post`/`_put`/`_patch`/`_delete`, which differ only in the
+    /// argv verb -- not itself `#[tool]`-annotated, so it isn't exposed as an MCP tool.
+    async fn http_write(
+        &self,
+        verb: &str,
+        args: HttpWriteArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let mut argv = vec!["http".to_string(), verb.to_string(), args.url.clone()];
+        push_opt(&mut argv, "--body", &args.body);
+        push_repeated(&mut argv, "--header", &args.headers);
+        push_repeated(&mut argv, "--query", &args.query);
+        push_opt_num(&mut argv, "--timeout", args.timeout);
+        push_opt(&mut argv, "--profile", &args.profile);
+        self.exec_self(argv, &None).await
+    }
+
     #[tool(
         description = "Show system information: working directory and environment variables",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
@@ -153,6 +169,7 @@ impl ToolerMcp {
     ) -> Result<CallToolResult, McpError> {
         let mut argv = vec!["http".to_string(), "get".to_string(), args.url.clone()];
         push_repeated(&mut argv, "--header", &args.headers);
+        push_repeated(&mut argv, "--query", &args.query);
         push_opt_num(&mut argv, "--timeout", args.timeout);
         push_opt(&mut argv, "--profile", &args.profile);
         self.exec_self(argv, &None).await
@@ -172,14 +189,66 @@ impl ToolerMcp {
     )]
     async fn tooler_http_post(
         &self,
-        Parameters(args): Parameters<HttpPostArgs>,
+        Parameters(args): Parameters<HttpWriteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut argv = vec!["http".to_string(), "post".to_string(), args.url.clone()];
-        push_opt(&mut argv, "--body", &args.body);
-        push_repeated(&mut argv, "--header", &args.headers);
-        push_opt_num(&mut argv, "--timeout", args.timeout);
-        push_opt(&mut argv, "--profile", &args.profile);
-        self.exec_self(argv, &None).await
+        self.http_write("post", args).await
+    }
+
+    #[tool(
+        description = "Perform an HTTP PUT request with a JSON body. Never accepts a bearer \
+                        token as a tool argument -- set TOOLER_HTTP_TOKEN in the MCP server's \
+                        own environment for ad hoc auth, or use --profile for a token stored in \
+                        the OS keychain (only sent to that profile's host).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_http_put(
+        &self,
+        Parameters(args): Parameters<HttpWriteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.http_write("put", args).await
+    }
+
+    #[tool(
+        description = "Perform an HTTP PATCH request with a JSON body. Never accepts a bearer \
+                        token as a tool argument -- set TOOLER_HTTP_TOKEN in the MCP server's \
+                        own environment for ad hoc auth, or use --profile for a token stored in \
+                        the OS keychain (only sent to that profile's host).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_http_patch(
+        &self,
+        Parameters(args): Parameters<HttpWriteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.http_write("patch", args).await
+    }
+
+    #[tool(
+        description = "Perform an HTTP DELETE request. Never accepts a bearer token as a tool \
+                        argument -- set TOOLER_HTTP_TOKEN in the MCP server's own environment \
+                        for ad hoc auth, or use --profile for a token stored in the OS keychain \
+                        (only sent to that profile's host).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn tooler_http_delete(
+        &self,
+        Parameters(args): Parameters<HttpWriteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.http_write("delete", args).await
     }
 
     #[tool(
