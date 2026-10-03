@@ -1,6 +1,6 @@
 [package]
 name = "tooler"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "A modular CLI toolkit"
 authors = ["Antonio Ventura <antonioventura.j@gmail.com>"]
@@ -53,7 +53,7 @@ md-5 = "0.10"
 hmac = "0.12"
 percent-encoding = "2"
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
+tempfile = "3"
 
 [dev-dependencies]
 assert_cmd = "2"
-tempfile = "3"

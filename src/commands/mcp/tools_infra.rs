@@ -358,6 +358,7 @@ impl ToolerMcp {
         push_opt_num(&mut argv, "--health-timeout", args.health_timeout);
         push_opt_num(&mut argv, "--health-retries", args.health_retries);
         push_opt_num(&mut argv, "--health-delay", args.health_delay);
+        push_flag(&mut argv, "--rollback-on-failure", args.rollback_on_failure);
         push_flag(&mut argv, "--sudo", args.sudo);
         push_flag(&mut argv, "--confirm", args.confirm);
         self.exec_self(argv, &None).await

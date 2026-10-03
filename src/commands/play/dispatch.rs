@@ -78,9 +78,10 @@ pub(crate) fn exec_systemd_restart(
     let server_name = render(&confirmed.server, vars);
     let sudo_pass = confirmed.sudo_pass.as_deref().map(|s| render(s, vars));
     let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
-    crate::db::ssh_exec_capture(
+    crate::db::ssh_exec_capture_with_sudo_password(
         &server,
         &crate::commands::systemd::restart_cmd(unit, confirmed.sudo, sudo_pass.as_deref()),
+        sudo_pass.as_deref(),
     )?;
     Ok(())
 }
@@ -96,9 +97,10 @@ pub(crate) fn exec_ps_kill(
     let server_name = render(&confirmed.server, vars);
     let sudo_pass = confirmed.sudo_pass.as_deref().map(|s| render(s, vars));
     let server = crate::commands::ssh::resolve_server(env.ctx, &server_name)?;
-    crate::db::ssh_exec_capture(
+    crate::db::ssh_exec_capture_with_sudo_password(
         &server,
         &crate::commands::ps::kill_cmd(confirmed.pid, signal, confirmed.sudo, sudo_pass.as_deref()),
+        sudo_pass.as_deref(),
     )?;
     Ok(())
 }
@@ -219,6 +221,7 @@ pub(crate) fn exec_deploy(
         confirmed.health_timeout,
         confirmed.health_retries,
         confirmed.health_delay,
+        confirmed.rollback_on_failure,
         confirmed.sudo,
         sudo_pass.as_deref(),
     )
@@ -553,7 +556,7 @@ pub(crate) fn run_task_once(
                 }
             }
             let (success, code, captured) =
-                run_with_timeout(cmd, task.register.is_some(), task.timeout)?;
+                run_with_timeout(cmd, task.register.is_some() || env.quiet, task.timeout)?;
             let elapsed = start.elapsed();
             if let Some(reg) = &task.register {
                 vars.insert(

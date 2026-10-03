@@ -2,6 +2,29 @@
 /// `tooler` command should have at least one `tooler_<command>[_*]` MCP tool, unless
 /// explicitly exempted below.
 use super::*;
+
+#[test]
+fn mcp_policy_limits_commands_and_explicit_server_arguments() {
+    let mut mcp = ToolerMcp::new();
+    mcp.policy = McpPolicy {
+        allowed_commands: vec!["deploy".to_string()],
+        allowed_servers: vec!["staging".to_string()],
+    };
+    assert!(
+        mcp.policy_error(&["deploy".to_string(), "staging".to_string()])
+            .is_none()
+    );
+    assert!(
+        mcp.policy_error(&["deploy".to_string(), "production".to_string()])
+            .unwrap()
+            .contains("production")
+    );
+    assert!(
+        mcp.policy_error(&["git".to_string(), "summary".to_string()])
+            .unwrap()
+            .contains("git")
+    );
+}
 use clap::CommandFactory;
 
 #[test]

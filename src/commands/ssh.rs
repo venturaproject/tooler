@@ -236,7 +236,11 @@ fn ssl(
     println!("{}", "─".repeat(50).dimmed());
 
     // Step 1: Extract certificate from PFX locally
-    let tmp_cert = std::env::temp_dir().join("tooler_ssl_cert.crt");
+    let tmp_cert = tempfile::Builder::new()
+        .prefix("tooler_ssl_")
+        .suffix(".crt")
+        .tempfile()
+        .context("Failed to create a temporary certificate file")?;
     println!(
         "{} Extracting certificate from PFX...",
         "1/5".bold().dimmed()
@@ -245,18 +249,22 @@ fn ssl(
     let mut openssl_cmd = std::process::Command::new("openssl");
     openssl_cmd
         .args(["pkcs12", "-in", pfx_path, "-clcerts", "-nokeys", "-out"])
-        .arg(&tmp_cert)
-        .arg("-legacy");
+        .arg(tmp_cert.path())
+        .args(["-legacy", "-passin", "stdin"]);
 
-    if let Some(pass) = pfx_password {
-        openssl_cmd.args(["-password", &format!("pass:{pass}")]);
-    } else {
-        openssl_cmd.args(["-password", "pass:"]);
-    }
-
-    let result = openssl_cmd
-        .status()
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = openssl_cmd
+        .stdin(Stdio::piped())
+        .spawn()
         .context("Failed to run openssl — is it installed?")?;
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(pfx_password.unwrap_or_default().as_bytes())
+        .context("Failed to provide PFX password to openssl")?;
+    let result = child.wait().context("Failed waiting for openssl")?;
     if !result.success() {
         bail!("openssl pkcs12 extraction failed. Check your PFX password.");
     }
@@ -264,7 +272,7 @@ fn ssl(
 
     // Step 2: Upload certificate
     println!("{} Uploading certificate...", "2/5".bold().dimmed());
-    run_scp(&server, &tmp_cert, &format!("/tmp/{cert_name}"))?;
+    run_scp(&server, tmp_cert.path(), &format!("/tmp/{cert_name}"))?;
     println!("     {} /tmp/{cert_name}", "✓".green());
 
     // Step 3: Upload private key
@@ -275,10 +283,7 @@ fn ssl(
     // Step 4: Move files into ssl_dir with correct permissions
     println!("{} Installing on server...", "4/5".bold().dimmed());
 
-    let sudo_prefix = match sudo_pass {
-        Some(pass) => format!("echo '{pass}' | sudo -S"),
-        None => "sudo".to_string(),
-    };
+    let sudo_prefix = "sudo";
 
     let install_cmd = format!(
         "mkdir -p {ssl_dir} && \
@@ -287,21 +292,48 @@ fn ssl(
          {sudo_prefix} chmod 644 {ssl_dir}/{cert_name} && \
          {sudo_prefix} chmod 600 {ssl_dir}/{key_name}",
     );
-    run_ssh(&server, &install_cmd)?;
+    run_ssh_with_sudo_password(&server, &install_cmd, sudo_pass)?;
     println!("     {} files installed in {ssl_dir}", "✓".green());
 
     // Step 5: Verify nginx config and reload
     println!("{} Verifying and reloading nginx...", "5/5".bold().dimmed());
     let reload_cmd = format!("{sudo_prefix} nginx -t && {sudo_prefix} systemctl reload nginx");
-    run_ssh(&server, &reload_cmd)?;
+    run_ssh_with_sudo_password(&server, &reload_cmd, sudo_pass)?;
     println!("     {} nginx reloaded", "✓".green());
-
-    // Cleanup local temp file
-    let _ = std::fs::remove_file(&tmp_cert);
 
     println!(
         "\n{} SSL certificate deployed successfully",
         "✓".green().bold()
     );
+    Ok(())
+}
+
+fn run_ssh_with_sudo_password(
+    server: &Server,
+    command: &str,
+    sudo_pass: Option<&str>,
+) -> Result<()> {
+    let Some(password) = sudo_pass else {
+        return run_ssh(server, command);
+    };
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("ssh")
+        .args(server.ssh_args())
+        .arg(server.host_target())
+        .arg(command.replace("sudo ", "sudo -S "))
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("Failed to launch ssh — is it installed?")?;
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(format!("{password}\n").as_bytes())
+        .context("Failed to provide sudo password over SSH")?;
+    let status = child.wait().context("Failed waiting for ssh")?;
+    if !status.success() {
+        bail!("SSH command failed (exit {})", status.code().unwrap_or(1));
+    }
     Ok(())
 }

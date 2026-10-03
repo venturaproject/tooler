@@ -4,7 +4,7 @@ use crate::{
     db,
     output::OutputFormat,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use colored::Colorize;
 use std::time::Duration;
@@ -37,6 +37,9 @@ pub struct DeployArgs {
     /// Seconds to wait between health check attempts
     #[arg(long, default_value_t = 2)]
     pub health_delay: u64,
+    /// Reset to the revision that was deployed before `--pull` if a later step fails
+    #[arg(long)]
+    pub rollback_on_failure: bool,
     /// Run the restart command via sudo
     #[arg(long)]
     pub sudo: bool,
@@ -59,6 +62,7 @@ pub fn run(args: DeployArgs, ctx: &Context) -> Result<()> {
         args.health_timeout,
         args.health_retries,
         args.health_delay,
+        args.rollback_on_failure,
         args.sudo,
         args.sudo_pass.as_deref(),
         args.confirm,
@@ -83,7 +87,19 @@ fn build_cmd(path: &str, build: &str) -> String {
 }
 
 fn restart_cmd(restart: &str, sudo: bool, sudo_pass: Option<&str>) -> String {
-    format!("{}{restart}", db::sudo_prefix(sudo, sudo_pass))
+    format!("{}{restart}", db::sudo_prefix(sudo, sudo_pass.is_some()))
+}
+
+fn revision_cmd(path: &str) -> String {
+    format!("cd {} && git rev-parse HEAD", db::shell_quote(path))
+}
+
+fn rollback_cmd(path: &str, revision: &str) -> String {
+    format!(
+        "cd {} && git reset --hard {}",
+        db::shell_quote(path),
+        db::shell_quote(revision)
+    )
 }
 
 /// Human-readable description of each requested step, in execution order --
@@ -95,6 +111,7 @@ fn plan_steps(
     restart: Option<&str>,
     health_url: Option<&str>,
     health_retries: u32,
+    rollback_on_failure: bool,
 ) -> Vec<String> {
     let mut steps = Vec::new();
     if pull {
@@ -111,6 +128,9 @@ fn plan_steps(
             "health check {url} (up to {health_retries} retries)"
         ));
     }
+    if rollback_on_failure {
+        steps.push("on failure: reset to the revision before git pull and restart".to_string());
+    }
     steps
 }
 
@@ -125,6 +145,7 @@ fn deploy(
     health_timeout: u64,
     health_retries: u32,
     health_delay: u64,
+    rollback_on_failure: bool,
     sudo: bool,
     sudo_pass: Option<&str>,
     confirm: bool,
@@ -132,7 +153,15 @@ fn deploy(
 ) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
 
-    let steps = plan_steps(path, pull, build, restart, health_url, health_retries);
+    let steps = plan_steps(
+        path,
+        pull,
+        build,
+        restart,
+        health_url,
+        health_retries,
+        rollback_on_failure,
+    );
     if steps.is_empty() {
         return fail(
             json,
@@ -181,6 +210,7 @@ fn deploy(
         health_timeout,
         health_retries,
         health_delay,
+        rollback_on_failure,
         sudo,
         sudo_pass,
     ) {
@@ -221,6 +251,75 @@ pub(crate) fn apply_deploy_steps(
     health_timeout: u64,
     health_retries: u32,
     health_delay: u64,
+    rollback_on_failure: bool,
+    sudo: bool,
+    sudo_pass: Option<&str>,
+) -> Result<()> {
+    if rollback_on_failure && !pull {
+        bail!("--rollback-on-failure requires --pull so tooler can restore a prior revision");
+    }
+    let previous_revision = if rollback_on_failure {
+        Some(
+            db::ssh_exec_capture(server, &revision_cmd(path))
+                .context("could not determine the currently deployed git revision")?
+                .trim()
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let deploy_result = apply_deploy_steps_inner(
+        server,
+        path,
+        pull,
+        build,
+        restart,
+        health_url,
+        health_timeout,
+        health_retries,
+        health_delay,
+        sudo,
+        sudo_pass,
+    );
+    if let Err(deploy_error) = deploy_result {
+        if let Some(revision) = previous_revision {
+            let rollback =
+                db::ssh_exec_capture(server, &rollback_cmd(path, &revision)).and_then(|_| {
+                    match restart {
+                        Some(cmd) => db::ssh_exec_capture_with_sudo_password(
+                            server,
+                            &restart_cmd(cmd, sudo, sudo_pass),
+                            sudo_pass,
+                        )
+                        .map(|_| ()),
+                        None => Ok(()),
+                    }
+                });
+            return match rollback {
+                Ok(()) => Err(deploy_error.context(format!(
+                    "deployment rolled back to {revision} after failure"
+                ))),
+                Err(rollback_error) => Err(deploy_error.context(format!(
+                    "deployment failed and rollback to {revision} also failed: {rollback_error:#}"
+                ))),
+            };
+        }
+        return Err(deploy_error);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_deploy_steps_inner(
+    server: &crate::config::Server,
+    path: &str,
+    pull: bool,
+    build: Option<&str>,
+    restart: Option<&str>,
+    health_url: Option<&str>,
+    health_timeout: u64,
+    health_retries: u32,
+    health_delay: u64,
     sudo: bool,
     sudo_pass: Option<&str>,
 ) -> Result<()> {
@@ -235,7 +334,11 @@ pub(crate) fn apply_deploy_steps(
     }
 
     if let Some(cmd) = restart
-        && let Err(e) = db::ssh_exec_capture(server, &restart_cmd(cmd, sudo, sudo_pass))
+        && let Err(e) = db::ssh_exec_capture_with_sudo_password(
+            server,
+            &restart_cmd(cmd, sudo, sudo_pass),
+            sudo_pass,
+        )
     {
         bail!("restart failed: {e:#}");
     }
@@ -297,13 +400,21 @@ mod tests {
     fn restart_cmd_with_sudo_and_password() {
         assert_eq!(
             restart_cmd("systemctl restart myapp", true, Some("pw")),
-            "echo 'pw' | sudo -S systemctl restart myapp"
+            "sudo -S systemctl restart myapp"
         );
     }
 
     #[test]
     fn plan_steps_only_includes_requested_actions() {
-        let steps = plan_steps("/app", true, None, Some("systemctl restart myapp"), None, 3);
+        let steps = plan_steps(
+            "/app",
+            true,
+            None,
+            Some("systemctl restart myapp"),
+            None,
+            3,
+            false,
+        );
         assert_eq!(
             steps,
             vec!["git pull in /app", "restart: systemctl restart myapp"]
@@ -312,12 +423,24 @@ mod tests {
 
     #[test]
     fn plan_steps_empty_when_nothing_requested() {
-        assert!(plan_steps("/app", false, None, None, None, 3).is_empty());
+        assert!(plan_steps("/app", false, None, None, None, 3, false).is_empty());
     }
 
     #[test]
     fn plan_steps_includes_health_check_with_retry_count() {
-        let steps = plan_steps("/app", false, None, None, Some("https://x.test"), 5);
+        let steps = plan_steps("/app", false, None, None, Some("https://x.test"), 5, false);
         assert_eq!(steps, vec!["health check https://x.test (up to 5 retries)"]);
+    }
+
+    #[test]
+    fn rollback_commands_are_confined_to_the_deploy_repository() {
+        assert_eq!(
+            revision_cmd("/var/www/app"),
+            "cd '/var/www/app' && git rev-parse HEAD"
+        );
+        assert_eq!(
+            rollback_cmd("/var/www/app", "abc123"),
+            "cd '/var/www/app' && git reset --hard 'abc123'"
+        );
     }
 }

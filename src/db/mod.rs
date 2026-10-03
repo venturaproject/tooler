@@ -202,18 +202,40 @@ pub fn fetch_remote_file(server: &Server, path: &str) -> Result<String> {
     ssh_exec_capture(server, &format!("cat {}", shell_quote(path)))
 }
 
-/// Builds a sudo-invocation prefix for a remote command: empty when not using sudo,
-/// `sudo ` when no password is supplied (relies on passwordless/NOPASSWD sudo), or a
-/// piped `echo <pw> | sudo -S ` when a password is supplied. Shared by every command
-/// that can run its remote action via sudo (systemd, ps).
-pub(crate) fn sudo_prefix(sudo: bool, sudo_pass: Option<&str>) -> String {
+/// Builds a sudo-invocation prefix for a remote command. When a password is supplied,
+/// `sudo -S` reads it from SSH's stdin instead of embedding it in the remote command.
+pub(crate) fn sudo_prefix(sudo: bool, password_on_stdin: bool) -> String {
     if !sudo {
         return String::new();
     }
-    match sudo_pass {
-        Some(pass) => format!("echo {} | sudo -S ", shell_quote(pass)),
-        None => "sudo ".to_string(),
+    if password_on_stdin {
+        "sudo -S ".to_string()
+    } else {
+        "sudo ".to_string()
     }
+}
+
+/// Runs a remote command and supplies an optional sudo password through SSH's stdin.
+/// Keeping the password out of both local and remote argv prevents it appearing in a
+/// process listing. The caller must build `command` with `sudo_prefix(..., true)`.
+pub(crate) fn ssh_exec_capture_with_sudo_password(
+    server: &Server,
+    command: &str,
+    sudo_pass: Option<&str>,
+) -> Result<String> {
+    let Some(password) = sudo_pass else {
+        return ssh_exec_capture(server, command);
+    };
+    let (stdout, stderr, success) =
+        ssh_exec_with_stdin(server, command, format!("{password}\n").as_bytes())?;
+    if !success {
+        bail!(
+            "remote command failed on {}: {}",
+            server.host_target(),
+            stderr.trim()
+        );
+    }
+    Ok(stdout)
 }
 
 /// Runs `command` on `server` over SSH and returns its raw stdout bytes, without lossy
@@ -1093,20 +1115,17 @@ mod tests {
 
     #[test]
     fn sudo_prefix_empty_when_not_sudo() {
-        assert_eq!(sudo_prefix(false, Some("pw")), "");
+        assert_eq!(sudo_prefix(false, true), "");
     }
 
     #[test]
     fn sudo_prefix_plain_sudo_without_password() {
-        assert_eq!(sudo_prefix(true, None), "sudo ");
+        assert_eq!(sudo_prefix(true, false), "sudo ");
     }
 
     #[test]
     fn sudo_prefix_pipes_quoted_password() {
-        assert_eq!(
-            sudo_prefix(true, Some("it's")),
-            "echo 'it'\\''s' | sudo -S "
-        );
+        assert_eq!(sudo_prefix(true, true), "sudo -S ");
     }
 
     fn pg_creds() -> Credentials {

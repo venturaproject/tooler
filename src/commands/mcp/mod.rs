@@ -1,5 +1,6 @@
 use crate::{
     commands::{echo::EchoArgs, info::InfoArgs},
+    config::McpPolicy,
     context::Context,
 };
 use anyhow::Result;
@@ -164,6 +165,31 @@ fn push_repeated(argv: &mut Vec<String>, flag: &str, values: &[String]) {
     }
 }
 
+/// Extracts explicit server operands from the command wrappers that target one server.
+/// Fleet groups/all and arbitrary playbook YAML are intentionally not inferred here: use
+/// `mcp.allowed_commands` to withhold those broad execution surfaces when a server
+/// allowlist is required.
+fn server_arguments(argv: &[String]) -> Vec<&str> {
+    let Some(command) = argv.first().map(String::as_str) else {
+        return Vec::new();
+    };
+    let positional_server = match command {
+        "deploy" | "stat" => argv.get(1),
+        "ssh" | "systemd" | "ps" | "logs" | "fs" | "cron" => argv.get(2),
+        _ => None,
+    };
+    let mut servers: Vec<&str> = positional_server.into_iter().map(String::as_str).collect();
+    for pair in argv.windows(2) {
+        if pair[0] == "--server" {
+            servers.push(&pair[1]);
+        }
+        if pair[0] == "--servers" {
+            servers.extend(pair[1].split(',').map(str::trim).filter(|s| !s.is_empty()));
+        }
+    }
+    servers
+}
+
 /// A `--var`/`-e` key that looks like it holds a credential, for `redact_argv`'s
 /// heuristic pass -- matched by substring since the actual set of var names a playbook
 /// author might choose is unbounded (`db_password`, `api_key`, `stripe_secret`, ...).
@@ -227,6 +253,11 @@ impl ToolerMcp {
     ) -> Result<CallToolResult, McpError> {
         let started = std::time::Instant::now();
         let logged_argv = argv.clone();
+
+        if let Some(message) = self.policy_error(&argv) {
+            self.write_audit(&logged_argv, cwd, false, 0);
+            return Err(McpError::invalid_params(message, None));
+        }
 
         let exe = std::env::current_exe().map_err(|e| {
             McpError::internal_error(format!("cannot resolve tooler binary: {e}"), None)
@@ -334,6 +365,7 @@ pub struct ToolerMcp {
     tool_router: ToolRouter<ToolerMcp>,
     prompt_router: PromptRouter<ToolerMcp>,
     audit_log: Option<std::path::PathBuf>,
+    policy: McpPolicy,
     playbook_tools: Vec<PlaybookTool>,
 }
 
@@ -357,6 +389,37 @@ fn discover_playbook_tools() -> Vec<PlaybookTool> {
 }
 
 impl ToolerMcp {
+    fn policy_error(&self, argv: &[String]) -> Option<String> {
+        let command = argv.first()?;
+        if !self.policy.allowed_commands.is_empty()
+            && !self
+                .policy
+                .allowed_commands
+                .iter()
+                .any(|allowed| allowed == command)
+        {
+            return Some(format!(
+                "MCP policy denies the '{command}' command; add it to mcp.allowed_commands to permit it"
+            ));
+        }
+        if self.policy.allowed_servers.is_empty() {
+            return None;
+        }
+        for server in server_arguments(argv) {
+            if !self
+                .policy
+                .allowed_servers
+                .iter()
+                .any(|allowed| allowed == server)
+            {
+                return Some(format!(
+                    "MCP policy denies server '{server}'; add it to mcp.allowed_servers to permit it"
+                ));
+            }
+        }
+        None
+    }
+
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router_core()
@@ -366,6 +429,9 @@ impl ToolerMcp {
                 + Self::tool_router_admin(),
             prompt_router: Self::prompt_router(),
             audit_log: None,
+            policy: crate::config::load()
+                .map(|config| config.mcp)
+                .unwrap_or_default(),
             playbook_tools: discover_playbook_tools(),
         }
     }

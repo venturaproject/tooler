@@ -684,6 +684,9 @@ pub(crate) struct DeployRunArgs {
     pub(crate) health_retries: Option<u32>,
     /// Seconds to wait between health check attempts (default 2)
     pub(crate) health_delay: Option<u64>,
+    /// Reset to the revision before `pull` when a later deploy step fails
+    #[serde(default)]
+    pub(crate) rollback_on_failure: bool,
     /// Run the restart command via sudo. A sudo password, if needed, must never be
     /// passed as a tool argument -- set TOOLER_SUDO_PASS in the MCP server's own
     /// environment instead (or rely on passwordless/NOPASSWD sudo).

@@ -15,6 +15,18 @@ pub struct Config {
     pub group: HashMap<String, Group>,
     #[serde(default)]
     pub mail: HashMap<String, MailServer>,
+    #[serde(default)]
+    pub mcp: McpPolicy,
+}
+
+/// Limits the command surface exposed through `tooler mcp`. Empty allowlists preserve
+/// today's behavior; setting either list turns it into an explicit allowlist.
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct McpPolicy {
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
+    #[serde(default)]
+    pub allowed_servers: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -268,5 +280,12 @@ mod tests {
         let config: Config = toml::from_str("[default]\ncolor = false\n").unwrap();
         assert_eq!(config.default.output, "plain");
         assert!(!config.default.color);
+    }
+
+    #[test]
+    fn mcp_policy_defaults_to_open_allowlists() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.mcp.allowed_commands.is_empty());
+        assert!(config.mcp.allowed_servers.is_empty());
     }
 }

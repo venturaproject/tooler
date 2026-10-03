@@ -1500,6 +1500,9 @@ pub(crate) struct DeploySpec {
     /// Seconds to wait between health check attempts
     #[serde(default = "default_deploy_health_delay")]
     pub(crate) health_delay: u64,
+    /// Reset to the revision before `pull:` when a later deploy step fails
+    #[serde(default)]
+    pub(crate) rollback_on_failure: bool,
     /// Run the restart command via sudo
     #[serde(default)]
     pub(crate) sudo: bool,

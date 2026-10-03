@@ -127,7 +127,7 @@ pub(crate) fn apply_filter(rows: Vec<ProcessRow>, filter: Option<&str>) -> Vec<P
 pub(crate) fn kill_cmd(pid: u32, signal: &str, sudo: bool, sudo_pass: Option<&str>) -> String {
     format!(
         "{}kill {} {pid}",
-        db::sudo_prefix(sudo, sudo_pass),
+        db::sudo_prefix(sudo, sudo_pass.is_some()),
         db::shell_quote(&format!("-{signal}"))
     )
 }
@@ -212,7 +212,7 @@ fn kill(
     }
 
     let command = kill_cmd(pid, signal, sudo, sudo_pass);
-    if let Err(e) = db::ssh_exec_capture(&server, &command) {
+    if let Err(e) = db::ssh_exec_capture_with_sudo_password(&server, &command, sudo_pass) {
         return fail(json, format!("{e:#}"));
     }
 
@@ -292,7 +292,7 @@ ventura942 913  12.5  4.2   987654 321000 ?        Sl   09:01   3:22 ./server --
     fn kill_cmd_with_sudo_and_password() {
         assert_eq!(
             kill_cmd(1234, "9", true, Some("pw")),
-            "echo 'pw' | sudo -S kill '-9' 1234"
+            "sudo -S kill '-9' 1234"
         );
     }
 }

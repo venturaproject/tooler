@@ -8,13 +8,30 @@ fn stdout_of(assert: assert_cmd::assert::Assert) -> String {
     String::from_utf8_lossy(&assert.get_output().stdout).to_string()
 }
 
-/// `--output json` still prints whatever a `run:` task's own subprocess writes to
-/// stdout (that stream is inherited, not captured, so plain-mode's live-output
-/// behavior works — see `run_task_once`'s `run:` branch) — only the final summary line
-/// is guaranteed pure JSON. Parsing just the last line is robust to that.
+/// `--output json` always emits exactly one JSON document. Plain mode can still stream a
+/// `run:` task's stdout directly to the terminal.
 fn last_line_json(out: &str) -> serde_json::Value {
     serde_json::from_str(out.lines().next_back().expect("non-empty output"))
         .expect("last line was not valid JSON")
+}
+
+#[test]
+fn json_output_stays_a_single_document_when_run_prints_stdout() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: JSON output\ntasks:\n  - name: print\n    run: echo child-output\n",
+    )
+    .unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "play", "playbook.yml"])
+            .assert()
+            .success(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).expect("stdout must be JSON");
+    assert_eq!(value["success"], true);
+    assert!(!out.contains("child-output"));
 }
 
 /// Spawns a one-shot local HTTP server that replies with `body` verbatim (arbitrary

@@ -75,7 +75,7 @@ pub(crate) fn status_cmd(unit: &str) -> String {
 pub(crate) fn restart_cmd(unit: &str, sudo: bool, sudo_pass: Option<&str>) -> String {
     format!(
         "{}systemctl restart {}",
-        db::sudo_prefix(sudo, sudo_pass),
+        db::sudo_prefix(sudo, sudo_pass.is_some()),
         db::shell_quote(unit)
     )
 }
@@ -83,7 +83,7 @@ pub(crate) fn restart_cmd(unit: &str, sudo: bool, sudo_pass: Option<&str>) -> St
 fn logs_cmd(unit: &str, lines: u32, sudo: bool) -> String {
     format!(
         "{}journalctl -u {} -n {lines} --no-pager",
-        db::sudo_prefix(sudo, None),
+        db::sudo_prefix(sudo, false),
         db::shell_quote(unit)
     )
 }
@@ -149,7 +149,11 @@ fn restart(
         Ok(s) => s,
         Err(e) => return fail(json, format!("{e:#}")),
     };
-    if let Err(e) = db::ssh_exec_capture(&server, &restart_cmd(unit, sudo, sudo_pass)) {
+    if let Err(e) = db::ssh_exec_capture_with_sudo_password(
+        &server,
+        &restart_cmd(unit, sudo, sudo_pass),
+        sudo_pass,
+    ) {
         return fail(json, format!("{e:#}"));
     }
 
@@ -246,7 +250,7 @@ mod tests {
     fn restart_cmd_with_sudo_and_password() {
         assert_eq!(
             restart_cmd("nginx", true, Some("pw")),
-            "echo 'pw' | sudo -S systemctl restart 'nginx'"
+            "sudo -S systemctl restart 'nginx'"
         );
     }
 
