@@ -19,6 +19,8 @@ pub mod json;
 pub mod logs;
 pub mod mail;
 pub mod mcp;
+pub mod monitor;
+pub mod oauth;
 pub mod play;
 pub mod ps;
 pub mod report;

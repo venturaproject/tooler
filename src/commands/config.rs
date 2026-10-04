@@ -14,15 +14,16 @@ pub enum ConfigSubcommand {
     /// Show full configuration
     Show,
     /// Get a value by key (e.g. default.output, profile.staging.base_url, profile.staging.token,
-    /// profile.staging.token_url, profile.staging.client_id, profile.staging.client_secret,
+    /// profile.staging.token_url, profile.staging.authorization_url, profile.staging.redirect_uri, profile.staging.client_id, profile.staging.client_secret,
     /// profile.staging.refresh_token, mail.notify.host, mail.notify.password)
     Get { key: String },
     /// Set a value by key (e.g. default.output json, profile.staging.token secret123,
     /// mail.notify.host mail16.serv00.com). Profile tokens/client_secret/refresh_token and
     /// mail.<name>.password are stored encrypted in the OS keychain, never in the config
     /// file. Setting profile.<name>.token_url marks a profile as OAuth2-managed: `tooler
-    /// http` then refreshes and caches an access token from the configured refresh_token
-    /// instead of using a static token.
+    /// http` then refreshes and caches an access token from the configured refresh_token.
+    /// Set authorization_url too to use `tooler oauth login` with PKCE instead of a static
+    /// token.
     Set { key: String, value: String },
     /// List configured profiles
     Profiles,
@@ -224,6 +225,10 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                         .get(name)
                         .and_then(|p| p.token_url.clone())
                         .ok_or_else(|| anyhow::anyhow!("No token_url set for profile '{name}'"))?,
+                    "authorization_url" => ctx.config.profile.get(name).and_then(|p| p.authorization_url.clone())
+                        .ok_or_else(|| anyhow::anyhow!("No authorization_url set for profile '{name}'"))?,
+                    "redirect_uri" => ctx.config.profile.get(name).and_then(|p| p.redirect_uri.clone())
+                        .ok_or_else(|| anyhow::anyhow!("No redirect_uri set for profile '{name}'"))?,
                     "client_id" => ctx
                         .config
                         .profile
@@ -246,7 +251,7 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                         )
                     })?,
                     _ => bail!(
-                        "Unknown profile key '{}'. Available: base_url, token, token_url, client_id, client_secret, refresh_token",
+                        "Unknown profile key '{}'. Available: base_url, token, token_url, authorization_url, redirect_uri, client_id, client_secret, refresh_token",
                         field
                     ),
                 };
@@ -379,6 +384,32 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                             println!("{} {} = {}", "set".green().bold(), key.cyan(), value);
                         }
                     }
+                    "authorization_url" => {
+                        let mut cfg = ctx.config.clone();
+                        cfg.profile
+                            .entry(name.to_string())
+                            .or_default()
+                            .authorization_url = Some(value.clone());
+                        config::save(&cfg)?;
+                        if json {
+                            println!("{}", serde_json::json!({"key": key, "value": value}));
+                        } else {
+                            println!("{} {} = {}", "set".green().bold(), key.cyan(), value);
+                        }
+                    }
+                    "redirect_uri" => {
+                        let mut cfg = ctx.config.clone();
+                        cfg.profile
+                            .entry(name.to_string())
+                            .or_default()
+                            .redirect_uri = Some(value.clone());
+                        config::save(&cfg)?;
+                        if json {
+                            println!("{}", serde_json::json!({"key": key, "value": value}));
+                        } else {
+                            println!("{} {} = {}", "set".green().bold(), key.cyan(), value);
+                        }
+                    }
                     "client_id" => {
                         let mut cfg = ctx.config.clone();
                         cfg.profile.entry(name.to_string()).or_default().client_id =
@@ -413,7 +444,7 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                         }
                     }
                     _ => bail!(
-                        "Unknown profile key '{}'. Available: base_url, token, token_url, client_id, client_secret, refresh_token",
+                        "Unknown profile key '{}'. Available: base_url, token, token_url, authorization_url, redirect_uri, client_id, client_secret, refresh_token",
                         field
                     ),
                 }
@@ -526,6 +557,20 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                         }
                         config::save(&cfg)?;
                     }
+                    "authorization_url" => {
+                        let mut cfg = ctx.config.clone();
+                        if let Some(p) = cfg.profile.get_mut(name) {
+                            p.authorization_url = None;
+                        }
+                        config::save(&cfg)?;
+                    }
+                    "redirect_uri" => {
+                        let mut cfg = ctx.config.clone();
+                        if let Some(p) = cfg.profile.get_mut(name) {
+                            p.redirect_uri = None;
+                        }
+                        config::save(&cfg)?;
+                    }
                     "client_id" => {
                         let mut cfg = ctx.config.clone();
                         if let Some(p) = cfg.profile.get_mut(name) {
@@ -537,7 +582,7 @@ pub fn run(args: ConfigArgs, ctx: &Context) -> Result<()> {
                         secrets::delete_secret(name, field)?
                     }
                     _ => bail!(
-                        "Unknown profile key '{}'. Available: base_url, token, token_url, client_id, client_secret, refresh_token",
+                        "Unknown profile key '{}'. Available: base_url, token, token_url, authorization_url, redirect_uri, client_id, client_secret, refresh_token",
                         field
                     ),
                 }

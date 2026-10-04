@@ -54,6 +54,19 @@ pub(crate) fn probe_url(url: &str, timeout_secs: u64) -> Result<u16> {
     Ok(res.status().as_u16())
 }
 
+/// Tests TCP connectivity without producing CLI output. Shared by `check port` and the
+/// monitor runtime so both use identical DNS resolution and timeout behavior.
+pub(crate) fn probe_port(host: &str, port: u16, timeout_secs: u64) -> Result<()> {
+    let addr = format!("{host}:{port}");
+    let socket_addr = addr
+        .to_socket_addrs()
+        .with_context(|| format!("Cannot resolve '{addr}'"))?
+        .next()
+        .with_context(|| format!("No address found for '{addr}'"))?;
+    TcpStream::connect_timeout(&socket_addr, Duration::from_secs(timeout_secs))?;
+    Ok(())
+}
+
 fn check_url(url: &str, timeout_secs: u64, ctx: &Context) -> Result<()> {
     match probe_url(url, timeout_secs) {
         Ok(status) if (200..300).contains(&status) => {
@@ -103,14 +116,7 @@ fn check_url(url: &str, timeout_secs: u64, ctx: &Context) -> Result<()> {
 }
 
 fn check_port(host: &str, port: u16, timeout_secs: u64, ctx: &Context) -> Result<()> {
-    let addr = format!("{host}:{port}");
-    let socket_addr = addr
-        .to_socket_addrs()
-        .with_context(|| format!("Cannot resolve '{addr}'"))?
-        .next()
-        .with_context(|| format!("No address found for '{addr}'"))?;
-
-    match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(timeout_secs)) {
+    match probe_port(host, port, timeout_secs) {
         Ok(_) => {
             if ctx.output == OutputFormat::Json {
                 println!(
@@ -135,7 +141,7 @@ fn check_port(host: &str, port: u16, timeout_secs: u64, ctx: &Context) -> Result
                 "✗".red().bold(),
                 e.to_string().dimmed()
             );
-            Err(e.into())
+            Err(e)
         }
     }
 }

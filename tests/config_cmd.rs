@@ -60,6 +60,24 @@ fn set_and_get_profile_oauth_fields() {
         .args(["config", "set", "profile.exact.client_id", "abc123"])
         .assert()
         .success();
+    tooler_in(dir.path())
+        .args([
+            "config",
+            "set",
+            "profile.exact.authorization_url",
+            "https://example.com/oauth2/authorize",
+        ])
+        .assert()
+        .success();
+    tooler_in(dir.path())
+        .args([
+            "config",
+            "set",
+            "profile.exact.redirect_uri",
+            "http://127.0.0.1:8976/callback",
+        ])
+        .assert()
+        .success();
 
     let out = stdout_of(
         tooler_in(dir.path())
@@ -68,6 +86,13 @@ fn set_and_get_profile_oauth_fields() {
             .success(),
     );
     assert!(out.contains("abc123"));
+    let out = stdout_of(
+        tooler_in(dir.path())
+            .args(["config", "get", "profile.exact.authorization_url"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("oauth2/authorize"));
 }
 
 #[test]

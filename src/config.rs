@@ -61,6 +61,11 @@ pub struct Profile {
     /// `tooler http` refreshes and caches an access token instead of using a static
     /// bearer token (see `oauth::get_valid_access_token`).
     pub token_url: Option<String>,
+    /// OAuth2 authorization endpoint used by `tooler oauth login` for authorization-code
+    /// login with PKCE.
+    pub authorization_url: Option<String>,
+    /// Optional registered loopback redirect URI. Omit it to use a fresh local port.
+    pub redirect_uri: Option<String>,
     /// OAuth2 client ID. Not treated as secret (unlike `client_secret`/`refresh_token`,
     /// which live in the OS keychain via `secrets.rs`).
     pub client_id: Option<String>,

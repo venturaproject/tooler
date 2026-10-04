@@ -35,6 +35,8 @@ fn main() -> Result<()> {
         Commands::Http(args) => commands::http::run(args, &ctx),
         Commands::Jobs(args) => commands::jobs::run(args, &ctx),
         Commands::Check(args) => commands::check::run(args, &ctx),
+        Commands::Monitor(args) => commands::monitor::run(args, &ctx),
+        Commands::OAuth(args) => commands::oauth::run(args, &ctx),
         Commands::Run(args) => commands::run::run(args, &ctx),
         Commands::Play(args) => commands::play::run(args, &ctx),
         Commands::Git(args) => commands::git::run(args, &ctx),

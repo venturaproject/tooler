@@ -4,9 +4,9 @@ use crate::{
         db::DbArgs, deploy::DeployArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs,
         fleet::FleetArgs, fs::FsArgs, gh::GhArgs, git::GitArgs, group::GroupArgs, http::HttpArgs,
         info::InfoArgs, jobs::JobsArgs, json::JsonArgs, logs::LogsArgs, mail::MailArgs,
-        mcp::McpArgs, play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs,
-        scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs, stat::StatArgs,
-        systemd::SystemdArgs, vault::VaultArgs,
+        mcp::McpArgs, monitor::MonitorArgs, oauth::OAuthArgs, play::PlayArgs, ps::PsArgs,
+        report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs,
+        stat::StatArgs, systemd::SystemdArgs, vault::VaultArgs,
     },
     output::OutputFormat,
 };
@@ -55,6 +55,13 @@ pub enum Commands {
 
     /// Health-check URLs and TCP ports
     Check(CheckArgs),
+
+    /// Run scheduled checks with stateful alert and recovery webhooks
+    Monitor(MonitorArgs),
+
+    /// Log into an OAuth2 profile through browser authorization with PKCE
+    #[command(name = "oauth")]
+    OAuth(OAuthArgs),
 
     /// Manage tooler configuration
     Config(ConfigArgs),

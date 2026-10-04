@@ -14,6 +14,8 @@
   - [tooler http](#tooler-http)
   - [tooler jobs](#tooler-jobs)
   - [tooler check](#tooler-check)
+  - [tooler monitor](#tooler-monitor)
+  - [tooler oauth](#tooler-oauth)
   - [tooler json](#tooler-json)
   - [tooler run](#tooler-run)
   - [tooler play](#tooler-play)
@@ -284,6 +286,50 @@ tooler check port redis.internal 6379 --timeout 5
 ```
 
 Exit code is non-zero on failure — works well in scripts and CI.
+
+---
+
+### tooler monitor
+
+Run a versioned YAML monitor once; schedule the command through `tooler cron local add` or your platform scheduler. The monitor keeps `<file>.monitor.json` as its durable state, sends a webhook only when a check first fails or recovers, and exits non-zero while any check is failing.
+
+```yaml
+# monitors/staging.yml
+name: Staging
+webhook: {url: "https://alerts.example.net/tooler/staging"}
+checks:
+  - id: api
+    url: https://staging.example.com/health
+    expected_status: 200
+    timeout: 10
+  - id: postgres
+    host: db.internal
+    port: 5432
+    timeout: 3
+```
+
+```sh
+tooler monitor run monitors/staging.yml
+tooler monitor run monitors/staging.yml --dry
+tooler cron local add "*/5 * * * * /usr/local/bin/tooler monitor run /srv/app/monitors/staging.yml"
+```
+
+Webhook payloads contain the monitor name, check id, event (`failing` or `recovered`), status, error and timestamp. Treat the definition file as sensitive if its webhook URL includes a credential. A new failing check alerts immediately; a first successful run is silent.
+
+---
+
+### tooler oauth
+
+Log into an OAuth2 public client using Authorization Code with S256 PKCE. Tooler starts a temporary listener on `127.0.0.1`, verifies `state`, exchanges the returned code, and stores access/refresh tokens in the OS keychain. This command is intentionally CLI-only because a browser consent flow must stay with the local user.
+
+```sh
+tooler config set profile.acme.authorization_url https://id.example.com/authorize
+tooler config set profile.acme.token_url https://id.example.com/token
+tooler config set profile.acme.client_id tooler-desktop
+tooler --profile acme oauth login --scope openid --scope offline_access
+```
+
+Use `--no-open` to print rather than launch the authorization URL and `--timeout 300` to change the callback timeout. Set `profile.<name>.redirect_uri` only when the provider requires a pre-registered loopback URI; it must be `http://127.0.0.1:<port>/...`.
 
 ---
 
