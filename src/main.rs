@@ -1,3 +1,4 @@
+mod atomic_write;
 mod cli;
 mod commands;
 mod config;

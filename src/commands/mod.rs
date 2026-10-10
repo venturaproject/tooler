@@ -27,6 +27,7 @@ pub mod report;
 pub mod run;
 pub mod scaffold;
 pub mod server;
+pub mod shell;
 pub mod ssh;
 pub mod stat;
 pub mod systemd;

@@ -546,10 +546,8 @@ pub(crate) fn run_task_once(
         }
         if !env.dry {
             let start = Instant::now();
-            let mut cmd = std::process::Command::new("sh");
-            cmd.arg("-c")
-                .arg(&rendered_cmd)
-                .current_dir(&env.playbook_dir);
+            let mut cmd = crate::commands::shell::command(&rendered_cmd);
+            cmd.current_dir(&env.playbook_dir);
             if let Some(env_vars) = env_vars {
                 for (k, v) in env_vars {
                     cmd.env(k, render(v, vars));

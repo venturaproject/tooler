@@ -165,20 +165,27 @@ fn push_repeated(argv: &mut Vec<String>, flag: &str, values: &[String]) {
     }
 }
 
-/// Extracts explicit server operands from the command wrappers that target one server.
-/// Fleet groups/all and arbitrary playbook YAML are intentionally not inferred here: use
-/// `mcp.allowed_commands` to withhold those broad execution surfaces when a server
-/// allowlist is required.
+/// Extracts explicit server operands from command wrappers that target one server.
 fn server_arguments(argv: &[String]) -> Vec<&str> {
     let Some(command) = argv.first().map(String::as_str) else {
         return Vec::new();
     };
     let positional_server = match command {
         "deploy" | "stat" => argv.get(1),
+        "db" => argv.get(2),
         "ssh" | "systemd" | "ps" | "logs" | "fs" | "cron" => argv.get(2),
         _ => None,
     };
     let mut servers: Vec<&str> = positional_server.into_iter().map(String::as_str).collect();
+    // `ssh copy <local> <server>:<path>` has no standalone server argument.
+    if command == "ssh" && argv.get(1).is_some_and(|subcommand| subcommand == "copy") {
+        servers.clear();
+        if let Some(destination) = argv.get(3)
+            && let Some((server, _)) = destination.split_once(':')
+        {
+            servers.push(server);
+        }
+    }
     for pair in argv.windows(2) {
         if pair[0] == "--server" {
             servers.push(&pair[1]);
@@ -404,6 +411,22 @@ impl ToolerMcp {
         }
         if self.policy.allowed_servers.is_empty() {
             return None;
+        }
+        // Playbook task targets may be templated, included, or supplied by dynamic loops.
+        // Do not claim an allowlist protects execution that cannot be fully authorized here.
+        if command == "play" {
+            return Some(
+                "MCP policy denies playbooks while mcp.allowed_servers is configured; use explicit allowlisted commands instead".to_string(),
+            );
+        }
+        if command == "fleet"
+            && argv.iter().any(|argument| {
+                argument == "--all" || argument == "--group" || argument.starts_with("--group=")
+            })
+        {
+            return Some(
+                "MCP policy denies fleet --all/--group while mcp.allowed_servers is configured; use --servers with allowlisted names".to_string(),
+            );
         }
         for server in server_arguments(argv) {
             if !self

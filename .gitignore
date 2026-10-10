@@ -1,2 +1,6 @@
 /target
 /.playwright-mcp
+*.state.json
+*.data.json
+*.monitor.json
+*.lock

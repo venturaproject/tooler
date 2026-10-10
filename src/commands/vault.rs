@@ -91,7 +91,7 @@ fn encrypt_file(path: &Path, password_env: &str, json: bool) -> Result<()> {
     }
     let password = read_password(password_env)?;
     let encrypted = encrypt(&content, &password)?;
-    std::fs::write(path, encrypted.as_bytes())
+    crate::atomic_write::write(path, encrypted.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     if json {
         println!(
@@ -111,7 +111,8 @@ fn decrypt_file(path: &Path, password_env: &str, json: bool) -> Result<()> {
     }
     let password = read_password(password_env)?;
     let plaintext = decrypt(&content, &password)?;
-    std::fs::write(path, &plaintext).with_context(|| format!("writing {}", path.display()))?;
+    crate::atomic_write::write(path, &plaintext)
+        .with_context(|| format!("writing {}", path.display()))?;
     if json {
         println!(
             "{}",
@@ -159,7 +160,7 @@ fn rekey_file(
     let plaintext = decrypt(&content, &old_password)?;
     let new_password = read_password(new_password_env)?;
     let reencrypted = encrypt(&plaintext, &new_password)?;
-    std::fs::write(path, reencrypted.as_bytes())
+    crate::atomic_write::write(path, reencrypted.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     if json {
         println!(

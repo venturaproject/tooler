@@ -240,7 +240,7 @@ pub fn save(config: &Config) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, toml::to_string_pretty(config)?)?;
+    crate::atomic_write::write(&path, toml::to_string_pretty(config)?.as_bytes())?;
     Ok(())
 }
 

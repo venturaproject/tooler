@@ -121,9 +121,7 @@ fn exec_script(
         return Ok(());
     }
 
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&full_cmd)
+    let status = crate::commands::shell::command(&full_cmd)
         .current_dir(root)
         .status()?;
 

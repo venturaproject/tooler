@@ -63,6 +63,17 @@ struct CheckSpec {
 struct MonitorState {
     version: u8,
     checks: HashMap<String, CheckState>,
+    #[serde(default)]
+    pending_notifications: Vec<PendingNotification>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingNotification {
+    id: String,
+    event: String,
+    status: Status,
+    error: Option<String>,
+    at: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -99,6 +110,7 @@ fn load_state(path: &Path) -> Result<MonitorState> {
         return Ok(MonitorState {
             version: 1,
             checks: HashMap::new(),
+            pending_notifications: Vec::new(),
         });
     }
     serde_json::from_str(&std::fs::read_to_string(path)?)
@@ -106,14 +118,8 @@ fn load_state(path: &Path) -> Result<MonitorState> {
 }
 
 fn save_state(path: &Path, state: &MonitorState) -> Result<()> {
-    std::fs::write(path, serde_json::to_string_pretty(state)?)
-        .with_context(|| format!("writing monitor state {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::atomic_write::write(path, serde_json::to_string_pretty(state)?.as_bytes())
+        .with_context(|| format!("writing monitor state {}", path.display()))
 }
 
 fn validate_check(check: &CheckSpec) -> Result<()> {
@@ -148,17 +154,16 @@ fn probe(check: &CheckSpec) -> Result<()> {
     )
 }
 
-fn send_webhook(url: &str, monitor: &str, result: &CheckResult) -> Result<()> {
-    let event = result.transition.expect("only transitions notify");
+fn send_webhook(url: &str, monitor: &str, notification: &PendingNotification) -> Result<()> {
     let response = reqwest::blocking::Client::new()
         .post(url)
         .json(&serde_json::json!({
             "monitor": monitor,
-            "check": result.id,
-            "event": event,
-            "status": result.status,
-            "error": result.error,
-            "at": chrono::Utc::now().to_rfc3339(),
+            "check": notification.id,
+            "event": notification.event,
+            "status": notification.status,
+            "error": notification.error,
+            "at": notification.at,
         }))
         .send()
         .context("sending monitor webhook")?;
@@ -240,14 +245,26 @@ fn run_file(file: &Path, state_override: Option<&Path>, dry: bool, ctx: &Context
             error,
             transition,
         });
+        if let Some(event) = transition {
+            state.pending_notifications.push(PendingNotification {
+                id: check.id.clone(),
+                event: event.to_string(),
+                status,
+                error: results.last().and_then(|result| result.error.clone()),
+                at: now.clone(),
+            });
+        }
     }
     save_state(&state_path, &state)?;
     if let Some(webhook) = &monitor.webhook {
-        for result in &results {
-            if result.transition.is_some() {
-                send_webhook(&webhook.url, &monitor.name, result)?;
+        let pending = std::mem::take(&mut state.pending_notifications);
+        for notification in pending {
+            if let Err(error) = send_webhook(&webhook.url, &monitor.name, &notification) {
+                eprintln!("monitor webhook delivery deferred: {error}");
+                state.pending_notifications.push(notification);
             }
         }
+        save_state(&state_path, &state)?;
     }
     let success = results.iter().all(|r| r.status == Status::Ok);
     let output = serde_json::json!({
@@ -290,5 +307,24 @@ mod tests {
             expected_status: None,
         };
         assert!(validate_check(&invalid).is_err());
+    }
+
+    #[test]
+    fn pending_notifications_survive_state_round_trip() {
+        let state = MonitorState {
+            version: 1,
+            checks: HashMap::new(),
+            pending_notifications: vec![PendingNotification {
+                id: "api".into(),
+                event: "failing".into(),
+                status: Status::Failing,
+                error: Some("connection refused".into()),
+                at: "2026-01-01T00:00:00Z".into(),
+            }],
+        };
+        let restored: MonitorState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.pending_notifications.len(), 1);
+        assert_eq!(restored.pending_notifications[0].event, "failing");
     }
 }

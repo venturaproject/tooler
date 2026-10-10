@@ -40,14 +40,34 @@ fi
 
 ARTIFACT="${BIN_NAME}-${OS}-${ARCH}"
 URL="https://github.com/${REPO}/releases/download/${TOOLER_VERSION}/${ARTIFACT}"
+CHECKSUM_URL="https://github.com/${REPO}/releases/download/${TOOLER_VERSION}/SHA256SUMS.txt"
 
 echo "Installing tooler ${TOOLER_VERSION} (${OS}/${ARCH})..."
 
 # ── download ──────────────────────────────────────────────────────────────────
 TMP="$(mktemp)"
+SUMS="$(mktemp)"
+cleanup() { rm -f "$TMP" "$SUMS"; }
+trap cleanup EXIT HUP INT TERM
 if ! curl -fsSL "$URL" -o "$TMP"; then
   echo "error: download failed from $URL" >&2
-  rm -f "$TMP"
+  exit 1
+fi
+if ! curl -fsSL "$CHECKSUM_URL" -o "$SUMS"; then
+  echo "error: checksum manifest download failed from $CHECKSUM_URL" >&2
+  exit 1
+fi
+EXPECTED="$(awk -v artifact="$ARTIFACT" '$2 == artifact { count++; hash=$1 } END { if (count == 1 && hash ~ /^[0-9a-fA-F]{64}$/) print hash; else exit 1 }' "$SUMS")" || {
+  echo "error: checksum manifest has no unique valid entry for $ARTIFACT" >&2
+  exit 1
+}
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "$TMP" | awk '{print $1}')"
+else
+  ACTUAL="$(shasum -a 256 "$TMP" | awk '{print $1}')"
+fi
+if [ "$EXPECTED" != "$ACTUAL" ]; then
+  echo "error: checksum verification failed for $ARTIFACT" >&2
   exit 1
 fi
 chmod +x "$TMP"

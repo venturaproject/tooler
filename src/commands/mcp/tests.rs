@@ -25,6 +25,69 @@ fn mcp_policy_limits_commands_and_explicit_server_arguments() {
             .contains("git")
     );
 }
+
+#[test]
+fn mcp_server_allowlist_rejects_unresolvable_or_embedded_targets() {
+    let mut mcp = ToolerMcp::new();
+    mcp.policy = McpPolicy {
+        allowed_commands: vec!["ssh".into(), "fleet".into(), "play".into(), "db".into()],
+        allowed_servers: vec!["staging".into()],
+    };
+    assert!(
+        mcp.policy_error(&[
+            "ssh".into(),
+            "copy".into(),
+            "local".into(),
+            "staging:/tmp/x".into()
+        ])
+        .is_none()
+    );
+    assert!(
+        mcp.policy_error(&[
+            "ssh".into(),
+            "copy".into(),
+            "local".into(),
+            "production:/tmp/x".into()
+        ])
+        .unwrap()
+        .contains("production")
+    );
+    assert!(
+        mcp.policy_error(&[
+            "fleet".into(),
+            "exec".into(),
+            "--group".into(),
+            "web".into()
+        ])
+        .unwrap()
+        .contains("--all/--group")
+    );
+    assert!(
+        mcp.policy_error(&[
+            "fleet".into(),
+            "exec".into(),
+            "--servers".into(),
+            "staging,production".into()
+        ])
+        .unwrap()
+        .contains("production")
+    );
+    assert!(
+        mcp.policy_error(&["play".into(), "deploy.yml".into()])
+            .unwrap()
+            .contains("playbooks")
+    );
+    assert!(
+        mcp.policy_error(&[
+            "db".into(),
+            "query".into(),
+            "production".into(),
+            "select 1".into()
+        ])
+        .unwrap()
+        .contains("production")
+    );
+}
 use clap::CommandFactory;
 
 #[test]

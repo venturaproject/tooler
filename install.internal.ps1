@@ -20,16 +20,32 @@ if (-not $version) {
 
 $artifact = "$BIN_NAME-windows-x86_64.exe"
 $url      = "$BASE_URL/releases/$version/$artifact"
+$checksumUrl = "$BASE_URL/releases/$version/SHA256SUMS.txt"
 
 Write-Host "Installing tooler $version (windows/x86_64)..."
 
 # ── download ──────────────────────────────────────────────────────────────────
 $tmp = Join-Path $env:TEMP "$BIN_NAME.exe"
+$sums = Join-Path $env:TEMP "$BIN_NAME-SHA256SUMS.txt"
 try {
     Invoke-WebRequest -UseBasicParsing $url -OutFile $tmp
 } catch {
     Write-Error "Download failed from $url`nMake sure you are connected to the VPN."
     exit 1
+}
+try {
+    Invoke-WebRequest -UseBasicParsing $checksumUrl -OutFile $sums
+    $matches = @(Get-Content $sums | Where-Object { $_ -match "^([0-9a-fA-F]{64})\s+$([regex]::Escape($artifact))$" })
+    if ($matches.Count -ne 1) { throw "checksum manifest has no unique valid entry for $artifact" }
+    $expected = ($matches[0] -split '\s+')[0].ToLowerInvariant()
+    $actual = (Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLowerInvariant()
+    if ($expected -ne $actual) { throw "checksum verification failed for $artifact" }
+} catch {
+    Remove-Item $tmp -ErrorAction SilentlyContinue
+    Write-Error $_
+    exit 1
+} finally {
+    Remove-Item $sums -ErrorAction SilentlyContinue
 }
 
 # ── install ───────────────────────────────────────────────────────────────────

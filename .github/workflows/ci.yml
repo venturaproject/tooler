@@ -52,15 +52,9 @@ jobs:
       #   RUSTSEC-2026-0187 -- lopdf via printpdf 0.8.x (tooler report pdf): stack
       #     overflow on deeply nested PDF objects. Fixed once printpdf ships a release
       #     depending on lopdf >=0.42.0 (today means bumping printpdf past its 0.8 line).
-      #   RUSTSEC-2026-0104, -0098, -0099, -0049 -- rustls-webpki 0.102.8 via imap
-      #     3.0.0-alpha.15's own rustls-connector/rustls pin (tooler mail check): four
-      #     certificate-validation advisories. Fixed once imap ships a release built
-      #     against a current rustls.
+      # The PDF writer only constructs reports from JSON and never parses untrusted PDFs.
+      # Keep this narrow exception until a compatible printpdf release upgrades lopdf.
       - name: Audit
         run: >
-          cargo audit
-          --ignore RUSTSEC-2026-0187
-          --ignore RUSTSEC-2026-0104
-          --ignore RUSTSEC-2026-0098
-          --ignore RUSTSEC-2026-0099
-          --ignore RUSTSEC-2026-0049
+           cargo audit
+           --ignore RUSTSEC-2026-0187

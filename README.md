@@ -93,7 +93,7 @@ source "$HOME/.cargo/env"
 | cargo install | Rust 1.70+ and Cargo |
 | Build from source | Rust 1.70+ and Cargo |
 
-Supported platforms: macOS, Linux, Windows (Windows via cargo only).
+Supported platforms: macOS, Linux, Windows.
 
 ### Verify
 
@@ -1526,7 +1526,7 @@ Run `tooler doctor` (also exposed as the `tooler_doctor` tool) to self-check the
 
 **Audit log**: pass `--audit-log <path>` (or set `TOOLER_MCP_AUDIT_LOG`) to append one JSON line per tool call (timestamp, argv, cwd, success, duration) -- useful when Claude is driving SSH/git/server operations semi-autonomously. `argv` is redacted before it's written: `tooler_config_set`/`tooler_config_get` refuse every keychain-backed key outright (`profile.<name>.token`/`client_secret`/`refresh_token`, `mail.<name>.password` -- see below) rather than let one pass through as a raw argument at all, and as defense-in-depth the log write itself also scrubs a `config set` value for one of those keys and any `--var`/`-e name=value` pair whose name looks credential-shaped (`password`, `token`, `secret`, `api_key`, ...).
 
-**MCP policy**: configure command and explicit-server allowlists in `~/.tooler/config.toml` to reduce an agent's execution surface. Empty lists keep the existing unrestricted behavior. If `allowed_servers` is set, also restrict `allowed_commands` to exclude broad surfaces such as `play` and `fleet`, whose target servers cannot be inferred from the MCP wrapper arguments.
+**MCP policy**: configure command and explicit-server allowlists in `~/.tooler/config.toml` to reduce an agent's execution surface. Empty lists keep the existing unrestricted behavior. When `allowed_servers` is set, MCP rejects `play` and `fleet --all`/`--group` because their final targets cannot be authorized statically; use explicit allowlisted server names instead.
 
 ```toml
 [mcp]

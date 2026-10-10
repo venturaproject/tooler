@@ -189,19 +189,13 @@ pub(crate) fn write_persisted_state(env: &RunEnv, vars: &HashMap<String, String>
     let result = serde_json::to_string_pretty(&state)
         .map_err(anyhow::Error::from)
         .and_then(|json| {
-            std::fs::write(path, json)
+            crate::atomic_write::write(path, json.as_bytes())
                 .with_context(|| format!("writing persisted state {}", path.display()))
         });
-    if let Err(e) = result {
-        if !env.quiet {
-            println!("  {}", format!("(state not saved: {e})").dimmed());
-        }
-        return;
-    }
-    #[cfg(unix)]
+    if let Err(e) = result
+        && !env.quiet
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        println!("  {}", format!("(state not saved: {e})").dimmed());
     }
 }
 
@@ -237,18 +231,12 @@ pub(crate) fn write_checkpoint(
     let result = serde_json::to_string_pretty(&checkpoint)
         .map_err(anyhow::Error::from)
         .and_then(|json| {
-            std::fs::write(path, json)
+            crate::atomic_write::write(path, json.as_bytes())
                 .with_context(|| format!("writing checkpoint {}", path.display()))
         });
-    if let Err(e) = result {
-        if !env.quiet {
-            println!("  {}", format!("(checkpoint not saved: {e})").dimmed());
-        }
-        return;
-    }
-    #[cfg(unix)]
+    if let Err(e) = result
+        && !env.quiet
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        println!("  {}", format!("(checkpoint not saved: {e})").dimmed());
     }
 }

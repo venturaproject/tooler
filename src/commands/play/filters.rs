@@ -535,18 +535,32 @@ pub(crate) fn apply_filter_op(
     }
 }
 
-/// POSIX single-quote escaping for a value about to be interpolated into a `run:`/`ssh:`/
-/// `fleet:` shell command line via `| quote`: wraps `value` in single quotes, escaping any
-/// embedded `'` as `'\''` (close the quote, emit an escaped literal quote, reopen it) —
-/// the standard shlex-safe technique. Targets the `sh -c` `run:` already shells out to
-/// (see `run_task_once`'s `task.run` branch), not a non-POSIX shell. Always succeeds
+/// Shell escaping for a value about to be interpolated into a `run:`/`ssh:`/`fleet:` command
+/// via `| quote`. POSIX uses standard single quotes; Windows uses cmd double quotes with
+/// metacharacters escaped. Always succeeds
 /// (unlike `apply_json_filter`, there's no "doesn't match" case), so `| quote` never
 /// leaves a token unresolved the way a bad `json:` path can. See the README's "Trust
 /// model" section for why this exists: a `{{var}}` sourced from untrusted external data
 /// (`scrape:`, `http:` + `json:`, a `db_query:` row, a dynamic `loop: {from: ...}` item)
 /// can otherwise inject shell metacharacters straight into `run:`'s command line.
 pub(crate) fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
+    #[cfg(windows)]
+    {
+        let escaped = value
+            .replace('^', "^^")
+            .replace('&', "^&")
+            .replace('|', "^|")
+            .replace('<', "^<")
+            .replace('>', "^>")
+            .replace('%', "%%")
+            .replace('!', "^^!")
+            .replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
 }
 
 /// Applies a `json:<path>` filter to `value` (parsed as JSON), walking dot-separated
