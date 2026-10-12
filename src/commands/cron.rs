@@ -246,6 +246,19 @@ fn add_local(line: &str, ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+/// Add one local crontab line. Used by declarative task schedules so they do not need to
+/// spawn the CLI or duplicate the platform-specific crontab implementation.
+pub(crate) fn add_local_line(line: &str) -> Result<()> {
+    let existing = fetch_crontab_local()?;
+    let mut new_crontab = existing;
+    if !new_crontab.is_empty() && !new_crontab.ends_with('\n') {
+        new_crontab.push('\n');
+    }
+    new_crontab.push_str(line.trim_end());
+    new_crontab.push('\n');
+    write_crontab_local(&new_crontab)
+}
+
 fn remove_local(pattern: &str, ctx: &Context) -> Result<()> {
     let json = ctx.output == OutputFormat::Json;
 
@@ -287,6 +300,22 @@ fn remove_local(pattern: &str, ctx: &Context) -> Result<()> {
         println!("  {}", line.dimmed());
     }
     Ok(())
+}
+
+/// Remove local crontab lines containing a fixed substring and return those removed.
+pub(crate) fn remove_local_lines(pattern: &str) -> Result<Vec<String>> {
+    let existing = fetch_crontab_local()?;
+    let (kept, removed): (Vec<&str>, Vec<&str>) =
+        existing.lines().partition(|line| !line.contains(pattern));
+    if removed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut new_crontab = kept.join("\n");
+    if !new_crontab.is_empty() {
+        new_crontab.push('\n');
+    }
+    write_crontab_local(&new_crontab)?;
+    Ok(removed.into_iter().map(str::to_string).collect())
 }
 
 fn fetch_crontab(server: &crate::config::Server) -> Result<String> {

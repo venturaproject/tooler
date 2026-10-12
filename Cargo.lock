@@ -1685,6 +1685,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca63cb2488b847c12d1ca56034ba0f15613972c0dc0f8a957f525707567b23d"
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
 name = "glyph-names"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4690,7 +4696,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tooler"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4705,6 +4711,7 @@ dependencies = [
  "csv",
  "dirs",
  "getrandom 0.3.4",
+ "glob",
  "hmac 0.12.1",
  "imap",
  "imap-proto",

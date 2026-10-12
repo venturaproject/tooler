@@ -335,6 +335,44 @@ pub(crate) struct PlayMcpArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub(crate) struct TaskMcpArgs {
+    /// Persistent Taskfile YAML path. Real executions require a file on disk.
+    pub(crate) file: Option<String>,
+    /// Targets to run; the workflow's `default` target is used when omitted.
+    #[serde(default)]
+    pub(crate) targets: Vec<String>,
+    /// List available targets without executing.
+    #[serde(default)]
+    pub(crate) list: bool,
+    /// Resolve freshness and the dependency plan without executing.
+    #[serde(default)]
+    pub(crate) plan: bool,
+    /// Rerun requested targets even when outputs are current.
+    #[serde(default)]
+    pub(crate) force: bool,
+    /// Rerun every target in the requested dependency closure.
+    #[serde(default)]
+    pub(crate) force_deps: bool,
+    /// Show the dependency graph without executing.
+    #[serde(default)]
+    pub(crate) graph: bool,
+    /// Emit the graph as Graphviz DOT (implies graph).
+    #[serde(default)]
+    pub(crate) dot: bool,
+    /// Show local task workflow history without executing.
+    #[serde(default)]
+    pub(crate) history: bool,
+    /// Maximum history records to return.
+    pub(crate) limit: Option<usize>,
+    /// Schedule operation: `list`, `install`, or `remove`.
+    pub(crate) schedule: Option<String>,
+    /// Declared schedule name for install/remove.
+    pub(crate) schedule_name: Option<String>,
+    /// Directory from which to discover a Taskfile or resolve a relative file path.
+    pub(crate) cwd: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub(crate) struct PlayReplOpenArgs {
     /// Shown as the playbook's name in tooler play's own output
     pub(crate) name: Option<String>,

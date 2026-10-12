@@ -354,6 +354,7 @@ mod tools_core;
 mod tools_infra;
 mod tools_ops;
 mod tools_play;
+mod tools_task;
 
 pub(crate) use args::*;
 
@@ -447,6 +448,7 @@ impl ToolerMcp {
         Self {
             tool_router: Self::tool_router_core()
                 + Self::tool_router_play()
+                + Self::tool_router_task()
                 + Self::tool_router_ops()
                 + Self::tool_router_infra()
                 + Self::tool_router_admin(),

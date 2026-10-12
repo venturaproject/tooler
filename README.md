@@ -17,8 +17,9 @@
   - [tooler monitor](#tooler-monitor)
   - [tooler oauth](#tooler-oauth)
   - [tooler json](#tooler-json)
-  - [tooler run](#tooler-run)
-  - [tooler play](#tooler-play)
+   - [tooler run](#tooler-run)
+   - [tooler task](#tooler-task)
+   - [tooler play](#tooler-play)
   - [tooler git](#tooler-git)
   - [tooler scaffold](#tooler-scaffold)
   - [tooler config](#tooler-config)
@@ -371,6 +372,68 @@ tooler run test -- --nocapture   # pass extra args to the script
 ```
 
 Tooler walks up the directory tree to find `.tooler.toml`, so it works from any subdirectory of the project.
+
+---
+
+### tooler task
+
+Run local, incremental workflows from `Taskfile.yml`. Unlike `tooler play`, which is for
+ordered operational runbooks, a task workflow is a dependency graph whose outputs determine
+whether a target is current. Tasks execute sequentially and never start a daemon.
+
+**`Taskfile.yml`**:
+
+```yaml
+version: 1
+name: tooler
+single_instance: true
+
+targets:
+  default:
+    deps: [test]
+    phony: true
+    command: "true"
+
+  build:
+    inputs: [Cargo.toml, Cargo.lock, src/**/*.rs]
+    outputs: [target/release/tooler]
+    command: cargo build --release
+
+  test:
+    deps: [build]
+    inputs: [Cargo.toml, Cargo.lock, src/**/*.rs]
+    outputs: [.tooler/artifacts/test.ok]
+    command: cargo test && mkdir -p .tooler/artifacts && touch .tooler/artifacts/test.ok
+
+  clean:
+    phony: true
+    command: rm -rf target .tooler/artifacts
+
+schedules:
+  nightly-test:
+    cron: "0 2 * * *"
+    target: test
+```
+
+```sh
+tooler task                         # run default, or list targets when it is absent
+tooler task build test              # run requested targets and dependency closures
+tooler task --plan test             # show stale/current decisions without executing
+tooler task --graph test            # show the dependency graph
+tooler task --dot test              # emit Graphviz DOT
+tooler task --force test            # rerun the requested target
+tooler task --force-deps test       # rerun its entire dependency closure
+tooler task --history               # show recent local runs
+tooler task --schedule list
+tooler task --schedule install --schedule-name nightly-test
+tooler task --schedule remove --schedule-name nightly-test
+```
+
+`inputs` accepts files and glob patterns. A non-phony target must declare outputs, and a
+successful command must create every output. The task is current only when all outputs exist
+and none of its inputs or dependency outputs is newer. Run history is stored locally at
+`.tooler/task-history.jsonl`; task state and locks are ignored by Git. Local schedules use the
+existing system crontab and are unavailable on Windows.
 
 ---
 

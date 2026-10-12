@@ -1,0 +1,741 @@
+//! A small, local Make/Task-style workflow runner. It intentionally does not share the
+//! operational semantics of `play`: task outputs are filesystem artifacts and are the
+//! source of truth for incremental execution.
+use crate::{atomic_write, commands::shell, context::Context, output::OutputFormat};
+use anyhow::{Context as _, Result, bail};
+use clap::{Args, ValueEnum};
+use glob::glob;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[derive(Args)]
+pub struct TaskArgs {
+    /// Targets to run (defaults to `default`)
+    pub targets: Vec<String>,
+    /// Taskfile path (defaults to Taskfile.yml or Taskfile.yaml)
+    #[arg(short, long)]
+    pub file: Option<PathBuf>,
+    /// List declared targets
+    #[arg(long)]
+    pub list: bool,
+    /// Show the resolved DAG and freshness without executing
+    #[arg(long, visible_alias = "dry")]
+    pub plan: bool,
+    /// Run requested targets even when their outputs are current
+    #[arg(long)]
+    pub force: bool,
+    /// Also force every dependency of requested targets
+    #[arg(long)]
+    pub force_deps: bool,
+    /// Print the dependency graph instead of running
+    #[arg(long)]
+    pub graph: bool,
+    /// Print a DOT graph (implies --graph)
+    #[arg(long)]
+    pub dot: bool,
+    /// Show recorded workflow runs
+    #[arg(long)]
+    pub history: bool,
+    /// Maximum history records to show
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+    /// Manage declared local cron schedules
+    #[arg(long, value_enum)]
+    pub schedule: Option<ScheduleAction>,
+    /// Schedule name for --schedule install/remove
+    #[arg(long)]
+    pub schedule_name: Option<String>,
+}
+
+#[derive(Clone, ValueEnum)]
+pub enum ScheduleAction {
+    List,
+    Install,
+    Remove,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Taskfile {
+    version: u8,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_single_instance")]
+    single_instance: bool,
+    #[serde(default = "default_lock_timeout")]
+    lock_timeout: u64,
+    targets: BTreeMap<String, Target>,
+    #[serde(default)]
+    schedules: BTreeMap<String, Schedule>,
+}
+fn default_lock_timeout() -> u64 {
+    7200
+}
+fn default_single_instance() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Target {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    deps: Vec<String>,
+    #[serde(default)]
+    inputs: Vec<String>,
+    #[serde(default)]
+    outputs: Vec<String>,
+    #[serde(default)]
+    phony: bool,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Schedule {
+    cron: String,
+    target: String,
+}
+
+#[derive(Serialize)]
+struct TargetResult {
+    name: String,
+    status: String,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u128>,
+}
+#[derive(Serialize)]
+struct RunResult {
+    workflow: String,
+    name: Option<String>,
+    requested: Vec<String>,
+    targets: Vec<TargetResult>,
+    success: bool,
+}
+#[derive(Serialize, Deserialize)]
+struct HistoryRecord {
+    run_id: String,
+    started_at: String,
+    finished_at: String,
+    requested: Vec<String>,
+    targets: Vec<HistoryTarget>,
+    success: bool,
+    duration_ms: u128,
+}
+#[derive(Serialize, Deserialize)]
+struct HistoryTarget {
+    name: String,
+    status: String,
+    reason: String,
+    duration_ms: Option<u128>,
+}
+
+pub fn run(args: TaskArgs, ctx: &Context) -> Result<()> {
+    let path = discover(args.file)?;
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    let root = canonical
+        .parent()
+        .expect("taskfile has parent")
+        .to_path_buf();
+    let content = fs::read_to_string(&canonical)
+        .with_context(|| format!("reading {}", canonical.display()))?;
+    let file: Taskfile = serde_yaml::from_str(&content)
+        .with_context(|| format!("parsing {}", canonical.display()))?;
+    validate(&file)?;
+
+    if args.list {
+        return list(&file, ctx);
+    }
+    if let Some(action) = args.schedule {
+        return schedule(
+            action,
+            args.schedule_name.as_deref(),
+            &file,
+            &canonical,
+            ctx,
+        );
+    }
+    if args.history {
+        return history(&root, args.limit, ctx);
+    }
+    let requested = if args.targets.is_empty() {
+        if !file.targets.contains_key("default") {
+            return list(&file, ctx);
+        }
+        vec!["default".to_string()]
+    } else {
+        args.targets.clone()
+    };
+    let plan = build_plan(&file, &requested)?;
+    if args.graph || args.dot {
+        return print_graph(&file, &plan, args.dot, ctx);
+    }
+    execute(
+        &file,
+        Execution {
+            taskfile: &canonical,
+            root: &root,
+            requested,
+            plan,
+            dry: args.plan,
+            force: args.force,
+            force_deps: args.force_deps,
+        },
+        ctx,
+    )
+}
+
+fn discover(given: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = given {
+        return Ok(path);
+    }
+    ["Taskfile.yml", "Taskfile.yaml"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .ok_or_else(|| anyhow::anyhow!("no Taskfile.yml found (use --file PATH)"))
+}
+
+fn validate(file: &Taskfile) -> Result<()> {
+    if file.version != 1 {
+        bail!("Taskfile version must be 1");
+    }
+    if file.targets.is_empty() {
+        bail!("Taskfile must declare at least one target");
+    }
+    let mut owners = HashMap::new();
+    for (name, target) in &file.targets {
+        if target.command.trim().is_empty() {
+            bail!("target '{name}' has an empty command");
+        }
+        if !target.phony && target.outputs.is_empty() {
+            bail!("target '{name}' needs outputs or phony: true");
+        }
+        for dep in &target.deps {
+            if !file.targets.contains_key(dep) {
+                bail!("target '{name}' depends on unknown target '{dep}'");
+            }
+            if dep == name {
+                bail!("target '{name}' cannot depend on itself");
+            }
+        }
+        for output in &target.outputs {
+            if let Some(previous) = owners.insert(output, name) {
+                bail!("output '{output}' is declared by both '{previous}' and '{name}'");
+            }
+        }
+    }
+    for (name, schedule) in &file.schedules {
+        if !file.targets.contains_key(&schedule.target) {
+            bail!(
+                "schedule '{name}' targets unknown target '{}'",
+                schedule.target
+            );
+        }
+        validate_cron(&schedule.cron)?;
+    }
+    Ok(())
+}
+
+fn validate_cron(value: &str) -> Result<()> {
+    if value.split_whitespace().count() != 5 {
+        bail!("cron schedule '{value}' must have five fields");
+    }
+    Ok(())
+}
+
+fn build_plan(file: &Taskfile, requested: &[String]) -> Result<Vec<String>> {
+    let mut plan = Vec::new();
+    let mut visiting = BTreeSet::new();
+    let mut done = BTreeSet::new();
+    fn visit(
+        name: &str,
+        file: &Taskfile,
+        plan: &mut Vec<String>,
+        visiting: &mut BTreeSet<String>,
+        done: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if done.contains(name) {
+            return Ok(());
+        }
+        if !visiting.insert(name.to_string()) {
+            bail!("dependency cycle includes target '{name}'");
+        }
+        let target = file
+            .targets
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown target '{name}'"))?;
+        for dep in &target.deps {
+            visit(dep, file, plan, visiting, done)?;
+        }
+        visiting.remove(name);
+        done.insert(name.to_string());
+        plan.push(name.to_string());
+        Ok(())
+    }
+    for target in requested {
+        visit(target, file, &mut plan, &mut visiting, &mut done)?;
+    }
+    Ok(plan)
+}
+
+fn resolve_patterns(root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    for pattern in patterns {
+        let full = root.join(pattern).to_string_lossy().into_owned();
+        for path in glob(&full).with_context(|| format!("invalid path pattern '{pattern}'"))? {
+            let path = path?;
+            if path.is_file() {
+                paths.insert(path);
+            }
+        }
+        if !pattern.contains(['*', '?', '[']) && !root.join(pattern).is_file() {
+            bail!(
+                "declared input '{}' does not exist",
+                root.join(pattern).display()
+            );
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn freshness(root: &Path, target: &Target, dep_outputs: &[PathBuf]) -> Result<(bool, String)> {
+    if target.phony {
+        return Ok((false, "phony target".to_string()));
+    }
+    let outputs: Vec<_> = target.outputs.iter().map(|p| root.join(p)).collect();
+    if let Some(missing) = outputs.iter().find(|p| !p.is_file()) {
+        return Ok((false, format!("output {} is missing", missing.display())));
+    }
+    let oldest = outputs
+        .iter()
+        .map(|p| Ok(fs::metadata(p)?.modified()?))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .min()
+        .expect("validated outputs");
+    let mut inputs = resolve_patterns(root, &target.inputs)?;
+    inputs.extend_from_slice(dep_outputs);
+    if let Some(newer) = inputs.iter().find(|p| {
+        fs::metadata(p)
+            .and_then(|m| m.modified())
+            .map(|time| time > oldest)
+            .unwrap_or(true)
+    }) {
+        return Ok((false, format!("{} is newer than outputs", newer.display())));
+    }
+    Ok((true, "outputs are current".to_string()))
+}
+
+struct Execution<'a> {
+    taskfile: &'a Path,
+    root: &'a Path,
+    requested: Vec<String>,
+    plan: Vec<String>,
+    dry: bool,
+    force: bool,
+    force_deps: bool,
+}
+
+fn execute(file: &Taskfile, execution: Execution<'_>, ctx: &Context) -> Result<()> {
+    let Execution {
+        taskfile,
+        root,
+        requested,
+        plan,
+        dry,
+        force,
+        force_deps,
+    } = execution;
+    let _lock = if file.single_instance {
+        Some(acquire_lock(root, file.lock_timeout)?)
+    } else {
+        None
+    };
+    let started = chrono::Utc::now();
+    let start_clock = std::time::Instant::now();
+    let requested_set: BTreeSet<_> = requested.iter().cloned().collect();
+    let mut results = Vec::new();
+    let mut output_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut success = true;
+    for name in &plan {
+        let target = &file.targets[name];
+        let deps: Vec<PathBuf> = target
+            .deps
+            .iter()
+            .flat_map(|d| output_map.get(d).cloned().unwrap_or_default())
+            .collect();
+        let force_this = (force && requested_set.contains(name)) || force_deps;
+        let (current, reason) = freshness(root, target, &deps)?;
+        if current && !force_this {
+            results.push(TargetResult {
+                name: name.clone(),
+                status: "up_to_date".into(),
+                reason,
+                duration_ms: None,
+            });
+            output_map.insert(
+                name.clone(),
+                target.outputs.iter().map(|p| root.join(p)).collect(),
+            );
+            continue;
+        }
+        if dry {
+            results.push(TargetResult {
+                name: name.clone(),
+                status: "would_run".into(),
+                reason,
+                duration_ms: None,
+            });
+            continue;
+        }
+        if ctx.output != OutputFormat::Json {
+            println!("$ {}", target.command);
+        }
+        let now = std::time::Instant::now();
+        let cwd = target
+            .cwd
+            .as_ref()
+            .map(|p| root.join(p))
+            .unwrap_or_else(|| root.to_path_buf());
+        let mut command: Command = shell::command(&target.command);
+        command.current_dir(&cwd).envs(&target.env);
+        let status = if ctx.output == OutputFormat::Json {
+            command
+                .output()
+                .with_context(|| format!("running target '{name}'"))?
+                .status
+        } else {
+            command
+                .status()
+                .with_context(|| format!("running target '{name}'"))?
+        };
+        let elapsed = now.elapsed().as_millis();
+        if !status.success() {
+            results.push(TargetResult {
+                name: name.clone(),
+                status: "failed".into(),
+                reason: format!("exit {}", status.code().unwrap_or(1)),
+                duration_ms: Some(elapsed),
+            });
+            success = false;
+            break;
+        }
+        let missing = target
+            .outputs
+            .iter()
+            .map(|p| root.join(p))
+            .find(|p| !p.is_file());
+        if let Some(missing) = missing {
+            results.push(TargetResult {
+                name: name.clone(),
+                status: "failed".into(),
+                reason: format!("expected output {} was not created", missing.display()),
+                duration_ms: Some(elapsed),
+            });
+            success = false;
+            break;
+        }
+        output_map.insert(
+            name.clone(),
+            target.outputs.iter().map(|p| root.join(p)).collect(),
+        );
+        results.push(TargetResult {
+            name: name.clone(),
+            status: "ok".into(),
+            reason,
+            duration_ms: Some(elapsed),
+        });
+    }
+    let result = RunResult {
+        workflow: taskfile.display().to_string(),
+        name: file.name.clone(),
+        requested: requested.clone(),
+        targets: results,
+        success,
+    };
+    if !dry {
+        append_history(root, &result, started, start_clock.elapsed())?;
+    }
+    print_result(&result, ctx);
+    if !success {
+        bail!("task workflow failed");
+    }
+    Ok(())
+}
+
+fn lock_path(root: &Path) -> PathBuf {
+    root.join(".tooler/task.lock")
+}
+struct TaskLock(PathBuf);
+impl Drop for TaskLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+fn acquire_lock(root: &Path, timeout: u64) -> Result<TaskLock> {
+    let path = lock_path(root);
+    fs::create_dir_all(path.parent().expect("parent"))?;
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        writeln!(f, "{}", chrono::Utc::now().to_rfc3339())?;
+        return Ok(TaskLock(path));
+    }
+    let age = fs::metadata(&path)?
+        .modified()?
+        .elapsed()
+        .unwrap_or_default()
+        .as_secs();
+    if age <= timeout {
+        bail!("task workflow is already running ({})", path.display());
+    }
+    fs::remove_file(&path)?;
+    acquire_lock(root, timeout)
+}
+
+fn append_history(
+    root: &Path,
+    result: &RunResult,
+    started: chrono::DateTime<chrono::Utc>,
+    elapsed: std::time::Duration,
+) -> Result<()> {
+    let dir = root.join(".tooler");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("task-history.jsonl");
+    let mut records = fs::read_to_string(&path).unwrap_or_default();
+    let record = HistoryRecord {
+        run_id: format!(
+            "{}-{}",
+            started.format("%Y%m%dT%H%M%SZ"),
+            std::process::id()
+        ),
+        started_at: started.to_rfc3339(),
+        finished_at: chrono::Utc::now().to_rfc3339(),
+        requested: result.requested.clone(),
+        targets: result
+            .targets
+            .iter()
+            .map(|t| HistoryTarget {
+                name: t.name.clone(),
+                status: t.status.clone(),
+                reason: t.reason.clone(),
+                duration_ms: t.duration_ms,
+            })
+            .collect(),
+        success: result.success,
+        duration_ms: elapsed.as_millis(),
+    };
+    records.push_str(&serde_json::to_string(&record)?);
+    records.push('\n');
+    atomic_write::write(&path, records.as_bytes())
+}
+
+fn print_result(result: &RunResult, ctx: &Context) {
+    if ctx.output == OutputFormat::Json {
+        println!("{}", serde_json::to_string(result).unwrap());
+        return;
+    }
+    for target in &result.targets {
+        println!("{:16} {} ({})", target.name, target.status, target.reason);
+    }
+}
+fn list(file: &Taskfile, ctx: &Context) -> Result<()> {
+    if ctx.output == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({"targets": file.targets.keys().collect::<Vec<_>>() })
+        );
+        return Ok(());
+    }
+    for (name, target) in &file.targets {
+        println!(
+            "{:20} {}",
+            name,
+            target.description.as_deref().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+fn print_graph(file: &Taskfile, plan: &[String], dot: bool, ctx: &Context) -> Result<()> {
+    if dot {
+        println!("digraph taskfile {{");
+        for name in plan {
+            for dep in &file.targets[name].deps {
+                println!("  \"{dep}\" -> \"{name}\";");
+            }
+        }
+        println!("}}");
+    } else if ctx.output == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({"targets": plan, "edges": plan.iter().flat_map(|n| file.targets[n].deps.iter().map(move |d| serde_json::json!([d,n]))).collect::<Vec<_>>() })
+        );
+    } else {
+        for name in plan {
+            let deps = &file.targets[name].deps;
+            println!(
+                "{}{}",
+                name,
+                if deps.is_empty() {
+                    String::new()
+                } else {
+                    format!(" <- {}", deps.join(", "))
+                }
+            );
+        }
+    }
+    Ok(())
+}
+fn history(root: &Path, limit: usize, ctx: &Context) -> Result<()> {
+    let path = root.join(".tooler/task-history.jsonl");
+    let mut records: Vec<HistoryRecord> = fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    records.reverse();
+    records.truncate(limit);
+    if ctx.output == OutputFormat::Json {
+        println!("{}", serde_json::json!({"runs": records}));
+    } else {
+        for record in records {
+            println!(
+                "{} {} {}",
+                record.started_at,
+                if record.success { "ok" } else { "failed" },
+                record.requested.join(",")
+            );
+        }
+    }
+    Ok(())
+}
+fn schedule(
+    action: ScheduleAction,
+    name: Option<&str>,
+    file: &Taskfile,
+    taskfile: &Path,
+    ctx: &Context,
+) -> Result<()> {
+    match action {
+        ScheduleAction::List => {
+            if ctx.output == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schedules": file.schedules.keys().collect::<Vec<_>>() })
+                );
+            } else {
+                for (name, schedule) in &file.schedules {
+                    println!("{name:20} {} -> {}", schedule.cron, schedule.target);
+                }
+            }
+            Ok(())
+        }
+        ScheduleAction::Install | ScheduleAction::Remove => {
+            let name = name.ok_or_else(|| anyhow::anyhow!("--schedule-name is required"))?;
+            let schedule = file
+                .schedules
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown schedule '{name}'"))?;
+            let marker = format!("tooler-task:{name}");
+            match action {
+                ScheduleAction::Install => {
+                    crate::commands::cron::remove_local_lines(&marker)?;
+                    let exe = std::env::current_exe()?.canonicalize()?;
+                    let root = taskfile.parent().expect("taskfile has parent");
+                    let line = format!(
+                        "{} cd {} && {} task --file {} {} # {}",
+                        schedule.cron,
+                        crate::db::shell_quote(&root.display().to_string()),
+                        crate::db::shell_quote(&exe.display().to_string()),
+                        crate::db::shell_quote(&taskfile.display().to_string()),
+                        crate::db::shell_quote(&schedule.target),
+                        marker,
+                    );
+                    crate::commands::cron::add_local_line(&line)?;
+                    if ctx.output == OutputFormat::Json {
+                        println!("{}", serde_json::json!({"installed": name, "line": line}));
+                    } else {
+                        println!("Installed schedule '{name}'.");
+                    }
+                }
+                ScheduleAction::Remove => {
+                    let removed = crate::commands::cron::remove_local_lines(&marker)?;
+                    if ctx.output == OutputFormat::Json {
+                        println!("{}", serde_json::json!({"removed": removed}));
+                    } else {
+                        println!("Removed {} schedule line(s).", removed.len());
+                    }
+                }
+                ScheduleAction::List => unreachable!(),
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn task(command: &str, deps: &[&str]) -> Target {
+        Target {
+            description: None,
+            deps: deps.iter().map(|v| v.to_string()).collect(),
+            inputs: vec![],
+            outputs: vec!["out".into()],
+            phony: false,
+            cwd: None,
+            env: BTreeMap::new(),
+            command: command.into(),
+        }
+    }
+    #[test]
+    fn plan_orders_dependencies() {
+        let mut targets = BTreeMap::new();
+        targets.insert("build".into(), task("true", &["generate"]));
+        targets.insert("generate".into(), task("true", &[]));
+        let file = Taskfile {
+            version: 1,
+            name: None,
+            single_instance: false,
+            lock_timeout: 1,
+            targets,
+            schedules: BTreeMap::new(),
+        };
+        assert_eq!(
+            build_plan(&file, &["build".into()]).unwrap(),
+            ["generate", "build"]
+        );
+    }
+    #[test]
+    fn plan_rejects_cycles() {
+        let mut targets = BTreeMap::new();
+        targets.insert("a".into(), task("true", &["b"]));
+        targets.insert("b".into(), task("true", &["a"]));
+        let file = Taskfile {
+            version: 1,
+            name: None,
+            single_instance: false,
+            lock_timeout: 1,
+            targets,
+            schedules: BTreeMap::new(),
+        };
+        assert!(build_plan(&file, &["a".into()]).is_err());
+    }
+}

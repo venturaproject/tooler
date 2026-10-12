@@ -40,6 +40,7 @@ fn main() -> Result<()> {
         Commands::OAuth(args) => commands::oauth::run(args, &ctx),
         Commands::Run(args) => commands::run::run(args, &ctx),
         Commands::Play(args) => commands::play::run(args, &ctx),
+        Commands::Task(args) => commands::task::run(args, &ctx),
         Commands::Git(args) => commands::git::run(args, &ctx),
         Commands::Scaffold(args) => commands::scaffold::run(args, &ctx),
         Commands::Config(args) => commands::config::run(args, &ctx),

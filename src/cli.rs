@@ -6,7 +6,7 @@ use crate::{
         info::InfoArgs, jobs::JobsArgs, json::JsonArgs, logs::LogsArgs, mail::MailArgs,
         mcp::McpArgs, monitor::MonitorArgs, oauth::OAuthArgs, play::PlayArgs, ps::PsArgs,
         report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs,
-        stat::StatArgs, systemd::SystemdArgs, vault::VaultArgs,
+        stat::StatArgs, systemd::SystemdArgs, task::TaskArgs, vault::VaultArgs,
     },
     output::OutputFormat,
 };
@@ -71,6 +71,9 @@ pub enum Commands {
 
     /// Run a YAML playbook (tasks, vars, health checks)
     Play(PlayArgs),
+
+    /// Run incremental local workflows from Taskfile.yml
+    Task(TaskArgs),
 
     /// Git utilities: summary, clean branches, changelog
     Git(GitArgs),

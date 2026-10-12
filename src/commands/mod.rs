@@ -31,4 +31,5 @@ pub mod shell;
 pub mod ssh;
 pub mod stat;
 pub mod systemd;
+pub mod task;
 pub mod vault;

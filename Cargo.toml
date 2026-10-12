@@ -1,6 +1,6 @@
 [package]
 name = "tooler"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2024"
 description = "A modular CLI toolkit"
 authors = ["Antonio Ventura <antonioventura.j@gmail.com>"]
@@ -56,6 +56,7 @@ minijinja = { version = "2", default-features = false, features = ["builtins", "
 tempfile = "3"
 getrandom = "0.3"
 url = "2"
+glob = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # IMAP uses native TLS. Vendoring OpenSSL keeps the ARM release build independent of
