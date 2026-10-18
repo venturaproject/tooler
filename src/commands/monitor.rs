@@ -1,4 +1,4 @@
-use crate::{commands::check, context::Context, output::OutputFormat};
+use crate::{commands::check, context::Context};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,17 @@ pub enum MonitorSubcommand {
         /// Parse and show the checks without probing or updating state
         #[arg(long)]
         dry: bool,
+    },
+    /// Repeatedly run a monitor definition until interrupted
+    Watch {
+        /// YAML monitor definition
+        file: PathBuf,
+        /// Seconds between checks (minimum: 1)
+        #[arg(short, long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+        /// Override the durable state file (default: <file>.monitor.json)
+        #[arg(long)]
+        state: Option<PathBuf>,
     },
 }
 
@@ -173,13 +184,32 @@ fn send_webhook(url: &str, monitor: &str, notification: &PendingNotification) ->
     Ok(())
 }
 
-pub fn run(args: MonitorArgs, ctx: &Context) -> Result<()> {
+pub fn run(args: MonitorArgs, _ctx: &Context) -> Result<()> {
     match args.subcommand {
-        MonitorSubcommand::Run { file, state, dry } => run_file(&file, state.as_deref(), dry, ctx),
+        MonitorSubcommand::Run { file, state, dry } => {
+            let success = run_file_once(&file, state.as_deref(), dry)?;
+            if !success {
+                bail!("monitor has failing checks");
+            }
+            Ok(())
+        }
+        MonitorSubcommand::Watch {
+            file,
+            interval,
+            state,
+        } => watch_file(&file, state.as_deref(), interval),
     }
 }
 
-fn run_file(file: &Path, state_override: Option<&Path>, dry: bool, ctx: &Context) -> Result<()> {
+fn watch_file(file: &Path, state: Option<&Path>, interval: u64) -> Result<()> {
+    loop {
+        // A failing probe is an expected monitor result, not a reason to stop watching.
+        let _ = run_file_once(file, state, false)?;
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
+}
+
+fn run_file_once(file: &Path, state_override: Option<&Path>, dry: bool) -> Result<bool> {
     let monitor: MonitorFile = serde_yaml::from_str(&std::fs::read_to_string(file)?)
         .with_context(|| format!("parsing monitor {}", file.display()))?;
     if monitor.checks.is_empty() {
@@ -202,7 +232,7 @@ fn run_file(file: &Path, state_override: Option<&Path>, dry: bool, ctx: &Context
             "{}",
             serde_json::json!({"monitor": monitor.name, "dry": true, "checks": ids})
         );
-        return Ok(());
+        return Ok(true);
     }
 
     let state_path = state_override
@@ -281,13 +311,7 @@ fn run_file(file: &Path, state_override: Option<&Path>, dry: bool, ctx: &Context
         "success": success,
     });
     println!("{output}");
-    if !success {
-        if ctx.output != OutputFormat::Json {
-            eprintln!("monitor has failing checks");
-        }
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(success)
 }
 
 #[cfg(test)]

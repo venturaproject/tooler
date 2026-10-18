@@ -47,3 +47,18 @@ fn a_failed_check_writes_durable_failure_state() {
         .assert()
         .success();
 }
+
+#[test]
+fn watch_rejects_zero_interval_without_running_checks() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("monitor.yml"),
+        "name: Smoke\nchecks:\n  - id: unavailable\n    host: 127.0.0.1\n    port: 1\n",
+    )
+    .unwrap();
+
+    cmd.args(["monitor", "watch", "monitor.yml", "--interval", "0"])
+        .assert()
+        .failure();
+    assert!(!dir.path().join("monitor.yml.monitor.json").exists());
+}

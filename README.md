@@ -294,7 +294,7 @@ Exit code is non-zero on failure — works well in scripts and CI.
 
 ### tooler monitor
 
-Run a versioned YAML monitor once; schedule the command through `tooler cron local add` or your platform scheduler. The monitor keeps `<file>.monitor.json` as its durable state, sends a webhook only when a check first fails or recovers, and exits non-zero while any check is failing.
+Run a versioned YAML monitor once, or keep it running with `watch`. The monitor keeps `<file>.monitor.json` as its durable state and sends a webhook only when a check first fails or recovers. `run` exits non-zero while any check is failing; `watch` continues probing until interrupted (Ctrl-C).
 
 ```yaml
 # monitors/staging.yml
@@ -314,6 +314,7 @@ checks:
 ```sh
 tooler monitor run monitors/staging.yml
 tooler monitor run monitors/staging.yml --dry
+tooler monitor watch monitors/staging.yml --interval 30
 tooler cron local add "*/5 * * * * /usr/local/bin/tooler monitor run /srv/app/monitors/staging.yml"
 ```
 
