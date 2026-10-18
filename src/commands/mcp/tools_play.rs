@@ -74,7 +74,7 @@ impl ToolerMcp {
             let guard = TempPlaybookFile::write(content).map_err(|e| {
                 McpError::internal_error(format!("failed to write temp playbook: {e}"), None)
             })?;
-            argv.push(guard.0.to_string_lossy().to_string());
+            argv.push(guard.path().to_string_lossy().to_string());
             _temp_guard = Some(guard);
         } else {
             if let Some(file) = &args.file {
@@ -148,11 +148,10 @@ impl ToolerMcp {
             serde_yaml::Value::Sequence(Vec::new()),
         );
 
-        let path = new_session_path();
         let content = serde_yaml::to_string(&serde_yaml::Value::Mapping(doc)).map_err(|e| {
             McpError::internal_error(format!("failed to build session playbook: {e}"), None)
         })?;
-        std::fs::write(&path, content).map_err(|e| {
+        let path = create_session_file(&content).map_err(|e| {
             McpError::internal_error(format!("failed to write session file: {e}"), None)
         })?;
 

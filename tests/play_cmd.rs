@@ -3204,6 +3204,25 @@ fn state_set_does_not_persist_in_a_dry_run() {
 }
 
 #[test]
+fn parallel_state_set_is_persisted_in_declaration_order() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: Parallel state\ntasks:\n  - name: set concurrently\n    parallel:\n      - name: first\n        state_set:\n          winner: first\n          first_only: yes\n      - name: second\n        state_set:\n          winner: second\n          second_only: yes\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("playbook.yml.data.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["winner"], "second");
+    assert_eq!(state["first_only"], "yes");
+    assert_eq!(state["second_only"], "yes");
+}
+
+#[test]
 fn wait_for_file_exists_unblocks_once_the_file_appears() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -4578,14 +4597,8 @@ fn lint_does_not_flag_a_templated_include_path() {
 
 // ── single_instance: lock ─────────────────────────────────────────────────────
 
-/// A far-future RFC3339 timestamp — comfortably inside any `lock_timeout` window, so a
-/// hand-written lock reads as "fresh". Avoids pulling chrono into the test crate.
-fn fresh_lock_timestamp() -> &'static str {
-    "3000-01-01T00:00:00+00:00"
-}
-
 #[test]
-fn single_instance_refusal_names_the_holding_pid() {
+fn single_instance_ignores_orphaned_legacy_lock_files() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
         dir.path().join("playbook.yml"),
@@ -4594,25 +4607,15 @@ fn single_instance_refusal_names_the_holding_pid() {
     .unwrap();
     std::fs::write(
         dir.path().join("playbook.yml.lock"),
-        format!(
-            "{{\"pid\":424242,\"started_at\":\"{}\",\"playbook\":\"Locked\",\"host\":\"h\"}}\n",
-            fresh_lock_timestamp()
-        ),
+        "{\"pid\":424242,\"started_at\":\"3000-01-01T00:00:00+00:00\"}\n",
     )
     .unwrap();
 
-    let assert = cmd.args(["play", "playbook.yml"]).assert().failure();
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert!(
-        stderr.contains("already running (pid 424242"),
-        "stderr was: {stderr}"
-    );
-    // The playbook never ran.
-    assert!(!dir.path().join("ran.txt").exists());
+    cmd.args(["play", "playbook.yml"]).assert().success();
 }
 
 #[test]
-fn single_instance_takes_over_a_stale_lock() {
+fn single_instance_ignores_stale_legacy_lock_files() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
         dir.path().join("playbook.yml"),
@@ -4628,10 +4631,7 @@ fn single_instance_takes_over_a_stale_lock() {
 
     cmd.args(["play", "playbook.yml"]).assert().success();
     assert!(dir.path().join("ran.txt").exists());
-    assert!(
-        !dir.path().join("playbook.yml.lock").exists(),
-        "lock should be released"
-    );
+    assert!(dir.path().join("playbook.yml.lock").exists());
 }
 
 #[test]
@@ -4652,20 +4652,20 @@ fn single_instance_releases_the_lock_on_success_and_on_failure() {
         .args(["play", "ok.yml"])
         .assert()
         .success();
-    assert!(!dir.path().join("ok.yml.lock").exists());
+    assert!(dir.path().join("ok.yml.lock").exists());
 
     tooler_in(dir.path())
         .args(["play", "bad.yml"])
         .assert()
         .failure();
-    assert!(!dir.path().join("bad.yml.lock").exists());
+    assert!(dir.path().join("bad.yml.lock").exists());
 
     // JSON-mode failure exits via process::exit — the lock must still be gone.
     tooler_in(dir.path())
         .args(["--output", "json", "play", "bad.yml"])
         .assert()
         .failure();
-    assert!(!dir.path().join("bad.yml.lock").exists());
+    assert!(dir.path().join("bad.yml.lock").exists());
 }
 
 #[test]
@@ -4678,10 +4678,7 @@ fn single_instance_ignores_the_lock_in_dry_run() {
     .unwrap();
     std::fs::write(
         dir.path().join("playbook.yml.lock"),
-        format!(
-            "{{\"pid\":424242,\"started_at\":\"{}\",\"playbook\":\"Locked\",\"host\":\"h\"}}\n",
-            fresh_lock_timestamp()
-        ),
+        "{\"pid\":424242,\"started_at\":\"3000-01-01T00:00:00+00:00\"}\n",
     )
     .unwrap();
 

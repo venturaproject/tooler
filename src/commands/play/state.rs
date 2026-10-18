@@ -2,8 +2,7 @@
 //! `--resume` checkpoint (`<file>.state.json`), `state_set:`'s durable
 //! `<file>.data.json`, and `single_instance:`'s exclusive `<file>.lock`.
 use super::*;
-use anyhow::{Result, anyhow, bail};
-use colored::Colorize;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,110 +48,31 @@ pub(crate) fn lock_path_for(file_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// What a `<file>.lock` holds — one JSON line, so a human (or a `--dry` inspection) can
-/// see which process claims the playbook and since when.
-#[derive(Serialize, Deserialize)]
-pub(crate) struct LockInfo {
-    pub(crate) pid: u32,
-    pub(crate) started_at: String,
-    pub(crate) playbook: String,
-    pub(crate) host: String,
-}
-
-/// Removes the lock file it owns on drop — covers a clean finish, any `Err` return, and
-/// a panic. The two JSON-mode `std::process::exit(1)` paths bypass `Drop`, so they clean
-/// `env.lock_path` explicitly; a hard kill is covered by `lock_timeout` staleness.
-pub(crate) struct LockGuard(pub(crate) PathBuf);
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-pub(crate) fn best_effort_hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+/// Keeps the OS-backed lock alive for the run. The OS releases it on process exit, including
+/// the JSON-mode `std::process::exit(1)` paths and abrupt process termination.
+pub(crate) struct LockGuard {
+    _lock: crate::atomic_write::FileLock,
 }
 
 /// Acquires the `single_instance:` lock for `file_path`. Returns a `LockGuard` that
 /// releases it on drop. Fails if a fresh lock (younger than `lock_timeout` seconds) is
-/// already held; takes over — with a warning — a lock older than that (the previous run
-/// was killed without cleaning up) or one that's corrupt/unparseable.
+/// already held. The OS releases the advisory lock when a dead process exits, avoiding
+/// stale-lock takeover and deletion races entirely.
 pub(crate) fn acquire_lock(
     file_path: &Path,
     playbook_name: &str,
-    lock_timeout: u64,
+    _lock_timeout: u64,
 ) -> Result<LockGuard> {
-    use std::io::Write;
-    let path = lock_path_for(file_path);
-
-    for attempt in 0..2 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                let info = LockInfo {
-                    pid: std::process::id(),
-                    started_at: chrono::Utc::now().to_rfc3339(),
-                    playbook: playbook_name.to_string(),
-                    host: best_effort_hostname(),
-                };
-                let _ = writeln!(f, "{}", serde_json::to_string(&info).unwrap_or_default());
-                return Ok(LockGuard(path));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let held = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<LockInfo>(s.trim()).ok());
-                let stale = match &held {
-                    Some(info) => chrono::DateTime::parse_from_rfc3339(&info.started_at)
-                        .map(|t| {
-                            (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds()
-                                > lock_timeout as i64
-                        })
-                        .unwrap_or(true),
-                    None => true,
-                };
-                if !stale {
-                    let info = held.expect("non-stale implies parsed");
-                    bail!(
-                        "'{playbook_name}' is already running (pid {}, on {}, since {}) — \
-                         {} is held. If that run is dead, delete the lock file.",
-                        info.pid,
-                        info.host,
-                        info.started_at,
-                        path.display()
-                    );
-                }
-                eprintln!(
-                    "  {} {} looks stale{} — taking over",
-                    "!".yellow().bold(),
-                    path.display(),
-                    held.map(|i| format!(" (pid {}, since {})", i.pid, i.started_at))
-                        .unwrap_or_else(|| " (unparseable)".to_string())
-                );
-                let _ = std::fs::remove_file(&path);
-                if attempt == 1 {
-                    bail!(
-                        "could not acquire {} after taking over a stale lock",
-                        path.display()
-                    );
-                }
-            }
-            Err(e) => {
-                return Err(anyhow!("creating lock file {}: {e}", path.display()));
-            }
+    let lock_file = lock_path_for(file_path);
+    match crate::atomic_write::try_lock(file_path)? {
+        Some(lock) => Ok(LockGuard { _lock: lock }),
+        None => {
+            bail!(
+                "'{playbook_name}' is already running — {} is held",
+                lock_file.display()
+            );
         }
     }
-    unreachable!("loop returns or bails within 2 attempts")
 }
 
 /// Loads `<file>.data.json` if it exists (a missing file is an empty map, not an error --
@@ -178,25 +98,21 @@ pub(crate) fn load_persisted_state(path: &Path) -> Result<HashMap<String, String
 /// checkpointing, is a top-level-playbook-file concept). Called immediately after every
 /// `state_set:`, not batched, so state already set survives even a later task's crash --
 /// same "durable as you go" philosophy `write_checkpoint` already has.
-pub(crate) fn write_persisted_state(env: &RunEnv, vars: &HashMap<String, String>) {
+pub(crate) fn write_persisted_state(env: &RunEnv, updates: &HashMap<String, String>) -> Result<()> {
     let Some(path) = &env.data_path else {
-        return;
+        return Ok(());
     };
-    let state: HashMap<&str, &str> = vars
-        .iter()
-        .filter_map(|(k, v)| k.strip_prefix("state.").map(|key| (key, v.as_str())))
-        .collect();
-    let result = serde_json::to_string_pretty(&state)
-        .map_err(anyhow::Error::from)
-        .and_then(|json| {
-            crate::atomic_write::write(path, json.as_bytes())
-                .with_context(|| format!("writing persisted state {}", path.display()))
-        });
-    if let Err(e) = result
-        && !env.quiet
-    {
-        println!("  {}", format!("(state not saved: {e})").dimmed());
-    }
+    (|| -> Result<()> {
+        let _lock = crate::atomic_write::lock(path)?;
+        let mut state = load_persisted_state(path)?;
+        state.extend(updates.iter().filter_map(|(k, v)| {
+            k.strip_prefix("state.")
+                .map(|key| (key.to_string(), v.clone()))
+        }));
+        let json = serde_json::to_string_pretty(&state)?;
+        crate::atomic_write::write(path, json.as_bytes())
+            .with_context(|| format!("writing persisted state {}", path.display()))
+    })()
 }
 
 pub(crate) fn load_checkpoint(path: &Path) -> Result<PlayCheckpoint> {
@@ -218,9 +134,9 @@ pub(crate) fn write_checkpoint(
     playbook_name: &str,
     last_completed_task: &str,
     vars: &HashMap<String, String>,
-) {
+) -> Result<()> {
     let Some(path) = &env.state_path else {
-        return;
+        return Ok(());
     };
     let checkpoint = PlayCheckpoint {
         playbook: playbook_name.to_string(),
@@ -228,15 +144,10 @@ pub(crate) fn write_checkpoint(
         vars: vars.clone(),
         updated_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     };
-    let result = serde_json::to_string_pretty(&checkpoint)
+    serde_json::to_string_pretty(&checkpoint)
         .map_err(anyhow::Error::from)
         .and_then(|json| {
             crate::atomic_write::write(path, json.as_bytes())
                 .with_context(|| format!("writing checkpoint {}", path.display()))
-        });
-    if let Err(e) = result
-        && !env.quiet
-    {
-        println!("  {}", format!("(checkpoint not saved: {e})").dimmed());
-    }
+        })
 }

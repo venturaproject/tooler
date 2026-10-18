@@ -251,8 +251,56 @@ fn validate(file: &Taskfile) -> Result<()> {
 }
 
 fn validate_cron(value: &str) -> Result<()> {
-    if value.split_whitespace().count() != 5 {
+    let fields: Vec<_> = value.split_whitespace().collect();
+    if fields.len() != 5 {
         bail!("cron schedule '{value}' must have five fields");
+    }
+    for (field, min, max, names) in [
+        (fields[0], 0, 59, &[][..]),
+        (fields[1], 0, 23, &[][..]),
+        (fields[2], 1, 31, &[][..]),
+        (
+            fields[3],
+            1,
+            12,
+            &[
+                "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+            ][..],
+        ),
+        (
+            fields[4],
+            0,
+            7,
+            &["sun", "mon", "tue", "wed", "thu", "fri", "sat"][..],
+        ),
+    ] {
+        for part in field.split(',') {
+            let (base, step) = part
+                .split_once('/')
+                .map_or((part, None), |(base, step)| (base, Some(step)));
+            if step.is_some_and(|step| step.parse::<u32>().ok().filter(|n| *n > 0).is_none()) {
+                bail!("invalid cron field '{field}' in '{value}'");
+            }
+            let parse_value = |raw: &str| -> Option<u32> {
+                raw.parse().ok().or_else(|| {
+                    names
+                        .iter()
+                        .position(|name| raw.eq_ignore_ascii_case(name))
+                        .map(|index| index as u32 + min)
+                })
+            };
+            if base == "*" {
+                continue;
+            }
+            let valid = if let Some((start, end)) = base.split_once('-') {
+                matches!((parse_value(start), parse_value(end)), (Some(start), Some(end)) if start >= min && end <= max && start <= end)
+            } else {
+                matches!(parse_value(base), Some(number) if number >= min && number <= max)
+            };
+            if !valid {
+                bail!("invalid cron field '{field}' in '{value}'");
+            }
+        }
     }
     Ok(())
 }
@@ -478,36 +526,21 @@ fn execute(file: &Taskfile, execution: Execution<'_>, ctx: &Context) -> Result<(
 }
 
 fn lock_path(root: &Path) -> PathBuf {
-    root.join(".tooler/task.lock")
+    root.join(".tooler/task")
 }
-struct TaskLock(PathBuf);
-impl Drop for TaskLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
+struct TaskLock {
+    _lock: crate::atomic_write::FileLock,
 }
-fn acquire_lock(root: &Path, timeout: u64) -> Result<TaskLock> {
+fn acquire_lock(root: &Path, _timeout: u64) -> Result<TaskLock> {
     let path = lock_path(root);
     fs::create_dir_all(path.parent().expect("parent"))?;
-    if let Ok(mut f) = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        use std::io::Write;
-        writeln!(f, "{}", chrono::Utc::now().to_rfc3339())?;
-        return Ok(TaskLock(path));
+    match atomic_write::try_lock(&path)? {
+        Some(lock) => Ok(TaskLock { _lock: lock }),
+        None => bail!(
+            "task workflow is already running ({})",
+            atomic_write::lock_path(&path).display()
+        ),
     }
-    let age = fs::metadata(&path)?
-        .modified()?
-        .elapsed()
-        .unwrap_or_default()
-        .as_secs();
-    if age <= timeout {
-        bail!("task workflow is already running ({})", path.display());
-    }
-    fs::remove_file(&path)?;
-    acquire_lock(root, timeout)
 }
 
 fn append_history(
@@ -519,6 +552,7 @@ fn append_history(
     let dir = root.join(".tooler");
     fs::create_dir_all(&dir)?;
     let path = dir.join("task-history.jsonl");
+    let _lock = atomic_write::lock(&path)?;
     let mut records = fs::read_to_string(&path).unwrap_or_default();
     let record = HistoryRecord {
         run_id: format!(
@@ -656,7 +690,6 @@ fn schedule(
             let marker = format!("tooler-task:{name}");
             match action {
                 ScheduleAction::Install => {
-                    crate::commands::cron::remove_local_lines(&marker)?;
                     let exe = std::env::current_exe()?.canonicalize()?;
                     let root = taskfile.parent().expect("taskfile has parent");
                     let line = format!(
@@ -668,7 +701,7 @@ fn schedule(
                         crate::db::shell_quote(&schedule.target),
                         marker,
                     );
-                    crate::commands::cron::add_local_line(&line)?;
+                    crate::commands::cron::replace_local_line(&marker, &line)?;
                     if ctx.output == OutputFormat::Json {
                         println!("{}", serde_json::json!({"installed": name, "line": line}));
                     } else {
@@ -737,5 +770,47 @@ mod tests {
             schedules: BTreeMap::new(),
         };
         assert!(build_plan(&file, &["a".into()]).is_err());
+    }
+
+    #[test]
+    fn cron_validation_rejects_invalid_ranges_and_accepts_standard_syntax() {
+        assert!(validate_cron("*/15 9-17 * jan,mar mon-fri").is_ok());
+        assert!(validate_cron("60 * * * *").is_err());
+        assert!(validate_cron("* * * * nope").is_err());
+        assert!(validate_cron("*/0 * * * *").is_err());
+    }
+
+    #[test]
+    fn history_append_preserves_existing_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = RunResult {
+            workflow: "Taskfile.yml".to_string(),
+            name: None,
+            requested: vec!["default".to_string()],
+            targets: vec![],
+            success: true,
+        };
+        let started = chrono::Utc::now();
+        append_history(
+            directory.path(),
+            &result,
+            started,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        append_history(
+            directory.path(),
+            &result,
+            started,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(".tooler/task-history.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
     }
 }

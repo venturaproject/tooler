@@ -208,6 +208,13 @@ fn run_file(file: &Path, state_override: Option<&Path>, dry: bool, ctx: &Context
     let state_path = state_override
         .map(PathBuf::from)
         .unwrap_or_else(|| state_path_for(file));
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Hold the lock through probing, state update, delivery, and acknowledgement. This
+    // prevents two monitor invocations from deriving duplicate transitions or dropping a
+    // notification that the other invocation has just acknowledged.
+    let _lock = crate::atomic_write::lock(&state_path)?;
     let mut state = load_state(&state_path)?;
     let now = chrono::Utc::now().to_rfc3339();
     let mut results = Vec::new();

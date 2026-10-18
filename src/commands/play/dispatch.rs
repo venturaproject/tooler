@@ -498,8 +498,15 @@ pub(crate) fn run_task_once(
         // The actual persistence, like every other action's real work, is skipped in
         // --dry — the in-memory vars.insert() above is enough to preview what the
         // resulting {{state.*}} values would be within this run.
-        if !env.dry {
-            write_persisted_state(env, vars);
+        if !env.dry && !env.defer_state_persistence {
+            let updates = facts
+                .keys()
+                .filter_map(|key| {
+                    vars.get(&format!("state.{key}"))
+                        .map(|value| (format!("state.{key}"), value.clone()))
+                })
+                .collect();
+            write_persisted_state(env, &updates)?;
         }
         return Ok(());
     }
@@ -2022,7 +2029,7 @@ pub(crate) fn run_task_once(
                 state_path: None,
                 data_path: None,
                 keep_checkpoint: false,
-                lock_path: None,
+                defer_state_persistence: env.defer_state_persistence,
                 ctx: env.ctx,
             };
             include_stack.push(include_path);

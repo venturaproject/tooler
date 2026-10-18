@@ -27,6 +27,45 @@ fn mcp_policy_limits_commands_and_explicit_server_arguments() {
 }
 
 #[test]
+fn mcp_does_not_expose_plaintext_local_secrets() {
+    let mcp = ToolerMcp::new();
+    for argv in [
+        vec!["env".into(), "get".into(), "TOKEN".into()],
+        vec![
+            "env".into(),
+            "show".into(),
+            ".env".into(),
+            "--reveal".into(),
+        ],
+        vec!["vault".into(), "view".into(), "secrets.yml".into()],
+    ] {
+        assert!(
+            mcp.policy_error(&argv)
+                .unwrap()
+                .contains("plaintext local secrets")
+        );
+    }
+}
+
+#[test]
+fn mail_profiles_are_not_checked_as_ssh_servers() {
+    let mut mcp = ToolerMcp::new();
+    mcp.policy = McpPolicy {
+        allowed_commands: vec!["mail".into()],
+        allowed_servers: vec!["staging".into()],
+    };
+    assert!(
+        mcp.policy_error(&[
+            "mail".into(),
+            "send".into(),
+            "--server".into(),
+            "smtp".into()
+        ])
+        .is_none()
+    );
+}
+
+#[test]
 fn mcp_server_allowlist_rejects_unresolvable_or_embedded_targets() {
     let mut mcp = ToolerMcp::new();
     mcp.policy = McpPolicy {
@@ -86,6 +125,41 @@ fn mcp_server_allowlist_rejects_unresolvable_or_embedded_targets() {
         ])
         .unwrap()
         .contains("production")
+    );
+}
+
+#[test]
+fn mcp_server_allowlist_denies_server_profile_mutation() {
+    let mut mcp = ToolerMcp::new();
+    mcp.policy = McpPolicy {
+        allowed_commands: vec!["server".into(), "config".into()],
+        allowed_servers: vec!["staging".into()],
+    };
+    assert!(
+        mcp.policy_error(&["server".into(), "add".into(), "staging".into()])
+            .unwrap()
+            .contains("server-profile mutation")
+    );
+    assert!(
+        mcp.policy_error(&[
+            "config".into(),
+            "set".into(),
+            "server.staging.host".into(),
+            "attacker.example".into(),
+        ])
+        .unwrap()
+        .contains("server-profile mutation")
+    );
+}
+
+#[test]
+fn mcp_policy_load_failure_denies_every_command() {
+    let mut mcp = ToolerMcp::new();
+    mcp.policy_load_error = Some("invalid TOML".into());
+    assert!(
+        mcp.policy_error(&["deploy".into(), "staging".into()])
+            .unwrap()
+            .contains("could not be loaded")
     );
 }
 use clap::CommandFactory;
@@ -222,5 +296,103 @@ fn redact_argv_leaves_an_ordinary_var_alone() {
         "--var".to_string(),
         "env=prod".to_string(),
     ];
-    assert_eq!(redact_argv(&argv), argv);
+    assert_eq!(redact_argv(&argv)[3], "env=***");
+}
+
+#[test]
+fn redact_argv_scrubs_sensitive_request_and_execution_content() {
+    let argv = vec![
+        "http".into(),
+        "post".into(),
+        "https://example.test".into(),
+        "--header".into(),
+        "Authorization: Bearer secret".into(),
+        "--body".into(),
+        "{\"password\":\"secret\"}".into(),
+    ];
+    assert_eq!(redact_argv(&argv)[4], "***");
+    assert_eq!(redact_argv(&argv)[6], "***");
+    let db = vec![
+        "db".into(),
+        "query".into(),
+        "staging".into(),
+        "select * from users".into(),
+    ];
+    assert_eq!(redact_argv(&db)[3], "***");
+    let file = vec![
+        "fs".into(),
+        "write".into(),
+        "staging".into(),
+        "/x".into(),
+        "--content".into(),
+        "private".into(),
+    ];
+    assert_eq!(redact_argv(&file)[5], "***");
+    let fleet = vec![
+        "fleet".into(),
+        "exec".into(),
+        "--servers".into(),
+        "staging".into(),
+        "curl -H 'Authorization: secret'".into(),
+    ];
+    assert_eq!(redact_argv(&fleet)[3], "staging");
+    assert_eq!(redact_argv(&fleet)[4], "***");
+}
+
+#[test]
+fn playbook_arguments_must_match_declared_schema() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"environment": {"type": "string", "enum": ["staging"]}, "confirm": {"type": "boolean"}},
+        "required": ["environment"]
+    });
+    let schema = schema.as_object().unwrap();
+    assert!(
+        validate_playbook_arguments(
+            schema,
+            serde_json::json!({"environment": "staging"})
+                .as_object()
+                .unwrap()
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_playbook_arguments(
+            schema,
+            serde_json::json!({"environment": "production"})
+                .as_object()
+                .unwrap()
+        )
+        .is_err()
+    );
+    assert!(
+        validate_playbook_arguments(
+            schema,
+            serde_json::json!({"environment": "staging", "extra": true})
+                .as_object()
+                .unwrap()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn temporary_playbook_files_are_private_and_session_ids_reject_symlinks() {
+    let temp = TempPlaybookFile::write("name: test\ntasks: []\n").unwrap();
+    assert!(temp.path().is_file());
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(temp.path()).unwrap()) & 0o077,
+        0
+    );
+    let session = create_session_file("name: test\ntasks: []\n").unwrap();
+    assert!(validate_session_path(session.to_str().unwrap()).is_ok());
+    let link = std::env::temp_dir().join(format!("{SESSION_FILE_PREFIX}test-link.yml"));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&session, &link).unwrap();
+        assert!(validate_session_path(link.to_str().unwrap()).is_err());
+        std::fs::remove_file(&link).unwrap();
+    }
+    std::fs::remove_file(session).unwrap();
 }

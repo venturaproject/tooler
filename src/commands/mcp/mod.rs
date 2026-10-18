@@ -25,6 +25,31 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_EXEC_OUTPUT_BYTES: usize = 256 * 1024;
+
+async fn read_limited<R: tokio::io::AsyncRead + Unpin>(mut pipe: R) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = pipe.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_EXEC_OUTPUT_BYTES.saturating_sub(output.len());
+        let kept = remaining.min(read);
+        output.extend_from_slice(&buffer[..kept]);
+        truncated |= kept < read;
+    }
+    let mut output = String::from_utf8_lossy(&output).into_owned();
+    if truncated {
+        output.push_str("\n[output truncated]");
+    }
+    Ok(output)
+}
+
 #[derive(Args)]
 pub struct McpArgs {
     /// Serve over HTTP (Streamable HTTP transport) instead of stdio
@@ -187,7 +212,8 @@ fn server_arguments(argv: &[String]) -> Vec<&str> {
         }
     }
     for pair in argv.windows(2) {
-        if pair[0] == "--server" {
+        // `mail --server` selects an SMTP profile, not an SSH server profile.
+        if command != "mail" && pair[0] == "--server" {
             servers.push(&pair[1]);
         }
         if pair[0] == "--servers" {
@@ -197,35 +223,11 @@ fn server_arguments(argv: &[String]) -> Vec<&str> {
     servers
 }
 
-/// A `--var`/`-e` key that looks like it holds a credential, for `redact_argv`'s
-/// heuristic pass -- matched by substring since the actual set of var names a playbook
-/// author might choose is unbounded (`db_password`, `api_key`, `stripe_secret`, ...).
-fn looks_like_a_secret_var_name(name: &str) -> bool {
-    let name = name.to_lowercase();
-    [
-        "password",
-        "passwd",
-        "token",
-        "secret",
-        "api_key",
-        "apikey",
-        "credential",
-    ]
-    .iter()
-    .any(|pat| name.contains(pat))
-}
-
 /// Defense-in-depth redaction before an argv is written to `--audit-log`: the tool
 /// guards (`tooler_config_set`/`tooler_config_get` refuse keychain-backed keys outright,
-/// see `commands::config::is_secret_backed_key`) already stop the one designed path for
-/// a raw secret to reach an MCP argument, but this catches it a second time in case a
-/// guard is ever bypassed, plus the one path no guard covers: an agent handing
-/// `tooler_play` a `--var name=value` whose *value* is itself a secret the agent
-/// typed directly rather than referencing `{{secret.*}}`. Two rules, both exact-shape
-/// matches (not a general scan, to avoid redacting something that only coincidentally
-/// looks sensitive): a `config set <key> <value>` whose key is keychain-backed redacts
-/// `<value>`; a `--var`/`-e <name>=<value>` whose `<name>` looks like a credential (see
-/// `looks_like_a_secret_var_name`) redacts `<value>`.
+/// see `commands::config::is_secret_backed_key`) already stop the intended secret paths.
+/// Audit logs must make the safer tradeoff: redact all variable values and payload-like
+/// arguments rather than trying to infer whether arbitrary command or file content is safe.
 fn redact_argv(argv: &[String]) -> Vec<String> {
     let mut out: Vec<String> = argv.to_vec();
     if let [cmd, sub, key, _value] = out.as_slice()
@@ -237,13 +239,62 @@ fn redact_argv(argv: &[String]) -> Vec<String> {
         return out;
     }
     for i in 0..out.len().saturating_sub(1) {
-        if (out[i] == "--var" || out[i] == "-e")
-            && let Some((name, _)) = out[i + 1].split_once('=')
-            && looks_like_a_secret_var_name(name)
-        {
-            let name = name.to_string();
+        if matches!(out[i].as_str(), "--var" | "-e") {
+            let name = out[i + 1]
+                .split_once('=')
+                .map(|(name, _)| name)
+                .unwrap_or("var");
             out[i + 1] = format!("{name}=***");
         }
+        if matches!(
+            out[i].as_str(),
+            "--header" | "--body" | "--content" | "--query" | "--build" | "--restart"
+        ) {
+            out[i + 1] = "***".to_string();
+        }
+    }
+    match out.first().map(String::as_str) {
+        Some("db") if out.len() > 3 => out[3] = "***".to_string(),
+        Some("ssh")
+            if out.get(1).is_some_and(|subcommand| subcommand == "exec") && out.len() > 3 =>
+        {
+            out[3] = "***".to_string()
+        }
+        Some("fleet") if out.get(1).is_some_and(|subcommand| subcommand == "exec") => {
+            let mut index = 2;
+            while index < out.len() {
+                match out[index].as_str() {
+                    "--servers" | "--group" => index += 2,
+                    "--all" | "--parallel" | "--sudo" => index += 1,
+                    _ => {
+                        out[index] = "***".to_string();
+                        break;
+                    }
+                }
+            }
+        }
+        Some("run") => {
+            if let Some(separator) = out.iter().position(|arg| arg == "--") {
+                for argument in &mut out[separator + 1..] {
+                    *argument = "***".to_string();
+                }
+            }
+        }
+        Some("mail") if out.get(1).is_some_and(|subcommand| subcommand == "send") => {
+            // The send command's positional body follows its recipient fields.
+            for arg in out.iter_mut().skip(2) {
+                if !arg.starts_with('-') && arg.contains('\n') {
+                    *arg = "***".to_string();
+                }
+            }
+        }
+        Some("cron")
+            if matches!(out.get(1).map(String::as_str), Some("add") | Some("remove"))
+                && out.len() > 3 =>
+        {
+            out[3] = "***".to_string()
+        }
+        _ => {}
     }
     out
 }
@@ -270,8 +321,16 @@ impl ToolerMcp {
             McpError::internal_error(format!("cannot resolve tooler binary: {e}"), None)
         })?;
 
-        argv.push("--output".to_string());
-        argv.push("json".to_string());
+        // Global flags must precede `--`, otherwise clap forwards them to `tooler run`'s
+        // script arguments rather than applying the JSON MCP response contract.
+        let separator = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(argv.len());
+        argv.splice(
+            separator..separator,
+            ["--output".to_string(), "json".to_string()],
+        );
 
         let mut cmd = tokio::process::Command::new(exe);
         cmd.args(&argv).env("NO_COLOR", "1");
@@ -279,15 +338,42 @@ impl ToolerMcp {
             cmd.current_dir(dir);
         }
 
-        let output = cmd
-            .output()
-            .await
+        use std::process::Stdio;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
             .map_err(|e| McpError::internal_error(format!("failed to launch tooler: {e}"), None))?;
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let stdout_task = tokio::spawn(read_limited(stdout));
+        let stderr_task = tokio::spawn(read_limited(stderr));
+        let status = match tokio::time::timeout(EXEC_TIMEOUT, child.wait()).await {
+            Ok(status) => status.map_err(|e| {
+                McpError::internal_error(format!("failed to wait for tooler: {e}"), None)
+            })?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                self.write_audit(&logged_argv, cwd, false, started.elapsed().as_millis());
+                return Err(McpError::internal_error(
+                    "tooler execution timed out after 60 seconds",
+                    None,
+                ));
+            }
+        };
+        let output_text = |task: tokio::task::JoinHandle<Result<String, std::io::Error>>| async move {
+            task.await
+                .map_err(|e| {
+                    McpError::internal_error(format!("failed to collect tooler output: {e}"), None)
+                })?
+                .map_err(|e| {
+                    McpError::internal_error(format!("failed to read tooler output: {e}"), None)
+                })
+        };
+        let stdout = output_text(stdout_task).await?;
+        let stderr = output_text(stderr_task).await?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-        let result = if output.status.success() {
+        let result = if status.success() {
             CallToolResult::success(vec![ContentBlock::text(stdout)])
         } else {
             let mut message = String::new();
@@ -301,7 +387,7 @@ impl ToolerMcp {
                 message.push_str(&stderr);
             }
             if message.is_empty() {
-                message = format!("tooler exited with status {}", output.status);
+                message = format!("tooler exited with status {status}");
             }
             CallToolResult::error(vec![ContentBlock::text(message)])
         };
@@ -309,7 +395,7 @@ impl ToolerMcp {
         self.write_audit(
             &logged_argv,
             cwd,
-            output.status.success(),
+            status.success(),
             started.elapsed().as_millis(),
         );
         Ok(result)
@@ -374,6 +460,7 @@ pub struct ToolerMcp {
     prompt_router: PromptRouter<ToolerMcp>,
     audit_log: Option<std::path::PathBuf>,
     policy: McpPolicy,
+    policy_load_error: Option<String>,
     playbook_tools: Vec<PlaybookTool>,
 }
 
@@ -396,9 +483,74 @@ fn discover_playbook_tools() -> Vec<PlaybookTool> {
         .collect()
 }
 
+fn validate_playbook_arguments(
+    schema: &serde_json::Map<String, serde_json::Value>,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "playbook tool has an invalid input schema".to_string())?;
+    for name in arguments.keys() {
+        if !properties.contains_key(name) {
+            return Err(format!("unknown playbook argument '{name}'"));
+        }
+    }
+    for required in schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        if !arguments.contains_key(required) {
+            return Err(format!("missing required playbook argument '{required}'"));
+        }
+    }
+    for (name, value) in arguments {
+        let property = &properties[name];
+        let type_matches = match property.get("type").and_then(serde_json::Value::as_str) {
+            Some("string") => value.is_string(),
+            Some("number") => value.is_number(),
+            Some("boolean") => value.is_boolean(),
+            _ => false,
+        };
+        if !type_matches {
+            return Err(format!("playbook argument '{name}' has the wrong type"));
+        }
+        if let Some(values) = property.get("enum").and_then(serde_json::Value::as_array)
+            && !values.contains(value)
+        {
+            return Err(format!(
+                "playbook argument '{name}' is not an allowed value"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl ToolerMcp {
     fn policy_error(&self, argv: &[String]) -> Option<String> {
+        if let Some(error) = &self.policy_load_error {
+            return Some(format!(
+                "MCP policy configuration could not be loaded; refusing execution: {error}"
+            ));
+        }
         let command = argv.first()?;
+        // Secret-bearing local files are intentionally a CLI-only capability. An MCP client
+        // can still use explicitly allowed operational tools, but it cannot accidentally
+        // stream a .env value or decrypted vault directly into an agent conversation.
+        if (command == "env" && matches!(argv.get(1).map(String::as_str), Some("get")))
+            || (command == "env"
+                && argv.get(1).is_some_and(|subcommand| subcommand == "show")
+                && argv.iter().any(|argument| argument == "--reveal"))
+            || (command == "vault" && argv.get(1).is_some_and(|subcommand| subcommand == "view"))
+        {
+            return Some(
+                "MCP does not expose plaintext local secrets; use the local CLI directly"
+                    .to_string(),
+            );
+        }
         if !self.policy.allowed_commands.is_empty()
             && !self
                 .policy
@@ -412,6 +564,16 @@ impl ToolerMcp {
         }
         if self.policy.allowed_servers.is_empty() {
             return None;
+        }
+        if command == "server"
+            || (command == "config"
+                && matches!(argv.get(1).map(String::as_str), Some("set") | Some("unset"))
+                && argv.get(2).is_some_and(|key| key.starts_with("server.")))
+        {
+            return Some(
+                "MCP policy denies server-profile mutation while mcp.allowed_servers is configured"
+                    .to_string(),
+            );
         }
         // Playbook task targets may be templated, included, or supplied by dynamic loops.
         // Do not claim an allowlist protects execution that cannot be fully authorized here.
@@ -445,6 +607,10 @@ impl ToolerMcp {
     }
 
     pub fn new() -> Self {
+        let (policy, policy_load_error) = match crate::config::load() {
+            Ok(config) => (config.mcp, None),
+            Err(error) => (McpPolicy::default(), Some(error.to_string())),
+        };
         Self {
             tool_router: Self::tool_router_core()
                 + Self::tool_router_play()
@@ -454,9 +620,8 @@ impl ToolerMcp {
                 + Self::tool_router_admin(),
             prompt_router: Self::prompt_router(),
             audit_log: None,
-            policy: crate::config::load()
-                .map(|config| config.mcp)
-                .unwrap_or_default(),
+            policy,
+            policy_load_error,
             playbook_tools: discover_playbook_tools(),
         }
     }
@@ -565,6 +730,8 @@ impl ServerHandler for ToolerMcp {
         {
             let mut argv = vec!["play".to_string(), pb.file.to_string_lossy().to_string()];
             let args = request.arguments.unwrap_or_default();
+            validate_playbook_arguments(&pb.tool.input_schema, &args)
+                .map_err(|message| McpError::invalid_params(message, None))?;
             let mut allow_confirm = false;
             for (k, v) in &args {
                 if k == "confirm" {

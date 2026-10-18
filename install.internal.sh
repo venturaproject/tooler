@@ -3,7 +3,7 @@ set -e
 
 # ── config ────────────────────────────────────────────────────────────────────
 BIN_NAME="tooler"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${TOOLER_INSTALL_DIR:-/usr/local/bin}"
 BASE_URL="https://internal.empresa.com/cli/releases"
 VERSION_URL="https://internal.empresa.com/cli/version"
 
@@ -73,8 +73,11 @@ fi
 chmod +x "$TMP"
 
 # ── install ───────────────────────────────────────────────────────────────────
-if [ -w "$INSTALL_DIR" ] || sudo -n true 2>/dev/null; then
-  sudo mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+if [ -w "$INSTALL_DIR" ]; then
+  mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+  echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
+elif command -v sudo >/dev/null 2>&1 && sudo -v; then
+  sudo install -m 755 "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
   echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
 else
   LOCAL_BIN="$HOME/.local/bin"

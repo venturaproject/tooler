@@ -163,7 +163,7 @@ fn dry_env(ctx: &Context) -> RunEnv<'_> {
         state_path: None,
         data_path: None,
         keep_checkpoint: false,
-        lock_path: None,
+        defer_state_persistence: false,
         ctx,
     }
 }
@@ -1398,6 +1398,26 @@ fn load_persisted_state_reads_a_real_file() {
     std::fs::write(&path, r#"{"last_uid": "42"}"#).unwrap();
     let state = load_persisted_state(&path).unwrap();
     assert_eq!(state.get("last_uid"), Some(&"42".to_string()));
+}
+
+#[test]
+fn persisted_state_updates_merge_without_losing_existing_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("playbook.yml.data.json");
+    std::fs::write(&path, r#"{"existing":"one"}"#).unwrap();
+    let ctx = Context::new(
+        OutputFormat::Json,
+        "default".to_string(),
+        crate::config::Config::default(),
+    );
+    let env = RunEnv {
+        data_path: Some(path.clone()),
+        ..dry_env(&ctx)
+    };
+    write_persisted_state(&env, &vars(&[("state.added", "two")])).unwrap();
+    let state = load_persisted_state(&path).unwrap();
+    assert_eq!(state.get("existing"), Some(&"one".to_string()));
+    assert_eq!(state.get("added"), Some(&"two".to_string()));
 }
 
 #[test]

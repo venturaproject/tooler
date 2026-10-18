@@ -181,30 +181,23 @@ pub(crate) struct RunMcpArgs {
 
 /// A short-lived temp file backing `PlayMcpArgs.content` -- deleted on drop, so an
 /// inline playbook never lingers on disk past the one `tooler_play` call that used it.
-/// Not backed by the `tempfile` crate (only a dev-dependency in this project): just
-/// `std::env::temp_dir()` plus a name unique enough not to collide with a concurrent
-/// MCP call (pid + a nanosecond timestamp).
-pub(crate) struct TempPlaybookFile(pub(crate) PathBuf);
+/// Backed by an atomically-created private tempfile, so an inline playbook cannot follow
+/// a pre-existing path or symlink in the shared system temp directory.
+pub(crate) struct TempPlaybookFile(pub(crate) tempfile::NamedTempFile);
 
 impl TempPlaybookFile {
     pub(crate) fn write(content: &str) -> std::io::Result<Self> {
-        let name = format!(
-            "tooler-play-inline-{}-{}.yml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        );
-        let path = std::env::temp_dir().join(name);
-        std::fs::write(&path, content)?;
-        Ok(Self(path))
+        use std::io::Write;
+        let mut file = tempfile::Builder::new()
+            .prefix("tooler-play-inline-")
+            .suffix(".yml")
+            .tempfile()?;
+        file.write_all(content.as_bytes())?;
+        Ok(Self(file))
     }
-}
 
-impl Drop for TempPlaybookFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.0.path()
     }
 }
 
@@ -213,22 +206,17 @@ impl Drop for TempPlaybookFile {
 /// stray path a caller passed by mistake) before ever reading, writing, or deleting it.
 pub(crate) const SESSION_FILE_PREFIX: &str = "tooler-play-session-";
 
-/// Builds a new session file's path (not yet created on disk -- `tooler_play_repl_open`
-/// writes it) -- pid + a nanosecond timestamp, same uniqueness scheme
-/// `TempPlaybookFile` already uses, so two sessions opened in the same process tick
-/// still can't collide. Unlike `TempPlaybookFile`, nothing here auto-deletes on drop --
-/// a session must outlive any single tool call, so `tooler_play_repl_close` deletes it
-/// explicitly instead.
-pub(crate) fn new_session_path() -> PathBuf {
-    let name = format!(
-        "{SESSION_FILE_PREFIX}{}-{}.yml",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
-    );
-    std::env::temp_dir().join(name)
+/// Creates and persists a private session file. Unlike `TempPlaybookFile`, it must outlive
+/// one call, so `tooler_play_repl_close` deletes it explicitly.
+pub(crate) fn create_session_file(content: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix(SESSION_FILE_PREFIX)
+        .suffix(".yml")
+        .tempfile()?;
+    file.write_all(content.as_bytes())?;
+    let (_file, path) = file.keep()?;
+    Ok(path)
 }
 
 /// Validates a caller-supplied `session_id` is really a path to one of our own session
@@ -241,10 +229,19 @@ pub(crate) fn validate_session_path(session_id: &str) -> Result<PathBuf, McpErro
     let right_prefix = path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with(SESSION_FILE_PREFIX));
+        .is_some_and(|n| n.starts_with(SESSION_FILE_PREFIX) && n.ends_with(".yml"));
     if !in_temp_dir || !right_prefix {
         return Err(McpError::invalid_params(
             "session_id is not a value returned by tooler_play_repl_open",
+            None,
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+        McpError::invalid_params("session_id is not an open MCP play session", None)
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(McpError::invalid_params(
+            "session_id is not an open MCP play session",
             None,
         ));
     }

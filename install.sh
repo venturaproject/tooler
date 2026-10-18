@@ -3,7 +3,7 @@ set -e
 
 REPO="venturaproject/tooler"
 BIN_NAME="tooler"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${TOOLER_INSTALL_DIR:-/usr/local/bin}"
 
 # ── detect OS ────────────────────────────────────────────────────────────────
 OS="$(uname -s)"
@@ -73,9 +73,12 @@ fi
 chmod +x "$TMP"
 
 # ── install ───────────────────────────────────────────────────────────────────
-# Try /usr/local/bin first; fall back to ~/.local/bin if no sudo access
-if [ -w "$INSTALL_DIR" ] || sudo -n true 2>/dev/null; then
-  sudo mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+# Try /usr/local/bin first; fall back to ~/.local/bin when elevation is unavailable.
+if [ -w "$INSTALL_DIR" ]; then
+  mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+  echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
+elif command -v sudo >/dev/null 2>&1 && sudo -v; then
+  sudo install -m 755 "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
   echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
 else
   LOCAL_BIN="$HOME/.local/bin"

@@ -213,7 +213,7 @@ pub(crate) fn execute_playbook(
                 duration_ms: 0,
             });
             if is_top_level && !env.dry {
-                write_checkpoint(env, &playbook.name, &task.name, vars);
+                write_checkpoint(env, &playbook.name, &task.name, vars)?;
             }
             continue;
         }
@@ -260,7 +260,7 @@ pub(crate) fn execute_playbook(
                 });
             }
             if is_top_level && !env.dry {
-                write_checkpoint(env, &playbook.name, &task.name, vars);
+                write_checkpoint(env, &playbook.name, &task.name, vars)?;
             }
             continue;
         }
@@ -366,10 +366,6 @@ pub(crate) fn execute_playbook(
                             })
                         );
                         if is_top_level {
-                            // Drop is skipped by process::exit — release the lock by hand.
-                            if let Some(p) = &env.lock_path {
-                                let _ = std::fs::remove_file(p);
-                            }
                             std::process::exit(1);
                         }
                         bail!("playbook failed");
@@ -398,7 +394,7 @@ pub(crate) fn execute_playbook(
         // failure) — a hard failure already returned/exited inside the match. Never
         // checkpoints in --dry, since dry mode does no real work to resume from.
         if is_top_level && !env.dry {
-            write_checkpoint(env, &playbook.name, &task.name, vars);
+            write_checkpoint(env, &playbook.name, &task.name, vars)?;
         }
     }
 
@@ -621,9 +617,6 @@ pub(crate) fn run_notified_handlers(
                         })
                     );
                     if is_top_level {
-                        if let Some(p) = &env.lock_path {
-                            let _ = std::fs::remove_file(p);
-                        }
                         std::process::exit(1);
                     }
                     bail!("playbook failed");
@@ -844,19 +837,26 @@ pub(crate) fn run_loop_parallel(
     let mut failures: Vec<String> = Vec::new();
     let mut index = 0usize;
     for chunk in units.chunks(chunk_size) {
-        let results: Vec<Result<Option<String>>> = std::thread::scope(|scope| {
+        type WorkerResult = Result<(Option<String>, HashMap<String, String>)>;
+        let results: Vec<WorkerResult> = std::thread::scope(|scope| {
             let handles: Vec<_> = chunk
                 .iter()
                 .map(|unit| {
                     let mut loop_vars = vars.clone();
                     let mut stack = include_stack.to_vec();
                     apply_loop_unit(unit, &mut loop_vars, env.quiet);
+                    let worker_env = RunEnv {
+                        defer_state_persistence: true,
+                        ..env.clone()
+                    };
                     scope.spawn(move || {
-                        run_task_once_with_retries(task, &mut loop_vars, &mut stack, env)?;
-                        Ok(task
-                            .register
-                            .as_ref()
-                            .and_then(|r| loop_vars.get(r).cloned()))
+                        run_task_once_with_retries(task, &mut loop_vars, &mut stack, &worker_env)?;
+                        Ok((
+                            task.register
+                                .as_ref()
+                                .and_then(|r| loop_vars.get(r).cloned()),
+                            loop_vars,
+                        ))
                     })
                 })
                 .collect();
@@ -865,7 +865,17 @@ pub(crate) fn run_loop_parallel(
         for (unit, r) in chunk.iter().zip(results) {
             index += 1;
             match r {
-                Ok(val) => {
+                Ok((val, worker_vars)) => {
+                    let updates: HashMap<_, _> = worker_vars
+                        .into_iter()
+                        .filter(|(key, value)| {
+                            key.starts_with("state.") && vars.get(key) != Some(value)
+                        })
+                        .collect();
+                    vars.extend(updates.clone());
+                    if !env.dry && !env.defer_state_persistence {
+                        write_persisted_state(env, &updates)?;
+                    }
                     if let Some(v) = &val {
                         all_registered.push(v.clone());
                     }
@@ -940,10 +950,17 @@ pub(crate) fn run_parallel_block(
         for (child, r) in chunk.iter().zip(results) {
             let child_vars =
                 r.with_context(|| format!("parallel: child task '{}' failed", child.name))?;
+            let mut state_updates = HashMap::new();
             for (k, v) in child_vars {
                 if before.get(&k) != Some(&v) {
+                    if k.starts_with("state.") {
+                        state_updates.insert(k.clone(), v.clone());
+                    }
                     vars.insert(k, v);
                 }
+            }
+            if !env.dry && !env.defer_state_persistence {
+                write_persisted_state(env, &state_updates)?;
             }
         }
     }

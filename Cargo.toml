@@ -1,7 +1,8 @@
 [package]
 name = "tooler"
-version = "0.6.6"
+version = "0.6.7"
 edition = "2024"
+rust-version = "1.88"
 description = "A modular CLI toolkit"
 authors = ["Antonio Ventura <antonioventura.j@gmail.com>"]
 license = "MIT"
@@ -36,7 +37,7 @@ schemars = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-std", "net"] }
 axum = "0.8"
 printpdf = "0.8"
-rust_xlsxwriter = "0.89"
+rust_xlsxwriter = "0.100"
 scraper = "0.27.0"
 rustyline = "18.0.1"
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "hostname", "pool", "rustls-tls"] }

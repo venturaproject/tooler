@@ -57,7 +57,9 @@ Downloads a prebuilt binary for your OS and architecture:
 curl -fsSL https://raw.githubusercontent.com/venturaproject/tooler/main/install.sh | sh
 ```
 
-Supports: macOS (Intel + Apple Silicon), Linux (x86\_64 + arm64).
+Supports: macOS (Intel + Apple Silicon) and Linux (x86\_64 + arm64). Linux release assets are dynamically linked against glibc; use a compatible glibc distribution, or build from source on Alpine/musl and older distributions.
+
+Windows has a published x86\_64 `.exe`, but no public PowerShell installer yet. Download `tooler-windows-x86_64.exe` and `SHA256SUMS.txt` from the [latest release](https://github.com/venturaproject/tooler/releases/latest), verify the checksum, then place the executable on your `PATH`.
 
 To install a specific version:
 
@@ -90,9 +92,9 @@ source "$HOME/.cargo/env"
 
 | Method | Requirement |
 |---|---|
-| curl install | nothing — binary is self-contained |
-| cargo install | Rust 1.70+ and Cargo |
-| Build from source | Rust 1.70+ and Cargo |
+| curl install | macOS, or Linux with compatible glibc |
+| cargo install | Rust 1.88+ and Cargo |
+| Build from source | Rust 1.88+ and Cargo |
 
 Supported platforms: macOS, Linux, Windows.
 

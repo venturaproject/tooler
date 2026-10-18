@@ -376,6 +376,7 @@ pub(crate) fn print_tag_list(tasks: &[&Task], ctx: &Context) -> Result<()> {
 /// bundled into one struct because the parameter list (playbook_dir, project_root, dry,
 /// quiet, ctx, plus mutable vars/include_stack passed alongside) got too long to stay
 /// readable as positional args once `register:`/`include:` needed threading through too.
+#[derive(Clone)]
 pub(crate) struct RunEnv<'a> {
     pub(crate) playbook_dir: PathBuf,
     /// This playbook's `name:` (the outer one's, for `--repl` without a file: `"repl"`).
@@ -418,11 +419,9 @@ pub(crate) struct RunEnv<'a> {
     /// run. Only ever matters when `state_path.is_some()`, so same top-level-only scope
     /// as `state_path`/`start_at`/`data_path`.
     pub(crate) keep_checkpoint: bool,
-    /// The `single_instance:` lock file (`<file>.lock`) to clean up right before the two
-    /// JSON-mode `std::process::exit(1)` paths, which bypass `LockGuard`'s `Drop`.
-    /// `Some(...)` only when the top-level playbook set `single_instance: true` and this
-    /// isn't a `--dry` run; `None` otherwise (and always for an `include:`'s `sub_env`).
-    pub(crate) lock_path: Option<PathBuf>,
+    /// Parallel workers defer durable `state_set:` writes until the parent merges their
+    /// vars in declaration order.
+    pub(crate) defer_state_persistence: bool,
     pub(crate) ctx: &'a Context,
 }
 
@@ -570,7 +569,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
             state_path: None,
             data_path: None,
             keep_checkpoint: args.keep_checkpoint,
-            lock_path: None,
+            defer_state_persistence: false,
             ctx,
         };
         return run_repl(vars, env);
@@ -716,14 +715,13 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
 
     // single_instance: take the lock before any task runs. Real runs only — a --dry
     // inspection or a run of a playbook that didn't opt in never touches the lock. The
-    // guard releases it on every return/panic from here on; env.lock_path covers the two
-    // JSON-mode process::exit(1) paths that skip Drop.
-    let (lock_guard, lock_path) = if playbook.single_instance && !args.dry {
+    // The OS releases the advisory lock on every process exit, including the two JSON-mode
+    // `process::exit(1)` paths that bypass Rust destructors.
+    let lock_guard = if playbook.single_instance && !args.dry {
         let guard = acquire_lock(&file_path, &playbook.name, playbook.lock_timeout)?;
-        let p = guard.0.clone();
-        (Some(guard), Some(p))
+        Some(guard)
     } else {
-        (None, None)
+        None
     };
 
     let mut include_stack: Vec<PathBuf> = vec![file_path];
@@ -740,7 +738,7 @@ pub fn run(args: PlayArgs, ctx: &Context) -> Result<()> {
         state_path: Some(state_path),
         data_path: Some(data_path),
         keep_checkpoint: args.keep_checkpoint,
-        lock_path,
+        defer_state_persistence: false,
         ctx,
     };
 

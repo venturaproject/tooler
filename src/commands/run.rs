@@ -121,25 +121,30 @@ fn exec_script(
         return Ok(());
     }
 
-    let status = crate::commands::shell::command(&full_cmd)
-        .current_dir(root)
-        .status()?;
-
     if json {
+        let output = crate::commands::shell::command(&full_cmd)
+            .current_dir(root)
+            .output()?;
         println!(
             "{}",
             serde_json::json!({
                 "script": name,
                 "command": full_cmd,
-                "success": status.success(),
-                "exit_code": status.code(),
+                "success": output.status.success(),
+                "exit_code": output.status.code(),
+                "stdout": String::from_utf8_lossy(&output.stdout),
+                "stderr": String::from_utf8_lossy(&output.stderr),
             })
         );
-        if !status.success() {
+        if !output.status.success() {
             std::process::exit(1);
         }
         return Ok(());
     }
+
+    let status = crate::commands::shell::command(&full_cmd)
+        .current_dir(root)
+        .status()?;
 
     if !status.success() {
         bail!(
