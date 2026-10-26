@@ -68,7 +68,7 @@ PowerShell installer (user-local, verifies SHA256 before installing):
 irm https://raw.githubusercontent.com/venturaproject/tooler/main/install.ps1 | iex
 ```
 
-Set `$env:TOOLER_VERSION = 'v0.6.8'` before running it to install a pinned version.
+Set `$env:TOOLER_VERSION = 'v1.0.0'` before running it to install a pinned version.
 
 To install a specific version:
 
