@@ -2,6 +2,8 @@
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+grep -Fq 'Get-FileHash -Algorithm SHA256' "$ROOT/install.ps1"
+grep -Fq 'SHA256SUMS.txt' "$ROOT/install.ps1"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 MOCK="$WORK/mock"
