@@ -68,6 +68,14 @@ struct CheckSpec {
     timeout: Option<u64>,
     #[serde(default)]
     expected_status: Option<u16>,
+    #[serde(default = "one")]
+    failure_threshold: u32,
+    #[serde(default = "one")]
+    recovery_threshold: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -93,9 +101,15 @@ struct CheckState {
     since: String,
     last_run_at: String,
     last_error: Option<String>,
+    #[serde(default)]
+    failure_count: u32,
+    #[serde(default)]
+    recovery_count: u32,
+    #[serde(default)]
+    last_duration_ms: u128,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Status {
     Ok,
@@ -106,8 +120,41 @@ enum Status {
 struct CheckResult {
     id: String,
     status: Status,
+    probe_status: Status,
     error: Option<String>,
     transition: Option<&'static str>,
+    duration_ms: u128,
+    failure_count: u32,
+    recovery_count: u32,
+}
+
+fn status_after_probe(
+    prior: Option<&CheckState>,
+    probe_ok: bool,
+    spec: &CheckSpec,
+) -> (Status, u32, u32, Option<&'static str>) {
+    let prior_status = prior.map(|state| state.status).unwrap_or(Status::Ok);
+    let failure_count = if probe_ok {
+        0
+    } else {
+        prior.map_or(1, |s| s.failure_count.saturating_add(1))
+    };
+    let recovery_count = if probe_ok && prior_status == Status::Failing {
+        prior.map_or(1, |s| s.recovery_count.saturating_add(1))
+    } else {
+        0
+    };
+    let status = match prior_status {
+        Status::Ok if !probe_ok && failure_count >= spec.failure_threshold => Status::Failing,
+        Status::Failing if probe_ok && recovery_count >= spec.recovery_threshold => Status::Ok,
+        value => value,
+    };
+    let transition = match (prior.map(|s| s.status), status) {
+        (Some(Status::Ok), Status::Failing) | (None, Status::Failing) => Some("failing"),
+        (Some(Status::Failing), Status::Ok) => Some("recovered"),
+        _ => None,
+    };
+    (status, failure_count, recovery_count, transition)
 }
 
 fn state_path_for(file: &Path) -> PathBuf {
@@ -218,6 +265,9 @@ fn run_file_once(file: &Path, state_override: Option<&Path>, dry: bool) -> Resul
     let mut seen = std::collections::HashSet::new();
     for check in &monitor.checks {
         validate_check(check)?;
+        if check.failure_threshold == 0 || check.recovery_threshold == 0 {
+            bail!("check '{}' thresholds must be at least 1", check.id);
+        }
         if !seen.insert(&check.id) {
             bail!(
                 "monitor '{}' has duplicate check id '{}'",
@@ -249,44 +299,54 @@ fn run_file_once(file: &Path, state_override: Option<&Path>, dry: bool) -> Resul
     let now = chrono::Utc::now().to_rfc3339();
     let mut results = Vec::new();
     for check in &monitor.checks {
-        let (status, error) = match probe(check) {
-            Ok(()) => (Status::Ok, None),
-            Err(error) => (Status::Failing, Some(error.to_string())),
+        let probe_started = std::time::Instant::now();
+        let error = match probe(check) {
+            Ok(()) => None,
+            Err(error) => Some(error.to_string()),
         };
-        let prior = state.checks.get(&check.id).map(|s| s.status);
-        let transition = match (prior, status) {
-            (Some(Status::Ok), Status::Failing) | (None, Status::Failing) => Some("failing"),
-            (Some(Status::Failing), Status::Ok) => Some("recovered"),
-            _ => None,
+        let duration_ms = probe_started.elapsed().as_millis();
+        let prior_state = state.checks.get(&check.id);
+        let prior_status = prior_state.map(|s| s.status);
+        let (confirmed_status, failure_count, recovery_count, transition) =
+            status_after_probe(prior_state, error.is_none(), check);
+        let since = if prior_status == Some(confirmed_status) {
+            prior_state
+                .map(|s| s.since.clone())
+                .unwrap_or_else(|| now.clone())
+        } else {
+            now.clone()
         };
         state.checks.insert(
             check.id.clone(),
             CheckState {
-                status,
-                since: if prior == Some(status) {
-                    state
-                        .checks
-                        .get(&check.id)
-                        .map(|s| s.since.clone())
-                        .unwrap_or_else(|| now.clone())
-                } else {
-                    now.clone()
-                },
+                status: confirmed_status,
+                since,
                 last_run_at: now.clone(),
                 last_error: error.clone(),
+                failure_count,
+                recovery_count,
+                last_duration_ms: duration_ms,
             },
         );
         results.push(CheckResult {
             id: check.id.clone(),
-            status,
+            status: confirmed_status,
+            probe_status: if error.is_none() {
+                Status::Ok
+            } else {
+                Status::Failing
+            },
             error,
             transition,
+            duration_ms,
+            failure_count,
+            recovery_count,
         });
         if let Some(event) = transition {
             state.pending_notifications.push(PendingNotification {
                 id: check.id.clone(),
                 event: event.to_string(),
-                status,
+                status: confirmed_status,
                 error: results.last().and_then(|result| result.error.clone()),
                 at: now.clone(),
             });
@@ -303,7 +363,7 @@ fn run_file_once(file: &Path, state_override: Option<&Path>, dry: bool) -> Resul
         }
         save_state(&state_path, &state)?;
     }
-    let success = results.iter().all(|r| r.status == Status::Ok);
+    let success = results.iter().all(|r| r.error.is_none());
     let output = serde_json::json!({
         "monitor": monitor.name,
         "state": state_path,
@@ -327,6 +387,8 @@ mod tests {
             port: None,
             timeout: None,
             expected_status: None,
+            failure_threshold: 1,
+            recovery_threshold: 1,
         };
         assert!(validate_check(&valid).is_ok());
         let invalid = CheckSpec {
@@ -336,6 +398,8 @@ mod tests {
             port: None,
             timeout: None,
             expected_status: None,
+            failure_threshold: 1,
+            recovery_threshold: 1,
         };
         assert!(validate_check(&invalid).is_err());
     }
@@ -357,5 +421,57 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(restored.pending_notifications.len(), 1);
         assert_eq!(restored.pending_notifications[0].event, "failing");
+    }
+
+    #[test]
+    fn thresholds_require_consecutive_failures_and_recoveries() {
+        let spec = CheckSpec {
+            id: "api".into(),
+            url: Some("https://example.test".into()),
+            host: None,
+            port: None,
+            timeout: None,
+            expected_status: None,
+            failure_threshold: 2,
+            recovery_threshold: 2,
+        };
+        let (status, failures, recoveries, transition) = status_after_probe(None, false, &spec);
+        assert_eq!(status, Status::Ok);
+        assert_eq!(failures, 1);
+        assert_eq!(transition, None);
+        let failing = CheckState {
+            status,
+            since: "now".into(),
+            last_run_at: "now".into(),
+            last_error: Some("down".into()),
+            failure_count: failures,
+            recovery_count: recoveries,
+            last_duration_ms: 1,
+        };
+        let (status, failures, _, transition) = status_after_probe(Some(&failing), false, &spec);
+        assert_eq!(status, Status::Failing);
+        assert_eq!(failures, 2);
+        assert_eq!(transition, Some("failing"));
+        let recovered_once = CheckState {
+            status,
+            since: "then".into(),
+            last_run_at: "then".into(),
+            last_error: None,
+            failure_count: failures,
+            recovery_count: 0,
+            last_duration_ms: 1,
+        };
+        let (status, _, recoveries, transition) =
+            status_after_probe(Some(&recovered_once), true, &spec);
+        assert_eq!(status, Status::Failing);
+        assert_eq!(recoveries, 1);
+        assert_eq!(transition, None);
+        let recovered_twice = CheckState {
+            recovery_count: recoveries,
+            ..recovered_once
+        };
+        let (status, _, _, transition) = status_after_probe(Some(&recovered_twice), true, &spec);
+        assert_eq!(status, Status::Ok);
+        assert_eq!(transition, Some("recovered"));
     }
 }

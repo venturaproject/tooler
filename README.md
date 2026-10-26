@@ -15,6 +15,7 @@
   - [tooler jobs](#tooler-jobs)
   - [tooler check](#tooler-check)
   - [tooler monitor](#tooler-monitor)
+  - [tooler history](#tooler-history)
   - [tooler oauth](#tooler-oauth)
   - [tooler json](#tooler-json)
    - [tooler run](#tooler-run)
@@ -59,7 +60,15 @@ curl -fsSL https://raw.githubusercontent.com/venturaproject/tooler/main/install.
 
 Supports: macOS (Intel + Apple Silicon) and Linux (x86\_64 + arm64). Linux release assets are dynamically linked against glibc; use a compatible glibc distribution, or build from source on Alpine/musl and older distributions.
 
-Windows has a published x86\_64 `.exe`, but no public PowerShell installer yet. Download `tooler-windows-x86_64.exe` and `SHA256SUMS.txt` from the [latest release](https://github.com/venturaproject/tooler/releases/latest), verify the checksum, then place the executable on your `PATH`.
+Windows has a published x86\_64 `.exe` and a PowerShell installer that verifies the checksum before installing.
+
+PowerShell installer (user-local, verifies SHA256 before installing):
+
+```powershell
+irm https://raw.githubusercontent.com/venturaproject/tooler/main/install.ps1 | iex
+```
+
+Set `$env:TOOLER_VERSION = 'v0.6.8'` before running it to install a pinned version.
 
 To install a specific version:
 
@@ -165,7 +174,22 @@ tooler env list .env                      # list keys only
 tooler env get DATABASE_URL .env          # get a single value
 tooler env diff .env .env.example         # keys present in one but not the other
 tooler env check .env.example .env        # verify .env has all keys from .env.example
+tooler env validate env.schema.yml .env   # validate required values and types (never prints values)
 ```
+
+Schema example (`env.schema.yml`):
+
+```yaml
+variables:
+  API_URL: {type: url}
+  PORT: {type: integer, min: 1, max: 65535}
+  DEBUG: {type: boolean, required: false}
+  ENVIRONMENT: {enum: [development, staging, production]}
+```
+
+Supported types are `string` (default), `integer`, `number`, `boolean`, and absolute `url`;
+`min`/`max` apply to numeric types, `enum` restricts allowed literal values, and `non_empty: true`
+rejects blank strings. Errors report variable names and issues only, never the configured values.
 
 ---
 
@@ -305,6 +329,8 @@ checks:
     url: https://staging.example.com/health
     expected_status: 200
     timeout: 10
+    failure_threshold: 2 # require two consecutive failures before alerting
+    recovery_threshold: 2 # require two successes before sending recovery
   - id: postgres
     host: db.internal
     port: 5432
@@ -318,7 +344,31 @@ tooler monitor watch monitors/staging.yml --interval 30
 tooler cron local add "*/5 * * * * /usr/local/bin/tooler monitor run /srv/app/monitors/staging.yml"
 ```
 
-Webhook payloads contain the monitor name, check id, event (`failing` or `recovered`), status, error and timestamp. Treat the definition file as sensitive if its webhook URL includes a credential. A new failing check alerts immediately; a first successful run is silent.
+Webhook payloads contain the monitor name, check id, event (`failing` or `recovered`), status, error and timestamp. Treat the definition file as sensitive if its webhook URL includes a credential. A first successful run is silent; with the default threshold of `1`, a new failure alerts immediately.
+Thresholds default to `1`, preserving immediate transitions. Results include probe duration,
+consecutive counts, the raw `probe_status`, and thresholded `status`; state and alert transitions
+only change after the configured threshold is reached.
+
+---
+
+### tooler history
+
+Browse a local, unified history of operational command runs. Tooler records the command family,
+start time, success/failure and duration for HTTP, checks, monitors, playbooks, tasks, SSH,
+database, systemd, cron, deploy, fleet and mail commands. It deliberately does **not** store
+arguments, commands, request contents, environment variables or secrets. The SQLite database is
+kept at `~/.tooler/history.sqlite3` (or under `TOOLER_HOME`), with the most recent 10,000 runs
+retained.
+
+```sh
+tooler history
+tooler history --command deploy --limit 50
+tooler history --failed --output json
+```
+
+This history is diagnostic, not operational state: removing the database only removes the
+history. Monitor state, task fingerprints, playbook checkpoints and credentials remain in their
+existing files/keychain.
 
 ---
 
@@ -426,6 +476,7 @@ tooler task --graph test            # show the dependency graph
 tooler task --dot test              # emit Graphviz DOT
 tooler task --force test            # rerun the requested target
 tooler task --force-deps test       # rerun its entire dependency closure
+tooler task --hash test              # opt into content fingerprints instead of mtimes
 tooler task --history               # show recent local runs
 tooler task --schedule list
 tooler task --schedule install --schedule-name nightly-test
@@ -437,6 +488,9 @@ successful command must create every output. The task is current only when all o
 and none of its inputs or dependency outputs is newer. Run history is stored locally at
 `.tooler/task-history.jsonl`; task state and locks are ignored by Git. Local schedules use the
 existing system crontab and are unavailable on Windows.
+`--hash` stores SHA-256 fingerprints in `.tooler/task-fingerprints.json` and detects input or
+output content changes even when modification times are preserved. The default remains the
+faster timestamp check.
 
 ---
 
@@ -514,6 +568,14 @@ run in Tooler's Rust runtime, with no Python dependency. It never merges or depl
 **`--keep-checkpoint`** skips that automatic deletion on success, combined with `--resume` or on a fresh run — for anything that wants to keep resuming the *same* checkpoint across several separate, individually-successful `tooler play` invocations instead of just recovering from one failure. This is what the incremental MCP sessions below are built on.
 
 **Persistent state (`state_set:` + `{{state.*}}`)** is the durable counterpart to `--resume`'s checkpoint — deliberately a *different* file (`<file>.data.json`, never auto-deleted) for a different purpose: `--resume` restores one specific failed run; `state_set:` carries memory forward across many separate *successful* runs, e.g. a `tooler cron local`-scheduled playbook remembering "the last row ID processed" or "already sent today's report" without abusing IMAP's `\Seen` flag or a DB write for bookkeeping unrelated to the DB itself.
+
+#### AI Factory pilot: GitHub issue → reviewed pull request
+
+Tooler's human-supervised issue-to-PR workflow supports OpenCode, Claude Code, and custom
+agent adapters. Its safety gates, setup, staged usage, recovery procedure, and limitations
+are documented in the **[AI Factory guide](docs/ai-factory.md)**. The playbook is
+[`playbooks/ai-factory.yml`](playbooks/ai-factory.yml); orchestration and adapter integration
+run in Tooler's Rust runtime, with no Python dependency. It never merges or deploys.
 
 ```yaml
 tasks:

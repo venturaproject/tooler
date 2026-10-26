@@ -49,6 +49,7 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 base64 = "0.22"
 sha2 = "0.10"
+rusqlite = { version = "0.38", features = ["bundled"] }
 sha1 = "0.10"
 md-5 = "0.10"
 hmac = "0.12"

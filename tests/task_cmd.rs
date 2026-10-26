@@ -80,3 +80,24 @@ fn json_output_stays_a_single_document() {
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value["success"], true);
 }
+
+#[test]
+fn hash_mode_caches_fingerprints_and_detects_modified_outputs() {
+    let (mut cmd, dir) = tooler();
+    write_taskfile(dir.path());
+    cmd.args(["task", "--hash"]).assert().success();
+    assert!(dir.path().join(".tooler/task-fingerprints.json").is_file());
+
+    let mut cmd = tooler_in(dir.path());
+    let second = stdout_of(cmd.args(["task", "--hash"]).assert().success());
+    assert!(second.contains("content fingerprints match"));
+
+    std::fs::write(dir.path().join("build.txt"), "tampered output").unwrap();
+    let mut cmd = tooler_in(dir.path());
+    let third = stdout_of(cmd.args(["task", "--hash"]).assert().success());
+    assert!(third.contains("output content changed"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("build.txt")).unwrap(),
+        "built\n"
+    );
+}

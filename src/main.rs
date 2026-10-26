@@ -5,6 +5,7 @@ mod config;
 mod context;
 mod db;
 mod factory;
+mod history;
 mod oauth;
 mod output;
 mod project;
@@ -29,7 +30,23 @@ fn main() -> Result<()> {
 
     let ctx = Context::new(output, cli.profile, cfg);
 
-    match cli.command {
+    let tracked_command = match &cli.command {
+        Commands::Http(_) => Some("http"),
+        Commands::Check(_) => Some("check"),
+        Commands::Monitor(_) => Some("monitor"),
+        Commands::Play(_) => Some("play"),
+        Commands::Task(_) => Some("task"),
+        Commands::Ssh(_) => Some("ssh"),
+        Commands::Db(_) => Some("db"),
+        Commands::Systemd(_) => Some("systemd"),
+        Commands::Cron(_) => Some("cron"),
+        Commands::Deploy(_) => Some("deploy"),
+        Commands::Fleet(_) => Some("fleet"),
+        Commands::Mail(_) => Some("mail"),
+        _ => None,
+    };
+    let started = std::time::Instant::now();
+    let result = match cli.command {
         Commands::Info(args) => commands::info::run(args, &ctx),
         Commands::Echo(args) => commands::echo::run(args, &ctx),
         Commands::Json(args) => commands::json::run(args, &ctx),
@@ -65,5 +82,12 @@ fn main() -> Result<()> {
         Commands::Group(args) => commands::group::run(args, &ctx),
         Commands::Mail(args) => commands::mail::run(args, &ctx),
         Commands::Vault(args) => commands::vault::run(args, &ctx),
+        Commands::History(args) => commands::history::run(args, &ctx),
+    };
+    if let Some(command) = tracked_command
+        && let Err(error) = history::record(command, result.is_ok(), started.elapsed())
+    {
+        eprintln!("tooler: could not record command history: {error:#}");
     }
+    result
 }

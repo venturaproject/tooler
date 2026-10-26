@@ -6,6 +6,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Args, ValueEnum};
 use glob::glob;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -32,6 +33,9 @@ pub struct TaskArgs {
     /// Also force every dependency of requested targets
     #[arg(long)]
     pub force_deps: bool,
+    /// Compare content fingerprints instead of relying on modification times
+    #[arg(long)]
+    pub hash: bool,
     /// Print the dependency graph instead of running
     #[arg(long)]
     pub graph: bool,
@@ -193,6 +197,7 @@ pub fn run(args: TaskArgs, ctx: &Context) -> Result<()> {
             dry: args.plan,
             force: args.force,
             force_deps: args.force_deps,
+            hash: args.hash,
         },
         ctx,
     )
@@ -360,13 +365,77 @@ fn resolve_patterns(root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
     Ok(paths.into_iter().collect())
 }
 
-fn freshness(root: &Path, target: &Target, dep_outputs: &[PathBuf]) -> Result<(bool, String)> {
+#[derive(Default, Serialize, Deserialize)]
+struct FingerprintCache {
+    targets: HashMap<String, TargetFingerprints>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TargetFingerprints {
+    inputs: String,
+    outputs: String,
+}
+
+fn hash_files(paths: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for path in paths {
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(fs::read(path).with_context(|| format!("hashing {}", path.display()))?);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn input_fingerprint(root: &Path, target: &Target, dep_outputs: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(target.command.as_bytes());
+    hasher.update(serde_json::to_vec(&target.env)?);
+    hasher.update(serde_json::to_vec(&target.cwd)?);
+    hasher.update(serde_json::to_vec(&target.deps)?);
+    hasher.update(serde_json::to_vec(&target.inputs)?);
+    hasher.update(serde_json::to_vec(&target.outputs)?);
+    let mut paths = resolve_patterns(root, &target.inputs)?;
+    paths.extend_from_slice(dep_outputs);
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(fs::read(&path).with_context(|| format!("hashing {}", path.display()))?);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn freshness(
+    root: &Path,
+    name: &str,
+    target: &Target,
+    dep_outputs: &[PathBuf],
+    use_hash: bool,
+    cache: &FingerprintCache,
+) -> Result<(bool, String)> {
     if target.phony {
         return Ok((false, "phony target".to_string()));
     }
     let outputs: Vec<_> = target.outputs.iter().map(|p| root.join(p)).collect();
     if let Some(missing) = outputs.iter().find(|p| !p.is_file()) {
         return Ok((false, format!("output {} is missing", missing.display())));
+    }
+    if use_hash {
+        let Some(saved) = cache.targets.get(name) else {
+            return Ok((false, "no saved content fingerprint".to_string()));
+        };
+        let current_inputs = input_fingerprint(root, target, dep_outputs)?;
+        let current_outputs = hash_files(&outputs)?;
+        if saved.inputs != current_inputs {
+            return Ok((false, "input content changed".to_string()));
+        }
+        if saved.outputs != current_outputs {
+            return Ok((false, "output content changed".to_string()));
+        }
+        return Ok((true, "content fingerprints match".to_string()));
     }
     let oldest = outputs
         .iter()
@@ -396,6 +465,7 @@ struct Execution<'a> {
     dry: bool,
     force: bool,
     force_deps: bool,
+    hash: bool,
 }
 
 fn execute(file: &Taskfile, execution: Execution<'_>, ctx: &Context) -> Result<()> {
@@ -407,6 +477,7 @@ fn execute(file: &Taskfile, execution: Execution<'_>, ctx: &Context) -> Result<(
         dry,
         force,
         force_deps,
+        hash,
     } = execution;
     let _lock = if file.single_instance {
         Some(acquire_lock(root, file.lock_timeout)?)
@@ -416,6 +487,13 @@ fn execute(file: &Taskfile, execution: Execution<'_>, ctx: &Context) -> Result<(
     let started = chrono::Utc::now();
     let start_clock = std::time::Instant::now();
     let requested_set: BTreeSet<_> = requested.iter().cloned().collect();
+    let cache_path = root.join(".tooler/task-fingerprints.json");
+    let mut fingerprint_cache = if hash && cache_path.is_file() {
+        serde_json::from_slice(&fs::read(&cache_path)?)
+            .with_context(|| format!("reading task fingerprints {}", cache_path.display()))?
+    } else {
+        FingerprintCache::default()
+    };
     let mut results = Vec::new();
     let mut output_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut success = true;
@@ -427,7 +505,7 @@ fn execute(file: &Taskfile, execution: Execution<'_>, ctx: &Context) -> Result<(
             .flat_map(|d| output_map.get(d).cloned().unwrap_or_default())
             .collect();
         let force_this = (force && requested_set.contains(name)) || force_deps;
-        let (current, reason) = freshness(root, target, &deps)?;
+        let (current, reason) = freshness(root, name, target, &deps, hash, &fingerprint_cache)?;
         if current && !force_this {
             results.push(TargetResult {
                 name: name.clone(),
@@ -501,6 +579,18 @@ fn execute(file: &Taskfile, execution: Execution<'_>, ctx: &Context) -> Result<(
             name.clone(),
             target.outputs.iter().map(|p| root.join(p)).collect(),
         );
+        if hash {
+            let outputs: Vec<_> = target.outputs.iter().map(|p| root.join(p)).collect();
+            fingerprint_cache.targets.insert(
+                name.clone(),
+                TargetFingerprints {
+                    inputs: input_fingerprint(root, target, &deps)?,
+                    outputs: hash_files(&outputs)?,
+                },
+            );
+            fs::create_dir_all(cache_path.parent().expect("cache path parent"))?;
+            atomic_write::write(&cache_path, &serde_json::to_vec_pretty(&fingerprint_cache)?)?;
+        }
         results.push(TargetResult {
             name: name.clone(),
             status: "ok".into(),

@@ -62,3 +62,42 @@ fn watch_rejects_zero_interval_without_running_checks() {
         .failure();
     assert!(!dir.path().join("monitor.yml.monitor.json").exists());
 }
+
+#[test]
+fn failure_threshold_delays_confirmed_failure_until_consecutive_probes() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("monitor.yml"),
+        "name: Smoke\nchecks:\n  - id: unavailable\n    host: 127.0.0.1\n    port: 1\n    timeout: 1\n    failure_threshold: 2\n",
+    )
+    .unwrap();
+
+    let first = cmd
+        .args(["--output", "json", "monitor", "run", "monitor.yml"])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(first["checks"][0]["failure_count"], 1);
+    assert_eq!(first["checks"][0]["status"], "ok");
+    assert_eq!(first["checks"][0]["probe_status"], "failing");
+    assert!(first["checks"][0]["duration_ms"].is_number());
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("monitor.yml.monitor.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["checks"]["unavailable"]["status"], "ok");
+
+    let second = tooler_in(dir.path())
+        .args(["--output", "json", "monitor", "run", "monitor.yml"])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
+    assert_eq!(second["checks"][0]["failure_count"], 2);
+    assert_eq!(second["checks"][0]["transition"], "failing");
+}

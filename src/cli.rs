@@ -3,11 +3,11 @@ use crate::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, cron::CronArgs,
         db::DbArgs, deploy::DeployArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs,
         factory::FactoryArgs, fleet::FleetArgs, fs::FsArgs, gh::GhArgs, git::GitArgs,
-        group::GroupArgs, http::HttpArgs, info::InfoArgs, jobs::JobsArgs, json::JsonArgs,
-        logs::LogsArgs, mail::MailArgs, mcp::McpArgs, monitor::MonitorArgs, oauth::OAuthArgs,
-        play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs,
-        server::ServerArgs, ssh::SshArgs, stat::StatArgs, systemd::SystemdArgs, task::TaskArgs,
-        vault::VaultArgs,
+        group::GroupArgs, history::HistoryArgs, http::HttpArgs, info::InfoArgs, jobs::JobsArgs,
+        json::JsonArgs, logs::LogsArgs, mail::MailArgs, mcp::McpArgs, monitor::MonitorArgs,
+        oauth::OAuthArgs, play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs,
+        scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs, stat::StatArgs,
+        systemd::SystemdArgs, task::TaskArgs, vault::VaultArgs,
     },
     output::OutputFormat,
 };
@@ -135,6 +135,9 @@ pub enum Commands {
 
     /// Manage named groups of server profiles (used by tooler fleet and playbook tasks)
     Group(GroupArgs),
+
+    /// Query local command execution history
+    History(HistoryArgs),
 
     /// Send email over SMTP (config.mail.<name> profiles or inline host/user/password)
     Mail(MailArgs),

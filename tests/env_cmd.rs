@@ -81,3 +81,36 @@ fn check_fails_when_a_key_is_missing() {
         .assert()
         .failure();
 }
+
+#[test]
+fn validate_checks_schema_without_disclosing_values() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("schema.yml"),
+        "variables:\n  PORT: {type: integer, min: 1, max: 65535}\n  DEBUG: {type: boolean, required: false}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".env"), "PORT=secret-not-a-number\n").unwrap();
+
+    let out = stdout_of(
+        cmd.args(["--output", "json", "env", "validate", "schema.yml"])
+            .assert()
+            .failure(),
+    );
+    assert!(out.contains("PORT"));
+    assert!(!out.contains("secret-not-a-number"));
+}
+
+#[test]
+fn validate_accepts_valid_values_and_optional_missing_keys() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("schema.yml"),
+        "variables:\n  PORT: {type: integer, min: 1, max: 65535}\n  DEBUG: {type: boolean, required: false}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".env"), "PORT=8080\n").unwrap();
+    cmd.args(["env", "validate", "schema.yml"])
+        .assert()
+        .success();
+}

@@ -13,6 +13,7 @@ pub mod fs;
 pub mod gh;
 pub mod git;
 pub mod group;
+pub mod history;
 pub mod http;
 pub mod info;
 pub mod jobs;
