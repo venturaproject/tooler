@@ -166,10 +166,10 @@ use clap::CommandFactory;
 
 #[test]
 fn every_cli_command_has_a_matching_mcp_tool() {
-    // Commands with no MCP tool on purpose: `mcp` is the server itself; `completions`
-    // and `monitor` are local scheduling concerns; and `oauth` requires a local browser
-    // callback where an agent cannot safely complete the interactive consent flow.
-    let exempt = ["mcp", "completions", "monitor", "oauth"];
+    // Internal/local-only commands with no MCP tool: `factory` is intentionally run only
+    // by the reviewed playbook; `mcp` is the server itself; `completions` and `monitor`
+    // are local scheduling concerns; `oauth` requires an interactive browser callback.
+    let exempt = ["mcp", "completions", "monitor", "oauth", "factory"];
 
     let cli = crate::cli::Cli::command();
     let tool_names: Vec<String> = ToolerMcp::new()

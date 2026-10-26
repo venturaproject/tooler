@@ -2,11 +2,12 @@ use crate::{
     commands::{
         check::CheckArgs, completions::CompletionsArgs, config::ConfigArgs, cron::CronArgs,
         db::DbArgs, deploy::DeployArgs, doctor::DoctorArgs, echo::EchoArgs, env::EnvArgs,
-        fleet::FleetArgs, fs::FsArgs, gh::GhArgs, git::GitArgs, group::GroupArgs, http::HttpArgs,
-        info::InfoArgs, jobs::JobsArgs, json::JsonArgs, logs::LogsArgs, mail::MailArgs,
-        mcp::McpArgs, monitor::MonitorArgs, oauth::OAuthArgs, play::PlayArgs, ps::PsArgs,
-        report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs, server::ServerArgs, ssh::SshArgs,
-        stat::StatArgs, systemd::SystemdArgs, task::TaskArgs, vault::VaultArgs,
+        factory::FactoryArgs, fleet::FleetArgs, fs::FsArgs, gh::GhArgs, git::GitArgs,
+        group::GroupArgs, http::HttpArgs, info::InfoArgs, jobs::JobsArgs, json::JsonArgs,
+        logs::LogsArgs, mail::MailArgs, mcp::McpArgs, monitor::MonitorArgs, oauth::OAuthArgs,
+        play::PlayArgs, ps::PsArgs, report::ReportArgs, run::RunArgs, scaffold::ScaffoldArgs,
+        server::ServerArgs, ssh::SshArgs, stat::StatArgs, systemd::SystemdArgs, task::TaskArgs,
+        vault::VaultArgs,
     },
     output::OutputFormat,
 };
@@ -71,6 +72,9 @@ pub enum Commands {
 
     /// Run a YAML playbook (tasks, vars, health checks)
     Play(PlayArgs),
+
+    /// Run an internal AI Factory workflow stage (normally called by its playbook)
+    Factory(FactoryArgs),
 
     /// Run incremental local workflows from Taskfile.yml
     Task(TaskArgs),

@@ -7,6 +7,7 @@ pub mod deploy;
 pub mod doctor;
 pub mod echo;
 pub mod env;
+pub mod factory;
 pub mod fleet;
 pub mod fs;
 pub mod gh;

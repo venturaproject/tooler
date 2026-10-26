@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod context;
 mod db;
+mod factory;
 mod oauth;
 mod output;
 mod project;
@@ -40,6 +41,7 @@ fn main() -> Result<()> {
         Commands::OAuth(args) => commands::oauth::run(args, &ctx),
         Commands::Run(args) => commands::run::run(args, &ctx),
         Commands::Play(args) => commands::play::run(args, &ctx),
+        Commands::Factory(args) => commands::factory::run(args),
         Commands::Task(args) => commands::task::run(args, &ctx),
         Commands::Git(args) => commands::git::run(args, &ctx),
         Commands::Scaffold(args) => commands::scaffold::run(args, &ctx),

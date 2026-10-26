@@ -499,6 +499,14 @@ tooler play playbook.yml --audit-log audit.jsonl               # log every task 
 tooler play playbook.yml --diff             # preview fs_write:/write_file: changes as a diff
 ```
 
+#### AI Factory pilot (GitHub issues)
+
+Tooler's human-supervised issue-to-PR workflow supports OpenCode, Claude Code, and custom
+agent adapters. Its safety gates, setup, staged usage, recovery procedure, and limitations
+are documented in the **[AI Factory guide](docs/ai-factory.md)**. The playbook is
+[`playbooks/ai-factory.yml`](playbooks/ai-factory.yml); orchestration and adapter integration
+run in Tooler's Rust runtime, with no Python dependency. It never merges or deploys.
+
 `--start-at-task <name>` skips straight to the named **top-level** task, treating every earlier task as already done — not run, not counted, no output. It's a practical rerun-after-a-fix tool, not a full `--resume`: there's no persisted run state, so a task after the start point that reads `{{a_var}}` registered by a now-skipped earlier task sees it unresolved, same as any other unknown token. Has no effect inside `include:`/`block:` — it only ever applies to the outermost playbook's own task list. Mutually exclusive with `--resume`.
 
 **`--resume`** is the real thing: every top-level run writes a checkpoint (`<file>.state.json`, a sibling of the playbook file) after each task's non-fatal outcome, capturing the *entire* vars map at that point — deleted automatically once the playbook fully succeeds. `tooler play playbook.yml --resume` restores those vars exactly as they were after the last completed task, continues with the task right after it, and errors clearly if no checkpoint exists. `--var` overrides still apply on top of the restored vars, so a bad value can be fixed before retrying — the whole point of resuming rather than restarting from scratch. **Security note**: since the checkpoint holds the *entire* vars snapshot, it can contain values resolved from `{{secret.*}}` (e.g. via `set_fact:`) — the file is written with `0600` permissions on Unix, but treat it like any other local credential material (gitignore `*.state.json`) rather than relying on that alone.

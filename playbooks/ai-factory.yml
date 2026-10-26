@@ -1,0 +1,69 @@
+name: GitHub issue to reviewed pull request
+description: >-
+  Manually orchestrate a low-risk issue using OpenCode, Claude Code, or a custom agent
+  adapter. Checks and independent review are required; never auto-merges or deploys.
+
+vars:
+  issue: ""
+  spec_agent: opencode
+  spec_model: ""
+  build_agent: opencode
+  build_model: ""
+  review_agent: claude
+  review_model: ""
+
+tasks:
+  - name: Validate issue and prepare isolated worktree
+    tags: [prepare]
+    run:
+      command: tooler factory prepare
+      env:
+        TOOLER_AI_ISSUE: "{{issue}}"
+
+  - name: Write implementation specification
+    tags: [spec]
+    run:
+      command: tooler factory spec
+      env:
+        TOOLER_AI_ISSUE: "{{issue}}"
+        TOOLER_AI_AGENT: "{{spec_agent}}"
+        TOOLER_AI_MODEL: "{{spec_model}}"
+
+  - name: Human approval bound to the reviewed spec hash
+    tags: [approve]
+    run:
+      command: tooler factory approve
+      env:
+        TOOLER_AI_ISSUE: "{{issue}}"
+
+  - name: Implement approved specification
+    tags: [implement]
+    run:
+      command: tooler factory implement
+      env:
+        TOOLER_AI_ISSUE: "{{issue}}"
+        TOOLER_AI_AGENT: "{{build_agent}}"
+        TOOLER_AI_MODEL: "{{build_model}}"
+
+  - name: Run formatting, Clippy and Rust tests
+    tags: [checks]
+    run:
+      command: tooler factory checks
+      env:
+        TOOLER_AI_ISSUE: "{{issue}}"
+
+  - name: Run independent read-only review
+    tags: [review]
+    run:
+      command: tooler factory review
+      env:
+        TOOLER_AI_ISSUE: "{{issue}}"
+        TOOLER_AI_AGENT: "{{review_agent}}"
+        TOOLER_AI_MODEL: "{{review_model}}"
+
+  - name: Commit explicit safe paths and open pull request
+    tags: [create-pr]
+    run:
+      command: tooler factory create-pr
+      env:
+        TOOLER_AI_ISSUE: "{{issue}}"
