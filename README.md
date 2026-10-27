@@ -1,4 +1,4 @@
-![tooler](docs/header.png)
+![tooler](docs/tooler-header.png)
 
 # tooler
 
