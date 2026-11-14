@@ -168,17 +168,16 @@ impl Canvas {
         self.ops.push(Op::SetTextCursor {
             pos: Point::new(Mm(x), Mm(y)),
         });
-        self.ops.push(Op::SetFontSize {
+        self.ops.push(Op::SetFont {
             size: Pt(size),
-            font: font.clone(),
+            font: printpdf::PdfFontHandle::External(font.clone()),
         });
         self.ops.push(Op::SetLineHeight { lh: Pt(size) });
         self.ops.push(Op::SetFillColor {
             col: Color::Rgb(color),
         });
-        self.ops.push(Op::WriteText {
+        self.ops.push(Op::ShowText {
             items: text_items(s),
-            font,
         });
         self.ops.push(Op::EndTextSection);
     }

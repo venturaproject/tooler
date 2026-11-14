@@ -14,7 +14,7 @@ use rmcp::{
     model::{
         CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
         PromptMessage, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
-        Role, ServerCapabilities, ServerInfo,
+        Role, ServerCapabilities, ServerConfig,
     },
     prompt, prompt_handler, prompt_router,
     service::RequestContext,
@@ -714,6 +714,9 @@ impl ServerHandler for ToolerMcp {
             tools,
             meta: None,
             next_cursor: None,
+            cache_scope: None,
+            result_type: None,
+            ttl_ms: None,
         })
     }
 
@@ -721,7 +724,7 @@ impl ServerHandler for ToolerMcp {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
         if request.name.starts_with("tooler_pb_")
             && let Some(pb) = self
                 .playbook_tools
@@ -748,14 +751,14 @@ impl ServerHandler for ToolerMcp {
             if allow_confirm {
                 argv.push("--yes".to_string());
             }
-            return self.exec_self(argv, &None).await;
+            return self.exec_self(argv, &None).await.map(Into::into);
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        self.tool_router.call(tcc).await.map(Into::into)
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -792,7 +795,7 @@ impl ServerHandler for ToolerMcp {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
         let argv = match request.uri.as_str() {
             "tooler://config/profiles" => vec!["config".to_string(), "profiles".to_string()],
             "tooler://config/servers" => vec!["server".to_string(), "list".to_string()],
@@ -818,6 +821,7 @@ impl ServerHandler for ToolerMcp {
         }
         Ok(ReadResourceResult::new(vec![
             ResourceContents::text(text, request.uri).with_mime_type("application/json"),
-        ]))
+        ])
+        .into())
     }
 }
