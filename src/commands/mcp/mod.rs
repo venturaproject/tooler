@@ -754,7 +754,7 @@ impl ServerHandler for ToolerMcp {
             return self.exec_self(argv, &None).await.map(Into::into);
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await.map(Into::into)
+        self.tool_router.call(tcc).await
     }
 
     fn get_info(&self) -> ServerConfig {
