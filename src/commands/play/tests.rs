@@ -219,18 +219,27 @@ fn render_for_display_masks_secret_tokens_but_not_others() {
 
 #[test]
 fn shell_quote_wraps_a_plain_value() {
+    #[cfg(not(windows))]
     assert_eq!(shell_quote("hello world"), "'hello world'");
+    #[cfg(windows)]
+    assert_eq!(shell_quote("hello world"), "\"hello world\"");
 }
 
 #[test]
 fn shell_quote_escapes_embedded_single_quotes() {
+    #[cfg(not(windows))]
     assert_eq!(shell_quote("it's here"), r"'it'\''s here'");
+    #[cfg(windows)]
+    assert_eq!(shell_quote("it's here"), "\"it's here\"");
 }
 
 #[test]
 fn quote_filter_resolves_a_var() {
     let v = vars(&[("item", "; rm -rf /")]);
+    #[cfg(not(windows))]
     assert_eq!(render("echo {{item | quote}}", &v), "echo '; rm -rf /'");
+    #[cfg(windows)]
+    assert_eq!(render("echo {{item | quote}}", &v), "echo \"; rm -rf /\"");
 }
 
 #[test]
@@ -245,7 +254,10 @@ fn render_for_display_quotes_a_masked_secret_without_leaking() {
     // The real value never resolves (not stored), but the point stands even when
     // it would: render_for_display masks to "***" before the filter runs, so the
     // filtered result is always the masked placeholder, quoted -- never the secret.
+    #[cfg(not(windows))]
     assert_eq!(render_for_display("{{secret.p.k | quote}}", &v), "'***'");
+    #[cfg(windows)]
+    assert_eq!(render_for_display("{{secret.p.k | quote}}", &v), "\"***\"");
 }
 
 #[test]

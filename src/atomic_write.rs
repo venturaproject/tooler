@@ -122,6 +122,10 @@ pub fn try_lock(path: &Path) -> Result<Option<FileLock>> {
     match lock_file(&file, false) {
         Ok(()) => Ok(Some(FileLock { _file: file })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        // LockFileEx reports an occupied byte range as ERROR_LOCK_VIOLATION (33),
+        // which Rust does not normalize to WouldBlock on Windows.
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(33) => Ok(None),
         Err(error) => Err(error).with_context(|| format!("locking {}", lock_path.display())),
     }
 }
