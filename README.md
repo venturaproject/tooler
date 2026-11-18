@@ -68,12 +68,12 @@ PowerShell installer (user-local, verifies SHA256 before installing):
 irm https://raw.githubusercontent.com/venturaproject/tooler/main/install.ps1 | iex
 ```
 
-Set `$env:TOOLER_VERSION = 'v1.0.0'` before running it to install a pinned version.
+Set `$env:TOOLER_VERSION = 'v1.0.1'` before running it to install a pinned version.
 
 To install a specific version:
 
 ```sh
-TOOLER_VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/venturaproject/tooler/main/install.sh | sh
+TOOLER_VERSION=v1.0.1 curl -fsSL https://raw.githubusercontent.com/venturaproject/tooler/main/install.sh | sh
 ```
 
 ### Option 2 — cargo (requires Rust)
@@ -102,8 +102,8 @@ source "$HOME/.cargo/env"
 | Method | Requirement |
 |---|---|
 | curl install | macOS, or Linux with compatible glibc |
-| cargo install | Rust 1.88+ and Cargo |
-| Build from source | Rust 1.88+ and Cargo |
+| cargo install | Rust 1.89+ and Cargo |
+| Build from source | Rust 1.89+ and Cargo |
 
 Supported platforms: macOS, Linux, Windows.
 
@@ -722,6 +722,11 @@ Every task's fields (and every action's own `{...}` spec, like `mail: {...}`/`db
 | `cron: {server, add / remove / list, confirm}` | Manage a remote crontab (exactly one of add/remove/list); `add`/`remove` require `confirm: true` |
 | `mail: {server/host/port/user/password, to, cc, bcc, subject, body, html, attachments}` | Send an email over SMTP, optionally with local file attachments |
 | `mail_check: {server, folder, unseen_only, limit, include_body, mark_seen}` | Read a mail profile's inbox over IMAP and capture the messages |
+
+`run:` executes through the operating system's native command interpreter: `sh` on Unix and
+`cmd.exe` on Windows. Shell syntax and environment-variable notation therefore follow the
+target platform (`$NAME` on Unix, `%NAME%` in `cmd.exe`); a command written for one shell
+is not automatically portable to the other.
 
 ```yaml
 tasks:

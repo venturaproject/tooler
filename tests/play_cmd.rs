@@ -4,6 +4,10 @@ use common::{tooler, tooler_in};
 use std::net::TcpListener;
 use tempfile::tempdir;
 
+// POSIX-shell fixtures below are Unix-only: `run:` intentionally invokes the native
+// command interpreter (sh on Unix, cmd.exe on Windows), so their scripts are not valid
+// cross-platform playbook syntax. Windows-specific `run:` coverage uses cmd.exe syntax.
+
 fn stdout_of(assert: assert_cmd::assert::Assert) -> String {
     String::from_utf8_lossy(&assert.get_output().stdout).to_string()
 }
@@ -361,6 +365,7 @@ fn audit_log_records_one_line_per_loop_iteration() {
 }
 
 #[test]
+#[cfg(unix)]
 fn loop_runs_once_per_item_in_order() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -381,6 +386,7 @@ fn loop_runs_once_per_item_in_order() {
 }
 
 #[test]
+#[cfg(unix)]
 fn loop_failure_aborts_remaining_items_and_playbook() {
     let dir = tempdir().unwrap();
     std::fs::write(
@@ -657,6 +663,7 @@ fn register_exit_code_survives_a_failure_when_ignore_errors_lets_the_playbook_co
 }
 
 #[test]
+#[cfg(unix)]
 fn run_env_injects_a_variable_into_the_subprocess() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -671,6 +678,7 @@ fn run_env_injects_a_variable_into_the_subprocess() {
 }
 
 #[test]
+#[cfg(unix)]
 fn run_env_value_is_templated_before_being_set() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -679,6 +687,21 @@ fn run_env_value_is_templated_before_being_set() {
          name: read it\n    run:\n      command: \"echo $MSG\"\n      \
          env:\n        MSG: \"{{greeting}}\"\n    register: out\n  - name: check it\n    \
          assert: \"{{out}} == hello-from-vars\"\n",
+    )
+    .unwrap();
+
+    cmd.args(["play", "playbook.yml"]).assert().success();
+}
+
+#[test]
+#[cfg(windows)]
+fn run_env_injects_a_variable_into_cmd_on_windows() {
+    let (mut cmd, dir) = tooler();
+    std::fs::write(
+        dir.path().join("playbook.yml"),
+        "name: WindowsRunEnv\ntasks:\n  - name: read it\n    run:\n      command: \"echo %FOO%\"\n      \
+         env:\n        FOO: bar\n    register: out\n  - name: check it\n    \
+         assert: \"{{out}} == bar\"\n",
     )
     .unwrap();
 
@@ -769,6 +792,7 @@ fn secret_set_task_writes_a_secret_that_secret_dot_reads_back() {
 }
 
 #[test]
+#[cfg(unix)]
 fn retries_eventually_succeeds() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1317,6 +1341,7 @@ fn lint_flags_an_undefined_var_inside_a_structured_assert_that() {
 }
 
 #[test]
+#[cfg(unix)]
 fn block_runs_tasks_in_order_and_counts_as_one_outcome() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1467,6 +1492,7 @@ fn unknown_notify_target_is_rejected_upfront() {
 }
 
 #[test]
+#[cfg(unix)]
 fn env_templating_resolves_from_the_process_environment() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1564,6 +1590,7 @@ fn fleet_servers_field_is_templated() {
 }
 
 #[test]
+#[cfg(unix)]
 fn loop_over_map_items_exposes_item_fields() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1814,6 +1841,7 @@ fn start_at_task_skips_earlier_tasks() {
 }
 
 #[test]
+#[cfg(unix)]
 fn include_with_vars_overrides_and_restores_between_calls() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -1930,6 +1958,7 @@ fn write_file_task_writes_rendered_content_and_appends() {
 }
 
 #[test]
+#[cfg(unix)]
 fn max_parallel_loop_runs_all_items_and_keeps_last_registered_value_deterministic() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
@@ -3409,6 +3438,7 @@ fn without_diff_flag_write_file_prints_no_diff_lines() {
 }
 
 #[test]
+#[cfg(unix)]
 fn flush_handlers_runs_a_pending_handler_immediately_mid_playbook() {
     let (mut cmd, dir) = tooler();
     std::fs::write(
